@@ -12,6 +12,7 @@ import logging
 import sys
 
 from stockbot import db
+from stockbot.compliance.wash_trade import scan_for_wash_trades
 from stockbot.config import get_settings
 from stockbot.market.tick import apply_tick
 
@@ -23,6 +24,7 @@ log = logging.getLogger("stockbot.market")
 ADVISORY_LOCK_KEY = 0x5350_4B_54  # "stock" (truncated), just needs to be a stable constant
 
 TICK_INTERVAL_SECONDS = 60
+WASH_TRADE_SCAN_EVERY_N_TICKS = 10
 
 
 async def run() -> None:
@@ -52,6 +54,10 @@ async def run() -> None:
                 try:
                     tick_index = await apply_tick(conn, settings.master_seed)
                     log.info("applied tick %d", tick_index)
+                    if tick_index % WASH_TRADE_SCAN_EVERY_N_TICKS == 0:
+                        flags = await scan_for_wash_trades(conn)
+                        if flags:
+                            log.warning("flagged %d possible wash trade(s)", len(flags))
                 except Exception:
                     log.exception("tick failed; will retry next interval")
                 elapsed = asyncio.get_event_loop().time() - start

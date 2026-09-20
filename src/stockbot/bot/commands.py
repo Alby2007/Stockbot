@@ -21,6 +21,7 @@ from stockbot.bot.charts import render_candle_chart
 from stockbot.bot.format import format_money, format_pct, format_price
 from stockbot.claims.errors import AlreadyClaimedTodayError
 from stockbot.claims.service import claim_daily
+from stockbot.compliance.wash_trade import scan_for_wash_trades
 from stockbot.config import get_settings
 from stockbot.ledger.errors import InsufficientFundsError
 from stockbot.ledger.service import get_balance
@@ -476,6 +477,27 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         lines += [
             f"  {name:<16} {format_money(balance)}"
             for name, balance in report.system_balances.items()
+        ]
+        await interaction.response.send_message(
+            "```\n" + "\n".join(lines) + "\n```", ephemeral=True
+        )
+
+    @admin_group.command(
+        name="wash-trades", description="Scan for and list flagged same-tick opposing trades"
+    )
+    async def admin_wash_trades(interaction: discord.Interaction) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            flags = await scan_for_wash_trades(conn)
+        if not flags:
+            await interaction.response.send_message("No new flags.", ephemeral=True)
+            return
+        lines = [
+            f"tick {f.tick_index}: instrument {f.instrument_id}, "
+            f"buyer {f.buyer_id} / seller {f.seller_id}"
+            for f in flags
         ]
         await interaction.response.send_message(
             "```\n" + "\n".join(lines) + "\n```", ephemeral=True

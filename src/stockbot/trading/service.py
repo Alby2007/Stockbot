@@ -215,13 +215,17 @@ async def execute_trade(
                 (impact_after, new_quoted_price, instrument_id),
             )
 
+            await cur.execute("SELECT MAX(tick_index) FROM market_ticks")
+            tick_row = await cur.fetchone()
+            current_tick_index = tick_row[0] if tick_row else None
+
             await cur.execute(
                 """
                 INSERT INTO trades (
                     user_id, instrument_id, side, quantity, fill_price,
-                    notional_minor, fee_minor, cash_transfer_id, fee_transfer_id
+                    notional_minor, fee_minor, cash_transfer_id, fee_transfer_id, tick_index
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (
@@ -234,6 +238,7 @@ async def execute_trade(
                     fee_minor,
                     cash_transfer_id,
                     fee_transfer_id,
+                    current_tick_index,
                 ),
             )
             row = await cur.fetchone()
