@@ -29,6 +29,15 @@ from stockbot.market.data import (
     get_instrument_snapshot,
 )
 from stockbot.market.engine import TICKS_PER_DAY
+from stockbot.shop.errors import ShopError
+from stockbot.shop.service import (
+    BASE_SLOTS,
+    buy_item,
+    get_slot_count,
+    get_user_entitlements,
+    list_items,
+    slot_price,
+)
 from stockbot.trading.errors import TradingError
 from stockbot.trading.service import execute_trade
 
@@ -366,3 +375,55 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"{verb} **{result.quantity}** {result.ticker} @ {format_price(result.fill_price)} "
             f"(fee {format_money(result.fee_minor)})"
         )
+
+    shop_group = app_commands.Group(
+        name="shop", description="Portfolio slots, analyst tools, and cosmetics"
+    )
+
+    @shop_group.command(name="list", description="List items available in the shop")
+    async def shop_list(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            items = await list_items(conn)
+            slot_count = await get_slot_count(conn, interaction.user.id)
+            owned = await get_user_entitlements(conn, interaction.user.id)
+
+        owned_keys = {row["item_key"] for row in owned}
+        lines = []
+        for item in items:
+            if item.key == "slot":
+                price = slot_price(slot_count - BASE_SLOTS)
+                lines.append(f"{item.key:<15} {format_money(price):>10}  (you have {slot_count})")
+                continue
+            marker = " (owned)" if item.key in owned_keys and item.duration_days is None else ""
+            recurring = f" every {item.duration_days}d" if item.duration_days else ""
+            assert item.price_minor is not None
+            lines.append(
+                f"{item.key:<15} {format_money(item.price_minor):>10}{recurring}{marker}"
+            )
+
+        embed = discord.Embed(title="Shop")
+        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        embed.set_footer(text="/shop buy <item>")
+        await interaction.response.send_message(embed=embed)
+
+    @shop_group.command(name="buy", description="Buy an item from the shop")
+    @app_commands.describe(item="Item key, e.g. slot, analyst_tools, theme_sunrise")
+    async def shop_buy(interaction: discord.Interaction, item: str) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            try:
+                price = await buy_item(conn, interaction.user.id, item.lower())
+            except InsufficientFundsError:
+                await interaction.response.send_message(
+                    "Insufficient funds for that purchase.", ephemeral=True
+                )
+                return
+            except ShopError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Purchased **{item.lower()}** for {format_money(price)}."
+        )
+
+    tree.add_command(shop_group)

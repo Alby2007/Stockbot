@@ -22,6 +22,17 @@ class InsufficientSharesError(TradingError):
         super().__init__(f"cannot sell {requested} shares of {ticker}; only {held} held")
 
 
+class TooManyPositionsError(TradingError):
+    def __init__(self, open_positions: int, slot_count: int):
+        self.open_positions = open_positions
+        self.slot_count = slot_count
+        super().__init__(
+            f"you already hold {open_positions} position(s), the max your "
+            f"{slot_count} portfolio slot(s) allow. Buy a slot in /shop or "
+            "close a position first."
+        )
+
+
 class DuplicateInteractionError(TradingError):
     """Raised when an interaction id has already been processed (idempotent replay)."""
 

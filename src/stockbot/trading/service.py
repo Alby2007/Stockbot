@@ -25,10 +25,12 @@ from psycopg.rows import dict_row
 
 from stockbot.ledger.service import get_system_account_id, get_user_account_id, post_transfer
 from stockbot.market import engine
+from stockbot.shop.service import get_slot_count
 from stockbot.trading.errors import (
     DuplicateInteractionError,
     InstrumentHaltedError,
     InsufficientSharesError,
+    TooManyPositionsError,
     UnknownInstrumentError,
 )
 
@@ -144,6 +146,19 @@ async def execute_trade(
         avg_cost = Decimal(position[1]) if position else Decimal(0)
 
         if side == "BUY":
+            if held_quantity == 0:
+                slot_count = await get_slot_count(conn, user_id)
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT COUNT(*) FROM positions WHERE user_id = %s AND quantity > 0",
+                        (user_id,),
+                    )
+                    open_positions_row = await cur.fetchone()
+                    assert open_positions_row is not None
+                    open_positions = open_positions_row[0]
+                if open_positions >= slot_count:
+                    raise TooManyPositionsError(open_positions, slot_count)
+
             cash_transfer_id = await post_transfer(
                 conn,
                 from_account_id=account_id,
