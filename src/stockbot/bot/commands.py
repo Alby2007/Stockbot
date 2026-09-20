@@ -53,6 +53,11 @@ from stockbot.shop.service import (
     list_items,
     slot_price,
 )
+from stockbot.shorts.service import (
+    cover_bounded_short,
+    list_open_shorts,
+    open_bounded_short,
+)
 from stockbot.trading.errors import TradingError
 from stockbot.trading.service import execute_trade
 
@@ -429,6 +434,113 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.response.send_message(
             f"{verb} **{result.quantity}** {result.ticker} @ {format_price(result.fill_price)} "
             f"(fee {format_money(result.fee_minor)})"
+        )
+
+    @tree.command(
+        name="short",
+        description="Open a bounded short: capped downside, auto-knockout above entry",
+    )
+    @app_commands.describe(
+        ticker="Instrument ticker",
+        quantity="Number of shares to short",
+        league="Use your season league stake instead of your main portfolio",
+    )
+    async def short(
+        interaction: discord.Interaction,
+        ticker: str,
+        quantity: app_commands.Range[int, 1, None],
+        league: bool = False,
+    ) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            season_id: int | None = None
+            if league:
+                entry = await get_active_entry(conn, interaction.user.id)
+                if entry is None:
+                    await interaction.response.send_message(
+                        "You're not entered in an active season. `/league join` first.",
+                        ephemeral=True,
+                    )
+                    return
+                season_id = entry[0]
+            try:
+                result = await open_bounded_short(
+                    conn,
+                    user_id=interaction.user.id,
+                    ticker=ticker,
+                    quantity=quantity,
+                    interaction_id=str(interaction.id),
+                    season_id=season_id,
+                )
+            except InsufficientFundsError:
+                await interaction.response.send_message(
+                    "Insufficient funds for the collateral.", ephemeral=True
+                )
+                return
+            except TradingError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Opened bounded short **#{result.short_id}**: {result.quantity} {result.ticker} "
+            f"@ {format_price(result.entry_price)} — collateral "
+            f"{format_money(result.collateral_minor)}, knocks out at "
+            f"{format_price(result.knockout_price)}."
+        )
+
+    @tree.command(name="shorts", description="List your open bounded shorts")
+    @app_commands.describe(league="Show league shorts instead of main-portfolio ones")
+    async def shorts(interaction: discord.Interaction, league: bool = False) -> None:
+        async with db.connection() as conn:
+            season_id: int | None = None
+            if league:
+                entry = await get_active_entry(conn, interaction.user.id)
+                if entry is None:
+                    await interaction.response.send_message(
+                        "You're not entered in an active season.", ephemeral=True
+                    )
+                    return
+                season_id = entry[0]
+            else:
+                await bootstrap_user(conn, interaction.user.id)
+            rows = await list_open_shorts(conn, interaction.user.id, season_id)
+
+        if not rows:
+            await interaction.response.send_message(
+                "No open bounded shorts.", ephemeral=True
+            )
+            return
+        lines = []
+        for s in rows:
+            pnl_pct = float(s["entry_price"]) / float(s["quoted_price"]) - 1
+            lines.append(
+                f"#{s['id']:<4} {s['ticker']:<6} {s['quantity']:>6} @ "
+                f"{format_price(s['entry_price']):>10}  "
+                f"KO {format_price(s['knockout_price']):>10}  "
+                f"{format_pct(pnl_pct):>8}"
+            )
+        embed = discord.Embed(title="Open bounded shorts")
+        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        embed.set_footer(text="/cover <id> to close early")
+        await interaction.response.send_message(embed=embed)
+
+    @tree.command(name="cover", description="Close a bounded short at market")
+    @app_commands.describe(short_id="Bounded short id from /shorts")
+    async def cover(interaction: discord.Interaction, short_id: int) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            try:
+                result = await cover_bounded_short(
+                    conn, user_id=interaction.user.id, short_id=short_id
+                )
+            except TradingError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        outcome = "profit" if result.payoff_minor >= 0 else "loss"
+        await interaction.response.send_message(
+            f"Covered **#{result.short_id}** {result.ticker} @ "
+            f"{format_price(result.close_price)} — {outcome} "
+            f"{format_money(abs(result.payoff_minor))}, paid out "
+            f"{format_money(result.payout_minor)}."
         )
 
     shop_group = app_commands.Group(

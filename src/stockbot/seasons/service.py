@@ -283,12 +283,29 @@ async def get_active_entry(
     return (int(row[0]), int(row[1])) if row else None
 
 
+# Reusable subquery: mark-to-market value of open bounded shorts, floored at
+# 0 per position (collateral + Q*(entry - quoted), in minor units). The
+# collateral already left the league account at open, so the position's
+# liquidation value is what equity sees.
+_SHORT_VALUE_SUBQUERY = """
+    SELECT bs.season_id, bs.user_id,
+           SUM(GREATEST(0, bs.collateral_minor
+                 + CAST(bs.quantity * (bs.entry_price - i.quoted_price) * 100 AS BIGINT)))
+               AS short_value_minor
+    FROM bounded_shorts bs
+    JOIN instruments i ON i.id = bs.instrument_id
+    WHERE bs.status = 'OPEN' AND bs.season_id IS NOT NULL
+    GROUP BY bs.season_id, bs.user_id
+"""
+
+
 async def league_equity_minor(conn: AsyncConnection, season_id: int, user_id: int) -> int:
-    """League account cash + mark value of season-scoped positions."""
+    """League account cash + mark value of season-scoped positions and shorts."""
     async with conn.cursor() as cur:
         await cur.execute(
-            """
+            f"""
             SELECT a.balance + COALESCE(pos.value_minor, 0)
+                          + COALESCE(sh.short_value_minor, 0)
             FROM season_entries e
             JOIN accounts a ON a.id = e.account_id
             LEFT JOIN (
@@ -299,6 +316,8 @@ async def league_equity_minor(conn: AsyncConnection, season_id: int, user_id: in
                 WHERE p.season_id = %s AND p.quantity > 0
                 GROUP BY p.user_id
             ) pos ON pos.user_id = e.user_id
+            LEFT JOIN ({_SHORT_VALUE_SUBQUERY}) sh
+                   ON sh.season_id = e.season_id AND sh.user_id = e.user_id
             WHERE e.season_id = %s AND e.user_id = %s
             """,
             (season_id, season_id, user_id),
@@ -343,11 +362,12 @@ async def on_tick(
         if tick_index % snapshot_interval_ticks == 0:
             day_index = tick_index // snapshot_interval_ticks
             await cur.execute(
-                """
+                f"""
                 INSERT INTO equity_snapshots
                     (season_id, user_id, day_index, tick_index, equity_minor)
                 SELECT e.season_id, e.user_id, %s, %s,
                        a.balance + COALESCE(pos.value_minor, 0)
+                             + COALESCE(sh.short_value_minor, 0)
                 FROM season_entries e
                 JOIN seasons s ON s.id = e.season_id
                 JOIN accounts a ON a.id = e.account_id
@@ -360,6 +380,8 @@ async def on_tick(
                     WHERE p.season_id IS NOT NULL AND p.quantity > 0
                     GROUP BY p.season_id, p.user_id
                 ) pos ON pos.season_id = e.season_id AND pos.user_id = e.user_id
+                LEFT JOIN ({_SHORT_VALUE_SUBQUERY}) sh
+                       ON sh.season_id = e.season_id AND sh.user_id = e.user_id
                 WHERE s.status = 'ACTIVE'
                   AND s.start_tick <= %s AND %s <= s.end_tick
                 ON CONFLICT DO NOTHING
@@ -385,9 +407,10 @@ async def standings(conn: AsyncConnection, season_id: int) -> list[Standing]:
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            """
+            f"""
             SELECT e.user_id, e.trades_count, e.final_score, e.final_rank, e.prize_minor,
-                   a.balance + COALESCE(pos.value_minor, 0) AS equity_minor
+                   a.balance + COALESCE(pos.value_minor, 0)
+                         + COALESCE(sh.short_value_minor, 0) AS equity_minor
             FROM season_entries e
             JOIN accounts a ON a.id = e.account_id
             LEFT JOIN (
@@ -399,9 +422,12 @@ async def standings(conn: AsyncConnection, season_id: int) -> list[Standing]:
                 WHERE p.season_id = %s AND p.quantity > 0
                 GROUP BY p.season_id, p.user_id
             ) pos ON pos.user_id = e.user_id
+            LEFT JOIN ({_SHORT_VALUE_SUBQUERY}) sh
+                   ON sh.season_id = e.season_id AND sh.user_id = e.user_id
             WHERE e.season_id = %s
             ORDER BY COALESCE(e.final_rank, 2147483647),
-                     a.balance + COALESCE(pos.value_minor, 0) DESC
+                     a.balance + COALESCE(pos.value_minor, 0)
+                           + COALESCE(sh.short_value_minor, 0) DESC
             """,
             (season_id, season_id),
         )

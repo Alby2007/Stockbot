@@ -8,9 +8,20 @@ trading (`/buy` `/sell`), `/balance` `/portfolio` `/market` `/stock` `/claim`
 (`/admin tune` `/admin ledger-audit` `/admin wash-trades` `/admin
 season-create` `/admin season-close`), wash-trade detection, the economy
 simulation harness (`python -m stockbot.simulation.harness`, use a scratch
-DB), and seasons/league (`/league info|join|standings`, `league` flag on
-`/buy` `/sell` `/portfolio`) are all done. Phase 2 (margin, shorts,
-liquidation) not started.
+DB), seasons/league (`/league info|join|standings`, `league` flag on
+`/buy` `/sell` `/portfolio`), and Phase 1.5 bounded shorts (`/short`
+`/shorts` `/cover`, `stockbot.shorts`, knockout sweep inside `apply_tick`)
+are all done. Phase 2 (true margin, signed positions, liquidation,
+insurance fund, SBX-40 index) not started.
+
+Bounded-shorts design notes: `bounded_shorts` rows are separate from
+long-only `positions` (defined-risk product: collateral = Q·entry·
+knockout_pct posted to MARKET_MAKER upfront, payout = max(0, collateral +
+Q·(entry − close)), KO at entry·(1+knockout_pct) → payout 0).
+`sweep_knockouts` runs inside `apply_tick` after instrument updates.
+`seasons` equity adds open-short value via `_SHORT_VALUE_SUBQUERY` — when
+embedding it in a raw query string, the query must be an f-string (a plain
+`"""` query shipped `{_SHORT_VALUE_SUBQUERY}` literally to Postgres once).
 
 Seasons design notes: LEAGUE accounts are `accounts` rows with
 `season_id` set; positions/trades carry `season_id` (NULL = main portfolio,

@@ -10,6 +10,7 @@ from psycopg.rows import dict_row
 
 from stockbot.market import engine, events
 from stockbot.seasons import service as seasons
+from stockbot.shorts import service as shorts
 
 
 async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
@@ -172,6 +173,11 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                         )
                     ],
                 )
+
+        # Bounded shorts: knock out any position whose instrument reached its
+        # knockout price this tick. Before season snapshots so closed shorts
+        # stop contributing to equity.
+        await shorts.sweep_knockouts(conn, tick_index)
 
         # Season lifecycle: activate due seasons, write day-boundary equity
         # snapshots, close finished seasons (all inside this tick's tx).
