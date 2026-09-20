@@ -603,3 +603,9 @@ async def close_season(conn: AsyncConnection, season_id: int) -> None:
             "UPDATE seasons SET status = 'CLOSED', prize_pool_minor = %s WHERE id = %s",
             (prize_pool, season_id),
         )
+        # League orders reference a dead season now -- cancel them.
+        await cur.execute(
+            "UPDATE orders SET status = 'CANCELLED' "
+            "WHERE season_id = %s AND status = 'OPEN'",
+            (season_id,),
+        )

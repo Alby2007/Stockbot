@@ -10,6 +10,7 @@ from psycopg.rows import dict_row
 
 from stockbot.margin import service as margin
 from stockbot.market import engine, events
+from stockbot.orders import service as orders
 from stockbot.seasons import service as seasons
 from stockbot.shorts import service as shorts
 
@@ -212,6 +213,11 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # knockout price this tick. Before season snapshots so closed shorts
         # stop contributing to equity.
         await shorts.sweep_knockouts(conn, tick_index)
+
+        # Resting limit orders: fill any whose limit the new marks satisfy.
+        # Before the margin sweep so a fill's impact and equity change land
+        # in this tick's margin state, not next tick's.
+        await orders.match_orders(conn, tick_index)
 
         # Phase 2 margin maintenance, all inside the tick transaction where
         # every instrument is already locked: refresh published short

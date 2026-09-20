@@ -51,7 +51,10 @@ from stockbot.ledger.service import (
     get_user_account_id,
     post_transfer,
 )
+from stockbot.margin.errors import MarginError
+from stockbot.margin.service import compute_health
 from stockbot.market.tick import apply_tick
+from stockbot.shop.service import buy_item
 from stockbot.simulation.metrics import faucet_sink_ratio, gini_coefficient
 from stockbot.trading.errors import TradingError
 from stockbot.trading.service import execute_trade
@@ -60,6 +63,7 @@ log = logging.getLogger("stockbot.simulation")
 
 SYNTHETIC_USER_ID_BASE = 900_000_000_000_000
 WHALE_STARTING_GRANT_MINOR = 500_000  # $5,000
+SHORTER_STARTING_GRANT_MINOR = 200_000  # $2,000: tier 1 ($500) + trading cash
 TICKS_PER_SIMULATED_DAY = 1440
 
 
@@ -69,15 +73,17 @@ class Agent:
     archetype: str
     wash_partner_id: int | None = None
     wash_ticker: str | None = None
+    short_ticker: str | None = None
 
 
 def build_cohort(num_users: int, rng: random.Random) -> list[Agent]:
     whale_count = max(1, num_users // 100)
     wash_pairs = max(1, num_users // 50)
     remaining = max(0, num_users - whale_count - wash_pairs * 2)
-    grinder_count = round(remaining * 0.5)
-    yolo_count = round(remaining * 0.25)
-    farmer_count = max(0, remaining - grinder_count - yolo_count)
+    grinder_count = round(remaining * 0.45)
+    yolo_count = round(remaining * 0.2)
+    shorter_count = round(remaining * 0.1)
+    farmer_count = max(0, remaining - grinder_count - yolo_count - shorter_count)
 
     agents: list[Agent] = []
     next_id = SYNTHETIC_USER_ID_BASE
@@ -96,6 +102,7 @@ def build_cohort(num_users: int, rng: random.Random) -> list[Agent]:
         agents.append(Agent(b, "wash_trader", wash_partner_id=a))
     _add("grinder", grinder_count)
     _add("yolo", yolo_count)
+    _add("shorter", shorter_count)
     _add("farmer", farmer_count)
 
     rng.shuffle(agents)
@@ -106,15 +113,28 @@ async def initialize_agents(conn: AsyncConnection, agents: list[Agent]) -> None:
     faucet_id = await get_system_account_id(conn, "FAUCET")
     for agent in agents:
         await bootstrap_user(conn, agent.user_id)
-        if agent.archetype == "whale":
+        if agent.archetype in ("whale", "shorter"):
             account_id = await get_user_account_id(conn, agent.user_id)
+            grant = (
+                WHALE_STARTING_GRANT_MINOR
+                if agent.archetype == "whale"
+                else SHORTER_STARTING_GRANT_MINOR
+            )
             await post_transfer(
                 conn,
                 from_account_id=faucet_id,
                 to_account_id=account_id,
-                amount=WHALE_STARTING_GRANT_MINOR,
-                reason="SIM_WHALE_SEED",
+                amount=grant,
+                reason="SIM_SEED",
             )
+        if agent.archetype == "shorter":
+            # Unlock margin tier 1 (2x gross leverage) before the sim starts.
+            from stockbot.shop.errors import ShopError
+
+            try:
+                await buy_item(conn, agent.user_id, "margin_tier")
+            except (ShopError, InsufficientFundsError):
+                log.warning("shorter %s couldn't buy margin tier", agent.user_id)
 
 
 async def _random_active_ticker(conn: AsyncConnection, rng: random.Random) -> str | None:
@@ -215,7 +235,53 @@ async def _run_agent_day(conn: AsyncConnection, agent: Agent, rng: random.Random
             # exact pattern compliance/wash_trade.py is designed to catch.
             await execute_trade(conn, user_id=agent.user_id, ticker=ticker, side="BUY", quantity=20)
             await execute_trade(conn, user_id=partner_id, ticker=ticker, side="SELL", quantity=5)
-    except (InsufficientFundsError, TradingError):
+
+        if agent.archetype == "shorter":
+            await _safe_claim(conn, agent.user_id)
+            if rng.random() >= 0.4:
+                return
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT i.ticker, p.quantity FROM positions p
+                    JOIN instruments i ON i.id = p.instrument_id
+                    WHERE p.user_id = %s AND p.quantity < 0 AND p.season_id IS NULL
+                    ORDER BY i.ticker
+                    """,
+                    (agent.user_id,),
+                )
+                shorts_held = await cur.fetchall()
+            if shorts_held:
+                # Cover an existing short with some probability.
+                if rng.random() < 0.5:
+                    ticker, qty = rng.choice(shorts_held)
+                    await execute_trade(
+                        conn,
+                        user_id=agent.user_id,
+                        ticker=str(ticker),
+                        side="BUY",
+                        quantity=int(-qty),
+                    )
+                return
+            # Open a short sized to a fraction of equity.
+            health = await compute_health(conn, agent.user_id, None)
+            ticker = await _random_active_ticker(conn, rng)
+            if ticker is None:
+                return
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT quoted_price FROM instruments WHERE ticker = %s", (ticker,)
+                )
+                row = await cur.fetchone()
+            price_minor = int(float(row[0]) * 100) if row else 100
+            target_notional = int(health.equity_minor * rng.uniform(0.3, 0.8))
+            quantity = target_notional // max(price_minor, 1)
+            if quantity < 1:
+                return
+            await execute_trade(
+                conn, user_id=agent.user_id, ticker=ticker, side="SELL", quantity=quantity
+            )
+    except (InsufficientFundsError, TradingError, MarginError):
         pass
 
 
@@ -234,7 +300,7 @@ async def net_worth_by_user(conn: AsyncConnection, user_ids: list[int]) -> dict[
             SELECT p.user_id, SUM(p.quantity * i.quoted_price)
             FROM positions p
             JOIN instruments i ON i.id = p.instrument_id
-            WHERE p.user_id = ANY(%s) AND p.quantity > 0 AND p.season_id IS NULL
+            WHERE p.user_id = ANY(%s) AND p.quantity <> 0 AND p.season_id IS NULL
             GROUP BY p.user_id
             """,
             (user_ids,),
@@ -252,11 +318,32 @@ async def economy_snapshot(conn: AsyncConnection) -> dict[str, float]:
     faucet_balance = await get_balance(conn, faucet_id)
     sink_balance = await get_balance(conn, sink_id)
     money_supply = -(faucet_balance + sink_balance)
+    insurance_id = await get_system_account_id(conn, "INSURANCE_FUND")
+    insurance_balance = await get_balance(conn, insurance_id)
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT COUNT(*) FROM liquidations")
+        row = await cur.fetchone()
+        liquidation_count = int(row[0]) if row else 0
+        await cur.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(-p.quantity * i.quoted_price), 0)
+            FROM positions p
+            JOIN instruments i ON i.id = p.instrument_id
+            WHERE p.quantity < 0 AND p.season_id IS NULL
+            """
+        )
+        short_row = await cur.fetchone()
+        short_positions = int(short_row[0]) if short_row else 0
+        short_notional = float(short_row[1]) if short_row else 0.0
     return {
         "faucet_printed": -faucet_balance,
         "sink_destroyed": sink_balance,
         "money_supply": money_supply,
         "faucet_sink_ratio": faucet_sink_ratio(-faucet_balance, sink_balance),
+        "insurance_fund": insurance_balance,
+        "liquidations": liquidation_count,
+        "open_shorts": short_positions,
+        "short_notional_major": short_notional,
     }
 
 
@@ -303,17 +390,21 @@ async def run_simulation(
             gini = gini_coefficient(list(net_worth.values()))
             timeline.append({"day": day, "gini": gini, **econ})
             log.info(
-                "day %d: money_supply=%s gini=%.3f faucet_sink_ratio=%.3f",
+                "day %d: money_supply=%s gini=%.3f faucet_sink=%.3f "
+                "liquidations=%d insurance=%s open_shorts=%d",
                 day,
                 econ["money_supply"],
                 gini,
                 econ["faucet_sink_ratio"],
+                int(econ["liquidations"]),
+                econ["insurance_fund"],
+                int(econ["open_shorts"]),
             )
 
     final_net_worth = await net_worth_by_user(conn, user_ids)
 
     by_archetype: dict[str, dict[str, float]] = {}
-    for archetype in {"grinder", "yolo", "farmer", "wash_trader", "whale"}:
+    for archetype in {"grinder", "yolo", "farmer", "wash_trader", "whale", "shorter"}:
         members = [uid for uid in user_ids if archetype_by_user[uid] == archetype]
         if not members:
             continue

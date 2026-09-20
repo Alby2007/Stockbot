@@ -14,6 +14,11 @@ DB), seasons/league (`/league info|join|standings`, `league` flag on
 and Phase 2 true margin (`stockbot.margin`, signed positions, liquidation
 engine, insurance fund, short interest + squeeze, SBX-40 index, `/margin`
 `/collateral` `/liquidations`, `margin_tier` shop unlock) are all done.
+Post-Phase-2: limit orders (`orders` table, `/order buy|sell|list|cancel`,
+matched inside `apply_tick` before the margin sweep; fills run through
+`execute_trade` in a savepoint so unfillable orders stay OPEN; league
+orders are cancelled on season close) and a `shorter` archetype in the sim
+harness are done.
 
 Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
 preserved -- short proceeds credit to cash and are spendable; leverage is

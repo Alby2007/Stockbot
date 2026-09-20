@@ -39,6 +39,7 @@ from stockbot.market.data import (
     get_instrument_snapshot,
 )
 from stockbot.market.engine import TICKS_PER_DAY
+from stockbot.orders.service import cancel_order, list_open_orders, place_order
 from stockbot.seasons.errors import SeasonError
 from stockbot.seasons.service import (
     close_season,
@@ -674,6 +675,142 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         embed = discord.Embed(title="Liquidations")
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(embed=embed)
+
+    order_group = app_commands.Group(
+        name="order", description="Resting limit orders, matched once per tick"
+    )
+
+    async def _place_order(
+        interaction: discord.Interaction,
+        ticker: str,
+        side: str,
+        quantity: int,
+        limit: float,
+        hours: float | None,
+        league: bool,
+    ) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            season_id: int | None = None
+            if league:
+                entry = await get_active_entry(conn, interaction.user.id)
+                if entry is None:
+                    await interaction.response.send_message(
+                        "You're not entered in an active season. `/league join` first.",
+                        ephemeral=True,
+                    )
+                    return
+                season_id = entry[0]
+            try:
+                result = await place_order(
+                    conn,
+                    user_id=interaction.user.id,
+                    ticker=ticker,
+                    side=side,  # type: ignore[arg-type]
+                    quantity=quantity,
+                    limit_price=Decimal(str(limit)),
+                    season_id=season_id,
+                    expires_in_ticks=(
+                        None if hours is None else int(hours * TICKS_PER_DAY / 24)
+                    ),
+                )
+            except (TradingError, ValueError) as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        expiry = (
+            "GTC"
+            if result.expires_tick is None
+            else f"expires tick {result.expires_tick}"
+        )
+        await interaction.response.send_message(
+            f"Order **#{result.order_id}** resting: {result.side} "
+            f"**{result.quantity}** {result.ticker} @ {format_price(result.limit_price)} "
+            f"({expiry}). Fills when the market reaches it."
+        )
+
+    @order_group.command(name="buy", description="Rest a limit buy")
+    @app_commands.describe(
+        ticker="Instrument ticker",
+        quantity="Number of shares",
+        limit="Max price you'll pay",
+        hours="Auto-expire after this many hours (omit for GTC)",
+        league="Place the order in your league portfolio",
+    )
+    async def order_buy(
+        interaction: discord.Interaction,
+        ticker: str,
+        quantity: app_commands.Range[int, 1, None],
+        limit: app_commands.Range[float, 0.0001, None],
+        hours: app_commands.Range[float, 0.02, None] | None = None,
+        league: bool = False,
+    ) -> None:
+        await _place_order(interaction, ticker, "BUY", quantity, limit, hours, league)
+
+    @order_group.command(
+        name="sell",
+        description="Rest a limit sell (past your holdings opens a short — needs margin)",
+    )
+    @app_commands.describe(
+        ticker="Instrument ticker",
+        quantity="Number of shares",
+        limit="Min price you'll accept",
+        hours="Auto-expire after this many hours (omit for GTC)",
+        league="Place the order in your league portfolio",
+    )
+    async def order_sell(
+        interaction: discord.Interaction,
+        ticker: str,
+        quantity: app_commands.Range[int, 1, None],
+        limit: app_commands.Range[float, 0.0001, None],
+        hours: app_commands.Range[float, 0.02, None] | None = None,
+        league: bool = False,
+    ) -> None:
+        await _place_order(interaction, ticker, "SELL", quantity, limit, hours, league)
+
+    @order_group.command(name="list", description="Show your resting orders")
+    @app_commands.describe(league="Show league orders instead of main-portfolio ones")
+    async def order_list(interaction: discord.Interaction, league: bool = False) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            season_id: int | None = None
+            if league:
+                entry = await get_active_entry(conn, interaction.user.id)
+                if entry is None:
+                    await interaction.response.send_message(
+                        "You're not entered in an active season.", ephemeral=True
+                    )
+                    return
+                season_id = entry[0]
+            rows = await list_open_orders(conn, interaction.user.id, season_id)
+        if not rows:
+            await interaction.response.send_message("No open orders.", ephemeral=True)
+            return
+        lines = [
+            f"#{r['id']:<4} {r['side']:<4} {r['quantity']:>5} {r['ticker']:<6} "
+            f"@ {format_price(r['limit_price']):>10} "
+            f"(mark {format_price(r['quoted_price'])})"
+            for r in rows
+        ]
+        embed = discord.Embed(title="Open orders")
+        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        await interaction.response.send_message(embed=embed)
+
+    @order_group.command(name="cancel", description="Cancel a resting order")
+    @app_commands.describe(order_id="Order id from /order list")
+    async def order_cancel(interaction: discord.Interaction, order_id: int) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            cancelled = await cancel_order(
+                conn, user_id=interaction.user.id, order_id=order_id
+            )
+        if cancelled:
+            await interaction.response.send_message(f"Cancelled order **#{order_id}**.")
+        else:
+            await interaction.response.send_message(
+                f"No open order **#{order_id}** on your account.", ephemeral=True
+            )
+
+    tree.add_command(order_group)
 
     shop_group = app_commands.Group(
         name="shop", description="Portfolio slots, analyst tools, and cosmetics"
