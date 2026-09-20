@@ -9,6 +9,7 @@ from psycopg import AsyncConnection, sql
 from psycopg.rows import dict_row
 
 from stockbot.market import engine, events
+from stockbot.seasons import service as seasons
 
 
 async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
@@ -171,5 +172,9 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                         )
                     ],
                 )
+
+        # Season lifecycle: activate due seasons, write day-boundary equity
+        # snapshots, close finished seasons (all inside this tick's tx).
+        await seasons.on_tick(conn, tick_index)
 
     return tick_index

@@ -32,6 +32,18 @@ from stockbot.market.data import (
     get_instrument_snapshot,
 )
 from stockbot.market.engine import TICKS_PER_DAY
+from stockbot.seasons.errors import SeasonError
+from stockbot.seasons.service import (
+    close_season,
+    create_season,
+    current_tick,
+    get_active_entry,
+    get_latest_season,
+    get_open_season,
+    join_season,
+    league_equity_minor,
+    standings,
+)
 from stockbot.shop.errors import ShopError
 from stockbot.shop.service import (
     BASE_SLOTS,
@@ -302,9 +314,21 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.response.send_message(embed=embed)
 
     @tree.command(name="portfolio", description="Show your positions and net worth")
-    async def portfolio(interaction: discord.Interaction) -> None:
+    @app_commands.describe(league="Show your league portfolio instead of your main one")
+    async def portfolio(interaction: discord.Interaction, league: bool = False) -> None:
         async with db.connection() as conn:
-            account_id = await bootstrap_user(conn, interaction.user.id)
+            season_id: int | None = None
+            if league:
+                entry = await get_active_entry(conn, interaction.user.id)
+                if entry is None:
+                    await interaction.response.send_message(
+                        "You're not entered in an active season. `/league join` first.",
+                        ephemeral=True,
+                    )
+                    return
+                season_id, account_id = entry
+            else:
+                account_id = await bootstrap_user(conn, interaction.user.id)
             cash = await get_balance(conn, account_id)
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -313,9 +337,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     FROM positions p
                     JOIN instruments i ON i.id = p.instrument_id
                     WHERE p.user_id = %s AND p.quantity > 0
+                      AND p.season_id IS NOT DISTINCT FROM %s
                     ORDER BY i.ticker
                     """,
-                    (interaction.user.id,),
+                    (interaction.user.id, season_id),
                 )
                 positions = await cur.fetchall()
 
@@ -332,29 +357,55 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         net_worth_minor = int(cash + holdings_value * 100)
         lines.append(f"\nNet worth: {format_money(net_worth_minor)}")
 
-        embed = discord.Embed(title=f"{interaction.user.display_name}'s portfolio")
+        embed = discord.Embed(
+            title=f"{interaction.user.display_name}'s {'league' if league else ''} portfolio"
+        )
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(embed=embed)
 
     @tree.command(name="buy", description="Buy shares of an instrument")
-    @app_commands.describe(ticker="Instrument ticker", quantity="Number of shares")
+    @app_commands.describe(
+        ticker="Instrument ticker",
+        quantity="Number of shares",
+        league="Trade from your season league stake instead of your main portfolio",
+    )
     async def buy(
-        interaction: discord.Interaction, ticker: str, quantity: app_commands.Range[int, 1, None]
+        interaction: discord.Interaction,
+        ticker: str,
+        quantity: app_commands.Range[int, 1, None],
+        league: bool = False,
     ) -> None:
-        await _do_trade(interaction, ticker, "BUY", quantity)
+        await _do_trade(interaction, ticker, "BUY", quantity, league)
 
     @tree.command(name="sell", description="Sell shares of an instrument")
-    @app_commands.describe(ticker="Instrument ticker", quantity="Number of shares")
+    @app_commands.describe(
+        ticker="Instrument ticker",
+        quantity="Number of shares",
+        league="Trade from your season league stake instead of your main portfolio",
+    )
     async def sell(
-        interaction: discord.Interaction, ticker: str, quantity: app_commands.Range[int, 1, None]
+        interaction: discord.Interaction,
+        ticker: str,
+        quantity: app_commands.Range[int, 1, None],
+        league: bool = False,
     ) -> None:
-        await _do_trade(interaction, ticker, "SELL", quantity)
+        await _do_trade(interaction, ticker, "SELL", quantity, league)
 
     async def _do_trade(
-        interaction: discord.Interaction, ticker: str, side: str, quantity: int
+        interaction: discord.Interaction, ticker: str, side: str, quantity: int, league: bool
     ) -> None:
         async with db.connection() as conn:
             await bootstrap_user(conn, interaction.user.id)
+            season_id: int | None = None
+            if league:
+                entry = await get_active_entry(conn, interaction.user.id)
+                if entry is None:
+                    await interaction.response.send_message(
+                        "You're not entered in an active season. `/league join` first.",
+                        ephemeral=True,
+                    )
+                    return
+                season_id = entry[0]
             try:
                 result = await execute_trade(
                     conn,
@@ -363,6 +414,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     side=side,  # type: ignore[arg-type]
                     quantity=quantity,
                     interaction_id=str(interaction.id),
+                    season_id=season_id,
                 )
             except InsufficientFundsError:
                 await interaction.response.send_message(
@@ -430,6 +482,109 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
 
     tree.add_command(shop_group)
+
+    league_group = app_commands.Group(
+        name="league",
+        description="Season league: opt-in competitive track with an equal stake",
+    )
+
+    @league_group.command(name="info", description="Show the current or upcoming season")
+    async def league_info(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            season = await get_open_season(conn)
+            if season is None:
+                await interaction.response.send_message(
+                    "No league season is scheduled right now.", ephemeral=True
+                )
+                return
+            tick = await current_tick(conn)
+            entry = await get_active_entry(conn, interaction.user.id, season.id)
+            equity = (
+                await league_equity_minor(conn, season.id, interaction.user.id)
+                if entry
+                else None
+            )
+
+        embed = discord.Embed(title=f"League — {season.name}")
+        embed.add_field(name="Status", value=season.status)
+        embed.add_field(
+            name="Window",
+            value=(
+                f"day {(max(tick - season.start_tick, 0)) // TICKS_PER_DAY + 1} of "
+                f"{(season.end_tick - season.start_tick) // TICKS_PER_DAY}"
+                if season.status == "ACTIVE"
+                else f"starts in {(season.start_tick - tick) / TICKS_PER_DAY:.1f} day(s)"
+            ),
+        )
+        embed.add_field(name="Entry fee", value=format_money(season.entry_fee_minor))
+        embed.add_field(name="Stake", value=format_money(season.stake_minor))
+        embed.add_field(
+            name="You",
+            value=(
+                f"entered — equity {format_money(equity)}"
+                if equity is not None
+                else "not entered"
+            ),
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @league_group.command(name="join", description="Enter the open league season")
+    async def league_join(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            season = await get_open_season(conn)
+            try:
+                await join_season(conn, interaction.user.id)
+            except InsufficientFundsError:
+                fee = season.entry_fee_minor if season else 0
+                await interaction.response.send_message(
+                    f"Insufficient funds for the {format_money(fee)} entry fee.",
+                    ephemeral=True,
+                )
+                return
+            except SeasonError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        if season is None:
+            return  # join_season already reported "no open season"
+        await interaction.response.send_message(
+            f"Entered **{season.name}** — your league stake is "
+            f"**{format_money(season.stake_minor)}**. Trade it with "
+            "`/buy <ticker> <qty> league:True`."
+        )
+
+    @league_group.command(name="standings", description="Show league standings")
+    async def league_standings(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            season = await get_latest_season(conn)
+            if season is None:
+                await interaction.response.send_message(
+                    "No league season exists yet.", ephemeral=True
+                )
+                return
+            rows = await standings(conn, season.id)
+
+        if not rows:
+            await interaction.response.send_message(
+                f"**{season.name}** has no entrants yet.", ephemeral=True
+            )
+            return
+
+        closed = season.status == "CLOSED"
+        lines = []
+        for i, s in enumerate(rows[:15], start=1):
+            rank = s.final_rank if closed else i
+            score = f"{s.final_score:>6.2f}" if s.final_score is not None else "    --"
+            prize = f" +{format_money(s.prize_minor)}" if s.prize_minor else ""
+            lines.append(
+                f"{rank:>3}. <@{s.user_id}>  eq {format_money(s.equity_minor):>12}  "
+                f"score {score}{prize}"
+            )
+        embed = discord.Embed(title=f"League standings — {season.name} ({season.status})")
+        embed.description = "\n".join(lines)
+        await interaction.response.send_message(embed=embed)
+
+    tree.add_command(league_group)
 
     admin_group = app_commands.Group(name="admin", description="Bot admin tools")
 
@@ -501,6 +656,62 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ]
         await interaction.response.send_message(
             "```\n" + "\n".join(lines) + "\n```", ephemeral=True
+        )
+
+    @admin_group.command(name="season-create", description="Create a league season")
+    @app_commands.describe(
+        name="Season name",
+        days="Length in days (default 42)",
+        start_in_days="Days until the season opens for entries (default 0 = next tick)",
+        entry_fee="Entry fee, minor units (default 1000 = $10)",
+        stake="Equal league stake, minor units (default 100000 = $1,000)",
+    )
+    async def admin_season_create(
+        interaction: discord.Interaction,
+        name: str,
+        days: app_commands.Range[int, 1, 365] = 42,
+        start_in_days: app_commands.Range[int, 0, 365] = 0,
+        entry_fee: app_commands.Range[int, 0, None] = 1_000,
+        stake: app_commands.Range[int, 1, None] = 100_000,
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            tick = await current_tick(conn)
+            start = tick + start_in_days * TICKS_PER_DAY + 1
+            season_id = await create_season(
+                conn,
+                name=name,
+                start_tick=start,
+                end_tick=start + days * TICKS_PER_DAY,
+                entry_fee_minor=entry_fee,
+                stake_minor=stake,
+            )
+        await interaction.response.send_message(
+            f"Created season **{name}** (id {season_id}): starts tick {start}, "
+            f"runs {days} day(s), fee {format_money(entry_fee)}, "
+            f"stake {format_money(stake)}.",
+            ephemeral=True,
+        )
+
+    @admin_group.command(
+        name="season-close", description="Finalize a season now: score, rank, pay prizes"
+    )
+    async def admin_season_close(
+        interaction: discord.Interaction, season_id: int
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            try:
+                await close_season(conn, season_id)
+            except SeasonError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Season {season_id} closed.", ephemeral=True
         )
 
     tree.add_command(admin_group)

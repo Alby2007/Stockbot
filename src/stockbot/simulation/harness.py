@@ -197,7 +197,7 @@ async def _run_agent_day(conn: AsyncConnection, agent: Agent, rng: random.Random
                     """
                     SELECT p.quantity FROM positions p
                     JOIN instruments i ON i.id = p.instrument_id
-                    WHERE p.user_id = %s AND i.ticker = %s
+                    WHERE p.user_id = %s AND i.ticker = %s AND p.season_id IS NULL
                     """,
                     (partner_id, ticker),
                 )
@@ -234,7 +234,7 @@ async def net_worth_by_user(conn: AsyncConnection, user_ids: list[int]) -> dict[
             SELECT p.user_id, SUM(p.quantity * i.quoted_price)
             FROM positions p
             JOIN instruments i ON i.id = p.instrument_id
-            WHERE p.user_id = ANY(%s) AND p.quantity > 0
+            WHERE p.user_id = ANY(%s) AND p.quantity > 0 AND p.season_id IS NULL
             GROUP BY p.user_id
             """,
             (user_ids,),

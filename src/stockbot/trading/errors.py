@@ -39,3 +39,17 @@ class DuplicateInteractionError(TradingError):
     def __init__(self, interaction_id: str):
         self.interaction_id = interaction_id
         super().__init__(f"interaction {interaction_id} was already processed")
+
+
+class NotInLeagueError(TradingError):
+    """League-scoped trade attempted without an entry in an ACTIVE season.
+
+    Lives here (not seasons/errors.py) because execute_trade raises it;
+    keeping it in the trading module avoids a circular import through
+    trading/__init__ -> trading.service -> seasons.service.
+    """
+
+    def __init__(self, user_id: int, season_id: int):
+        self.user_id = user_id
+        self.season_id = season_id
+        super().__init__(f"not entered in season {season_id}, or season is not active")

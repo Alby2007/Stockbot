@@ -25,11 +25,12 @@ from psycopg.rows import dict_row
 
 from stockbot.ledger.service import get_system_account_id, get_user_account_id, post_transfer
 from stockbot.market import engine
-from stockbot.shop.service import get_slot_count
+from stockbot.shop.service import BASE_SLOTS, get_slot_count
 from stockbot.trading.errors import (
     DuplicateInteractionError,
     InstrumentHaltedError,
     InsufficientSharesError,
+    NotInLeagueError,
     TooManyPositionsError,
     UnknownInstrumentError,
 )
@@ -73,7 +74,12 @@ async def execute_trade(
     side: Side,
     quantity: int,
     interaction_id: str | None = None,
+    season_id: int | None = None,
 ) -> TradeResult:
+    """When `season_id` is set, the trade runs against the user's LEAGUE
+    account and a season-scoped position (league portfolio), keeping league
+    wealth isolated from the persistent main portfolio.
+    """
     if quantity <= 0:
         raise ValueError("quantity must be positive")
     ticker = ticker.upper()
@@ -100,7 +106,28 @@ async def execute_trade(
         if instrument["circuit_halted_until_tick"] is not None:
             raise InstrumentHaltedError(ticker)
 
-        account_id = await get_user_account_id(conn, user_id)
+        if season_id is None:
+            account_id = await get_user_account_id(conn, user_id)
+        else:
+            # League-scoped trade: the account must be the user's LEAGUE
+            # account in an ACTIVE season. Queried inline rather than via
+            # seasons.service -- importing that module here would create a
+            # cycle (seasons.errors -> trading.errors -> trading package ->
+            # this module).
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT e.account_id
+                    FROM season_entries e
+                    JOIN seasons s ON s.id = e.season_id
+                    WHERE e.user_id = %s AND e.season_id = %s AND s.status = 'ACTIVE'
+                    """,
+                    (user_id, season_id),
+                )
+                entry_row = await cur.fetchone()
+            if entry_row is None:
+                raise NotInLeagueError(user_id, season_id)
+            account_id = int(entry_row[0])
         async with conn.cursor() as cur:
             await cur.execute("SELECT id FROM accounts WHERE id = %s FOR UPDATE", (account_id,))
             await cur.fetchone()
@@ -137,9 +164,10 @@ async def execute_trade(
                 """
                 SELECT quantity, avg_cost FROM positions
                 WHERE user_id = %s AND instrument_id = %s
+                  AND season_id IS NOT DISTINCT FROM %s
                 FOR UPDATE
                 """,
-                (user_id, instrument_id),
+                (user_id, instrument_id, season_id),
             )
             position = await cur.fetchone()
         held_quantity = int(position[0]) if position else 0
@@ -147,11 +175,20 @@ async def execute_trade(
 
         if side == "BUY":
             if held_quantity == 0:
-                slot_count = await get_slot_count(conn, user_id)
+                # League plays with the base allotment for everyone --
+                # purchased slots are a main-economy advantage and the league
+                # promise is an equal start.
+                slot_count = (
+                    BASE_SLOTS if season_id is not None else await get_slot_count(conn, user_id)
+                )
                 async with conn.cursor() as cur:
                     await cur.execute(
-                        "SELECT COUNT(*) FROM positions WHERE user_id = %s AND quantity > 0",
-                        (user_id,),
+                        """
+                        SELECT COUNT(*) FROM positions
+                        WHERE user_id = %s AND quantity > 0
+                          AND season_id IS NOT DISTINCT FROM %s
+                        """,
+                        (user_id, season_id),
                     )
                     open_positions_row = await cur.fetchone()
                     assert open_positions_row is not None
@@ -198,15 +235,16 @@ async def execute_trade(
         async with conn.cursor() as cur:
             await cur.execute(
                 """
-                INSERT INTO positions (user_id, instrument_id, quantity, avg_cost, updated_at)
-                VALUES (%s, %s, %s, %s, now())
-                ON CONFLICT (user_id, instrument_id)
+                INSERT INTO positions
+                    (user_id, instrument_id, season_id, quantity, avg_cost, updated_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (user_id, instrument_id, season_id)
                 DO UPDATE SET
                     quantity = EXCLUDED.quantity,
                     avg_cost = EXCLUDED.avg_cost,
                     updated_at = now()
                 """,
-                (user_id, instrument_id, new_quantity, avg_cost),
+                (user_id, instrument_id, season_id, new_quantity, avg_cost),
             )
 
             new_quoted_price = Decimal(str(round(base_price * math.exp(impact_after), 6)))
@@ -223,9 +261,10 @@ async def execute_trade(
                 """
                 INSERT INTO trades (
                     user_id, instrument_id, side, quantity, fill_price,
-                    notional_minor, fee_minor, cash_transfer_id, fee_transfer_id, tick_index
+                    notional_minor, fee_minor, cash_transfer_id, fee_transfer_id,
+                    tick_index, season_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (
@@ -239,11 +278,21 @@ async def execute_trade(
                     cash_transfer_id,
                     fee_transfer_id,
                     current_tick_index,
+                    season_id,
                 ),
             )
             row = await cur.fetchone()
             assert row is not None
             trade_id = row[0]
+
+            if season_id is not None:
+                await cur.execute(
+                    """
+                    UPDATE season_entries SET trades_count = trades_count + 1
+                    WHERE season_id = %s AND user_id = %s
+                    """,
+                    (season_id, user_id),
+                )
 
     return TradeResult(
         trade_id=trade_id,
