@@ -16,10 +16,12 @@ from discord import app_commands
 
 from stockbot import db
 from stockbot.accounts.service import bootstrap_user
+from stockbot.admin.service import TUNABLE_PARAMS, ledger_audit, tune_instrument
 from stockbot.bot.charts import render_candle_chart
 from stockbot.bot.format import format_money, format_pct, format_price
 from stockbot.claims.errors import AlreadyClaimedTodayError
 from stockbot.claims.service import claim_daily
+from stockbot.config import get_settings
 from stockbot.ledger.errors import InsufficientFundsError
 from stockbot.ledger.service import get_balance
 from stockbot.market.data import (
@@ -427,3 +429,56 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
 
     tree.add_command(shop_group)
+
+    admin_group = app_commands.Group(name="admin", description="Bot admin tools")
+
+    def _is_admin(interaction: discord.Interaction) -> bool:
+        return interaction.user.id in get_settings().admin_user_ids
+
+    @admin_group.command(name="tune", description="Hot-tune an instrument's price engine parameter")
+    @app_commands.describe(
+        ticker="Instrument ticker",
+        param=f"One of: {', '.join(TUNABLE_PARAMS)}",
+        value="New value",
+    )
+    async def admin_tune(
+        interaction: discord.Interaction, ticker: str, param: str, value: float
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            try:
+                await tune_instrument(conn, ticker, param, value)
+            except (ValueError, TradingError) as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Set {ticker.upper()}.{param} = {value}", ephemeral=True
+        )
+
+    @admin_group.command(name="ledger-audit", description="Run the ledger sum-zero invariant audit")
+    async def admin_ledger_audit(interaction: discord.Interaction) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            report = await ledger_audit(conn)
+
+        status = "HEALTHY" if report.healthy else "\u26a0 UNHEALTHY"
+        lines = [
+            f"Status: {status}",
+            f"Ledger sum (should be 0): {report.ledger_sum}",
+            f"Negative user accounts (should be 0): {report.negative_user_accounts}",
+            "",
+            "System account balances:",
+        ]
+        lines += [
+            f"  {name:<16} {format_money(balance)}"
+            for name, balance in report.system_balances.items()
+        ]
+        await interaction.response.send_message(
+            "```\n" + "\n".join(lines) + "\n```", ephemeral=True
+        )
+
+    tree.add_command(admin_group)
