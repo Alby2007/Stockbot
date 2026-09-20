@@ -16,11 +16,18 @@ from discord import app_commands
 
 from stockbot import db
 from stockbot.accounts.service import bootstrap_user
+from stockbot.bot.charts import render_candle_chart
 from stockbot.bot.format import format_money, format_pct, format_price
 from stockbot.claims.errors import AlreadyClaimedTodayError
 from stockbot.claims.service import claim_daily
 from stockbot.ledger.errors import InsufficientFundsError
 from stockbot.ledger.service import get_balance
+from stockbot.market.data import (
+    InstrumentSnapshot,
+    all_instrument_snapshots,
+    current_tick_index,
+    get_instrument_snapshot,
+)
 from stockbot.market.engine import TICKS_PER_DAY
 from stockbot.trading.errors import TradingError
 from stockbot.trading.service import execute_trade
@@ -84,22 +91,17 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
     @tree.command(name="market", description="List all tradeable instruments")
     async def market(interaction: discord.Interaction) -> None:
-        async with db.connection() as conn, conn.cursor() as cur:
-            await cur.execute(
-                """
-                SELECT i.ticker, s.key AS sector_key, i.quoted_price, i.circuit_halted_until_tick
-                FROM instruments i
-                JOIN sectors s ON s.id = i.sector_id
-                WHERE i.is_active
-                ORDER BY s.key, i.ticker
-                """
-            )
-            rows = await cur.fetchall()
+        async with db.connection() as conn:
+            snapshots = await all_instrument_snapshots(conn)
 
         lines = []
-        for ticker, sector_key, quoted_price, halted_until in rows:
-            marker = " (halted)" if halted_until is not None else ""
-            lines.append(f"{ticker:<6} {sector_key:<11} {format_price(quoted_price):>12}{marker}")
+        for s in sorted(snapshots, key=lambda s: (s.sector_key, s.ticker)):
+            marker = " (halted)" if s.is_halted else ""
+            change = format_pct(s.day_change_pct) if s.day_change_pct is not None else "   n/a"
+            lines.append(
+                f"{s.ticker:<6} {s.sector_key:<11} {format_price(s.quoted_price):>12} "
+                f"{change:>9}{marker}"
+            )
 
         embed = discord.Embed(
             title="Market",
@@ -110,57 +112,181 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @tree.command(name="stock", description="Show detail for one instrument")
     @app_commands.describe(ticker="Instrument ticker, e.g. NORT")
     async def stock(interaction: discord.Interaction, ticker: str) -> None:
-        ticker = ticker.upper()
         async with db.connection() as conn:
+            snapshot = await get_instrument_snapshot(conn, ticker)
+        if snapshot is None:
+            await interaction.response.send_message(
+                f"No instrument found for `{ticker.upper()}`.", ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(title=f"{snapshot.ticker} \u2014 {snapshot.name}")
+        embed.add_field(name="Sector", value=snapshot.sector_name)
+        embed.add_field(name="Price", value=format_price(snapshot.quoted_price))
+        if snapshot.day_change_pct is not None:
+            embed.add_field(name="24h change", value=format_pct(snapshot.day_change_pct))
+        embed.add_field(name="Impact", value=format_pct(float(snapshot.impact)))
+        if snapshot.is_halted:
+            embed.add_field(name="Status", value="Halted (circuit breaker)")
+        await interaction.response.send_message(embed=embed)
+
+    @tree.command(name="chart", description="Show a price chart for an instrument")
+    @app_commands.describe(
+        ticker="Instrument ticker, e.g. NORT",
+        ticks="How many recent ticks to show (default 240, ~4h)",
+    )
+    async def chart(
+        interaction: discord.Interaction,
+        ticker: str,
+        ticks: app_commands.Range[int, 10, 1440] = 240,
+    ) -> None:
+        async with db.connection() as conn:
+            snapshot = await get_instrument_snapshot(conn, ticker)
+            if snapshot is None:
+                await interaction.response.send_message(
+                    f"No instrument found for `{ticker.upper()}`.", ephemeral=True
+                )
+                return
+            buf = await render_candle_chart(conn, snapshot.id, snapshot.ticker, ticks)
+
+        if buf is None:
+            await interaction.response.send_message("No price history yet.", ephemeral=True)
+            return
+
+        filename = f"{snapshot.ticker}.png"
+        file = discord.File(buf, filename=filename)
+        embed = discord.Embed(title=f"{snapshot.ticker} \u2014 {snapshot.name}")
+        embed.set_image(url=f"attachment://{filename}")
+        await interaction.response.send_message(embed=embed, file=file)
+
+    @tree.command(name="movers", description="Show today's biggest gainers and losers")
+    async def movers(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            snapshots = await all_instrument_snapshots(conn)
+        ranked = sorted(
+            (s for s in snapshots if s.day_change_pct is not None),
+            key=lambda s: s.day_change_pct,  # type: ignore[arg-type,return-value]
+        )
+        if not ranked:
+            await interaction.response.send_message(
+                "Not enough price history yet.", ephemeral=True
+            )
+            return
+
+        def _lines(items: list[InstrumentSnapshot]) -> str:
+            return "\n".join(
+                f"{s.ticker:<6} {format_price(s.quoted_price):>10} "
+                f"{format_pct(s.day_change_pct):>9}"  # type: ignore[arg-type]
+                for s in items
+            )
+
+        embed = discord.Embed(title="Movers (24h)")
+        embed.add_field(
+            name="Top gainers", value=f"```\n{_lines(ranked[-5:][::-1])}\n```", inline=False
+        )
+        embed.add_field(name="Top losers", value=f"```\n{_lines(ranked[:5])}\n```", inline=False)
+        await interaction.response.send_message(embed=embed)
+
+    @tree.command(name="sectors", description="Show average performance by sector")
+    async def sectors(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            snapshots = await all_instrument_snapshots(conn)
+
+        by_sector: dict[str, list[InstrumentSnapshot]] = {}
+        for s in snapshots:
+            by_sector.setdefault(s.sector_key, []).append(s)
+
+        lines = []
+        for sector_key in sorted(by_sector):
+            members = by_sector[sector_key]
+            changes = [s.day_change_pct for s in members if s.day_change_pct is not None]
+            avg_change = sum(changes) / len(changes) if changes else None
+            change_str = format_pct(avg_change) if avg_change is not None else "   n/a"
+            lines.append(f"{sector_key:<11} {members[0].sector_name:<16} {change_str:>9}")
+
+        embed = discord.Embed(title="Sectors (avg 24h change)")
+        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        await interaction.response.send_message(embed=embed)
+
+    @tree.command(name="calendar", description="Show upcoming earnings dates")
+    async def calendar(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            current_tick = await current_tick_index(conn) or 0
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
-                    SELECT i.id, i.name, s.name AS sector_name, i.quoted_price,
-                           i.impact, i.circuit_halted_until_tick
-                    FROM instruments i
-                    JOIN sectors s ON s.id = i.sector_id
-                    WHERE i.ticker = %s AND i.is_active
-                    """,
-                    (ticker,),
+                    SELECT i.ticker, e.resolve_tick
+                    FROM events e
+                    JOIN instruments i ON i.id = e.instrument_id
+                    WHERE e.kind = 'EARNINGS' AND NOT e.resolved
+                    ORDER BY e.resolve_tick
+                    LIMIT 20
+                    """
                 )
-                instrument = await cur.fetchone()
-            if instrument is None:
-                await interaction.response.send_message(
-                    f"No instrument found for `{ticker}`.", ephemeral=True
-                )
-                return
-            instrument_id, name, sector_name, quoted_price, impact, halted_until = instrument
+                rows = await cur.fetchall()
 
+        if not rows:
+            await interaction.response.send_message(
+                "No earnings scheduled yet -- check back after the market has ticked a bit.",
+                ephemeral=True,
+            )
+            return
+
+        lines = [
+            f"{ticker:<6} in {(resolve_tick - current_tick) / TICKS_PER_DAY:>5.1f} day(s)"
+            for ticker, resolve_tick in rows
+        ]
+        embed = discord.Embed(title="Earnings calendar")
+        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        await interaction.response.send_message(embed=embed)
+
+    @tree.command(name="news", description="Show pending news hints and recent resolutions")
+    async def news(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            current_tick = await current_tick_index(conn) or 0
             async with conn.cursor() as cur:
-                await cur.execute("SELECT MAX(tick_index) FROM market_ticks")
-                row = await cur.fetchone()
-                current_tick = row[0] if row else None
+                await cur.execute(
+                    """
+                    SELECT i.ticker, e.headline, e.resolve_tick
+                    FROM events e
+                    JOIN instruments i ON i.id = e.instrument_id
+                    WHERE e.kind = 'NEWS' AND NOT e.resolved AND e.scheduled_tick <= %s
+                    ORDER BY e.resolve_tick
+                    LIMIT 10
+                    """,
+                    (current_tick,),
+                )
+                pending = await cur.fetchall()
 
-            day_ago_close = None
-            if current_tick is not None:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        """
-                        SELECT close FROM candles
-                        WHERE instrument_id = %s AND tick_index <= %s
-                        ORDER BY tick_index DESC
-                        LIMIT 1
-                        """,
-                        (instrument_id, max(current_tick - TICKS_PER_DAY, 0)),
-                    )
-                    row = await cur.fetchone()
-                    if row:
-                        day_ago_close = row[0]
+                await cur.execute(
+                    """
+                    SELECT i.ticker, e.headline, e.magnitude
+                    FROM events e
+                    JOIN instruments i ON i.id = e.instrument_id
+                    WHERE e.kind = 'NEWS' AND e.resolved AND e.resolve_tick > %s
+                    ORDER BY e.resolve_tick DESC
+                    LIMIT 5
+                    """,
+                    (current_tick - TICKS_PER_DAY,),
+                )
+                resolved = await cur.fetchall()
 
-        embed = discord.Embed(title=f"{ticker} \u2014 {name}")
-        embed.add_field(name="Sector", value=sector_name)
-        embed.add_field(name="Price", value=format_price(quoted_price))
-        if day_ago_close:
-            change = float(quoted_price) / float(day_ago_close) - 1
-            embed.add_field(name="24h change", value=format_pct(change))
-        embed.add_field(name="Impact", value=format_pct(float(impact)))
-        if halted_until is not None:
-            embed.add_field(name="Status", value="Halted (circuit breaker)")
+        embed = discord.Embed(title="News")
+        if pending:
+            lines = [
+                f"[{ticker}] {headline} (effect lands in "
+                f"{(resolve_tick - current_tick) / 60:.1f}h)"
+                for ticker, headline, resolve_tick in pending
+            ]
+            embed.add_field(name="Pending", value="\n".join(lines)[:1024], inline=False)
+        if resolved:
+            lines = [
+                f"[{ticker}] {headline} \u2014 landed {format_pct(float(magnitude))}"
+                for ticker, headline, magnitude in resolved
+            ]
+            embed.add_field(name="Recently resolved", value="\n".join(lines)[:1024], inline=False)
+        if not pending and not resolved:
+            embed.description = "No news right now."
         await interaction.response.send_message(embed=embed)
 
     @tree.command(name="portfolio", description="Show your positions and net worth")

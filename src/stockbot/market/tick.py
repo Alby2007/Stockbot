@@ -8,7 +8,7 @@ import math
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
-from stockbot.market import engine
+from stockbot.market import engine, events
 
 
 async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
@@ -31,9 +31,9 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             # No accounts are touched here, so this is just instruments-by-id.
             await cur.execute(
                 """
-                SELECT i.id, s.key AS sector_key, i.drift, i.sigma, i.beta, i.gamma, i.kappa,
-                       i.fundamental_sigma, i.tau_ticks, i.base_price, i.fundamental_value,
-                       i.impact, i.circuit_halted_until_tick
+                SELECT i.id, i.ticker, s.key AS sector_key, i.drift, i.sigma, i.beta, i.gamma,
+                       i.kappa, i.fundamental_sigma, i.tau_ticks, i.base_price,
+                       i.fundamental_value, i.impact, i.circuit_halted_until_tick
                 FROM instruments i
                 JOIN sectors s ON s.id = i.sector_id
                 WHERE i.is_active
@@ -47,6 +47,14 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         rng = engine.rng_for_tick(master_seed, tick_index)
         market_factor = engine.draw_market_factor(rng)
         sector_factors = engine.draw_sector_factors(rng, sector_keys)
+
+        # Events (earnings + news) use their own deterministic RNG stream so
+        # they can't perturb the price engine's own draw sequence.
+        events_rng = engine.rng_for_tick(f"{master_seed}|events", tick_index)
+        await events.schedule_initial_earnings(conn, events_rng, tick_index)
+        fundamentals = {row["id"]: float(row["fundamental_value"]) for row in instrument_rows}
+        fundamentals = await events.resolve_due_events(conn, events_rng, tick_index, fundamentals)
+        await events.maybe_create_news(conn, events_rng, tick_index, instrument_rows)
 
         results: list[engine.InstrumentTickResult] = []
         halts: dict[int, int | None] = {}
@@ -64,7 +72,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                 fundamental_sigma=float(row["fundamental_sigma"]),
                 tau_ticks=float(row["tau_ticks"]),
                 base_price=float(row["base_price"]),
-                fundamental_value=float(row["fundamental_value"]),
+                fundamental_value=fundamentals[row["id"]],
                 impact=float(row["impact"]),
             )
             opens[state.id] = state.base_price * math.exp(state.impact)

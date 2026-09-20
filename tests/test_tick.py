@@ -64,6 +64,7 @@ async def test_apply_tick_is_deterministic_given_the_same_seed_and_starting_stat
         )
         await cur.execute("DELETE FROM candles")
         await cur.execute("DELETE FROM market_ticks")
+        await cur.execute("DELETE FROM events")
 
     await apply_tick(conn, "deterministic-seed")
 
