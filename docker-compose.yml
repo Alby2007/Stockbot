@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: stockbot
+      POSTGRES_PASSWORD: stockbot
+      POSTGRES_DB: stockbot
+    ports:
+      # Host port 5450: this machine already has native Postgres services
+      # bound to 5432 and 5433, so both are avoided here.
+      - "5450:5432"
+    volumes:
+      - stockbot-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stockbot -d stockbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build: .
+    command: ["python", "-m", "stockbot.migrate"]
+    environment:
+      DATABASE_URL: postgresql://stockbot:stockbot@postgres:5432/stockbot
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  bot:
+    build: .
+    command: ["python", "-m", "stockbot.bot.main"]
+    environment:
+      DATABASE_URL: postgresql://stockbot:stockbot@postgres:5432/stockbot
+      DISCORD_TOKEN: ${DISCORD_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  market:
+    build: .
+    command: ["python", "-m", "stockbot.market.main"]
+    environment:
+      DATABASE_URL: postgresql://stockbot:stockbot@postgres:5432/stockbot
+      MASTER_SEED: ${MASTER_SEED:-change-me-in-production}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  stockbot-postgres-data:
