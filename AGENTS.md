@@ -2,13 +2,23 @@
 
 Project plan: see the design doc (Phase 0 → Phase 2). Current status:
 **Phase 0 complete** (ledger, accounts, migrations, process skeleton,
-docker-compose). **Phase 1 nearly complete**: tick engine, 40 seeded
-instruments, trading (`/buy` `/sell`), `/balance` `/portfolio` `/market`
-`/stock` `/claim` `/movers` `/sectors` `/chart` `/news` `/calendar`, shop,
-admin (`/admin tune` `/admin ledger-audit` `/admin wash-trades`), wash-trade
-detection, and the economy simulation harness (`python -m
-stockbot.simulation.harness`, use a scratch DB) are done. Remaining Phase 1:
-seasons/league. Phase 2 (margin, shorts, liquidation) not started.
+docker-compose). **Phase 1 complete**: tick engine, 40 seeded instruments,
+trading (`/buy` `/sell`), `/balance` `/portfolio` `/market` `/stock` `/claim`
+`/movers` `/sectors` `/chart` `/news` `/calendar`, shop, admin
+(`/admin tune` `/admin ledger-audit` `/admin wash-trades` `/admin
+season-create` `/admin season-close`), wash-trade detection, the economy
+simulation harness (`python -m stockbot.simulation.harness`, use a scratch
+DB), and seasons/league (`/league info|join|standings`, `league` flag on
+`/buy` `/sell` `/portfolio`) are all done. Phase 2 (margin, shorts,
+liquidation) not started.
+
+Seasons design notes: LEAGUE accounts are `accounts` rows with
+`season_id` set; positions/trades carry `season_id` (NULL = main portfolio,
+via `NULLS NOT DISTINCT` unique key). `seasons.on_tick` runs inside
+`apply_tick`'s transaction: activation, day-boundary equity snapshots,
+close (score/rank/prizes/sweep-to-SINK). Note: `ALTER TYPE ... ADD VALUE`
+can't be referenced in its own transaction -- that's why the enum lives in
+0008 and everything that touches 'LEAGUE' is in 0009.
 
 ## Gotchas already hit once -- don't re-debug these
 
