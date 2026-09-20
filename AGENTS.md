@@ -2,11 +2,13 @@
 
 Project plan: see the design doc (Phase 0 → Phase 2). Current status:
 **Phase 0 complete** (ledger, accounts, migrations, process skeleton,
-docker-compose). **Phase 1 in progress**: tick engine, 40 seeded instruments,
-trading (`/buy` `/sell`), `/balance` `/portfolio` `/market` `/stock` `/claim`
-are done; market data richness (`/movers`, `/sectors`, `/news`, `/calendar`,
-charts), shop, seasons/league, and the economy simulation harness are not
-started yet.
+docker-compose). **Phase 1 nearly complete**: tick engine, 40 seeded
+instruments, trading (`/buy` `/sell`), `/balance` `/portfolio` `/market`
+`/stock` `/claim` `/movers` `/sectors` `/chart` `/news` `/calendar`, shop,
+admin (`/admin tune` `/admin ledger-audit` `/admin wash-trades`), wash-trade
+detection, and the economy simulation harness (`python -m
+stockbot.simulation.harness`, use a scratch DB) are done. Remaining Phase 1:
+seasons/league. Phase 2 (margin, shorts, liquidation) not started.
 
 ## Gotchas already hit once -- don't re-debug these
 
@@ -33,6 +35,24 @@ started yet.
   leftover open transaction when the connection is released, and each
   top-level `conn.transaction()` call still commits for real as long as nothing
   upstream nested it.
+- The simulation harness hit the same bug differently: `run_simulation` calls
+  `bootstrap_user`/`net_worth_by_user` (bare SELECTs) before the tick loop, so
+  the whole run silently became one never-committed transaction full of
+  savepoints -- progressively slower, holding `instruments` row locks,
+  invisible to other connections. Fix: `simulation/harness.py::_main_async`
+  sets `conn.set_autocommit(True)`, which also mirrors production (each
+  service call = one real transaction). Tests keep using rollback-wrapped
+  conns; do NOT add `conn.commit()` inside `run_simulation` or it would break
+  that isolation.
+- `executemany()` is not a batch: psycopg3 still waits per row (~186 socket
+  waits per 40-instrument tick measured, ~96ms/tick). `market/tick.py` uses a
+  single `UPDATE ... FROM (VALUES ...)` and one multi-row `INSERT` instead --
+  ~8ms/tick. Note VALUES columns with mixed None/int rows infer as `text`;
+  cast explicitly (`v.col::bigint`). For real bulk loads, consider COPY.
+- `rng.choice(rows)` is only deterministic if the SQL has `ORDER BY` --
+  Postgres row order shifts as UPDATEs rearrange tuples, which made the
+  wash-trader sim test flaky until `_random_active_ticker` got `ORDER BY
+  ticker`.
 
 ## Environment
 
