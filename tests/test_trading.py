@@ -6,10 +6,10 @@ from psycopg import AsyncConnection
 from stockbot.accounts.service import bootstrap_user
 from stockbot.ledger.errors import InsufficientFundsError
 from stockbot.ledger.service import get_balance, get_system_account_id, post_transfer
+from stockbot.margin.errors import MarginNotUnlockedError
 from stockbot.trading.errors import (
     DuplicateInteractionError,
     InstrumentHaltedError,
-    InsufficientSharesError,
     UnknownInstrumentError,
 )
 from stockbot.trading.service import execute_trade
@@ -77,10 +77,12 @@ async def test_buy_pushes_price_up_via_impact(conn: AsyncConnection) -> None:
     assert quoted_price > base_price
 
 
-async def test_sell_requires_a_position(conn: AsyncConnection) -> None:
+async def test_sell_without_position_requires_margin_tier(conn: AsyncConnection) -> None:
+    """Phase 2: selling more than held opens a true margin short, which needs
+    a margin tier entitlement. Without one it's rejected."""
     await bootstrap_user(conn, 1003)
     ticker = await _first_ticker(conn)
-    with pytest.raises(InsufficientSharesError):
+    with pytest.raises(MarginNotUnlockedError):
         await execute_trade(conn, user_id=1003, ticker=ticker, side="SELL", quantity=1)
 
 

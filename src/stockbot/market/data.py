@@ -26,6 +26,7 @@ class InstrumentSnapshot:
     impact: Decimal
     halted_until_tick: int | None
     day_ago_close: Decimal | None
+    short_interest_pct: Decimal = Decimal(0)
 
     @property
     def day_change_pct(self) -> float | None:
@@ -57,7 +58,7 @@ async def all_instrument_snapshots(conn: AsyncConnection) -> list[InstrumentSnap
         await cur.execute(
             """
             SELECT i.id, i.ticker, i.name, s.key, s.name, i.quoted_price, i.impact,
-                   i.circuit_halted_until_tick, c.close
+                   i.circuit_halted_until_tick, c.close, i.short_interest_pct
             FROM instruments i
             JOIN sectors s ON s.id = i.sector_id
             LEFT JOIN LATERAL (
@@ -84,6 +85,7 @@ async def all_instrument_snapshots(conn: AsyncConnection) -> list[InstrumentSnap
             impact=r[6],
             halted_until_tick=r[7],
             day_ago_close=r[8],
+            short_interest_pct=r[9],
         )
         for r in rows
     ]

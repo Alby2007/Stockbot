@@ -24,12 +24,18 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from stockbot.ledger.service import get_system_account_id, get_user_account_id, post_transfer
+from stockbot.margin import service as margin
+from stockbot.margin.errors import (
+    InsufficientMarginError,
+    MarginNotUnlockedError,
+    PositionLimitError,
+    ShortInterestLimitError,
+)
 from stockbot.market import engine
 from stockbot.shop.service import BASE_SLOTS, get_slot_count
 from stockbot.trading.errors import (
     DuplicateInteractionError,
     InstrumentHaltedError,
-    InsufficientSharesError,
     NotInLeagueError,
     TooManyPositionsError,
     UnknownInstrumentError,
@@ -93,7 +99,7 @@ async def execute_trade(
             await cur.execute(
                 """
                 SELECT id, base_price, impact, liquidity, lambda_impact, max_impact,
-                       is_active, circuit_halted_until_tick
+                       is_active, circuit_halted_until_tick, short_interest_pct
                 FROM instruments
                 WHERE ticker = %s
                 FOR UPDATE
@@ -139,7 +145,18 @@ async def execute_trade(
         lambda_impact = float(instrument["lambda_impact"])
         max_impact = float(instrument["max_impact"])
 
+        # Squeeze mechanic: elevated short interest makes buy-side fills
+        # progressively more expensive -- covering gets harder exactly when
+        # everyone needs to.
         signed_notional = base_price * quantity * (1 if side == "BUY" else -1)
+        if side == "BUY":
+            cfg = await margin.margin_config(conn)
+            si = Decimal(instrument["short_interest_pct"] or 0)
+            over = si - cfg["margin.squeeze_si_threshold"]
+            if over > 0:
+                lambda_impact *= float(
+                    1 + cfg["margin.squeeze_lambda_boost"] * over
+                )
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=impact_before,
@@ -162,7 +179,7 @@ async def execute_trade(
         async with conn.cursor() as cur:
             await cur.execute(
                 """
-                SELECT quantity, avg_cost FROM positions
+                SELECT quantity, avg_cost, borrow_fees_accrued FROM positions
                 WHERE user_id = %s AND instrument_id = %s
                   AND season_id IS NOT DISTINCT FROM %s
                 FOR UPDATE
@@ -172,30 +189,32 @@ async def execute_trade(
             position = await cur.fetchone()
         held_quantity = int(position[0]) if position else 0
         avg_cost = Decimal(position[1]) if position else Decimal(0)
+        accrued = Decimal(position[2]) if position else Decimal(0)
 
-        if side == "BUY":
-            if held_quantity == 0:
-                # League plays with the base allotment for everyone --
-                # purchased slots are a main-economy advantage and the league
-                # promise is an equal start.
-                slot_count = (
-                    BASE_SLOTS if season_id is not None else await get_slot_count(conn, user_id)
+        if held_quantity == 0:
+            # League plays with the base allotment for everyone --
+            # purchased slots are a main-economy advantage and the league
+            # promise is an equal start.
+            slot_count = (
+                BASE_SLOTS if season_id is not None else await get_slot_count(conn, user_id)
+            )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT COUNT(*) FROM positions
+                    WHERE user_id = %s AND quantity <> 0
+                      AND season_id IS NOT DISTINCT FROM %s
+                    """,
+                    (user_id, season_id),
                 )
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        """
-                        SELECT COUNT(*) FROM positions
-                        WHERE user_id = %s AND quantity > 0
-                          AND season_id IS NOT DISTINCT FROM %s
-                        """,
-                        (user_id, season_id),
-                    )
-                    open_positions_row = await cur.fetchone()
-                    assert open_positions_row is not None
-                    open_positions = open_positions_row[0]
-                if open_positions >= slot_count:
-                    raise TooManyPositionsError(open_positions, slot_count)
+                open_positions_row = await cur.fetchone()
+                assert open_positions_row is not None
+                open_positions = open_positions_row[0]
+            if open_positions >= slot_count:
+                raise TooManyPositionsError(open_positions, slot_count)
 
+        settle_accrued = False
+        if side == "BUY":
             cash_transfer_id = await post_transfer(
                 conn,
                 from_account_id=account_id,
@@ -205,10 +224,27 @@ async def execute_trade(
                 memo=ticker,
             )
             new_quantity = held_quantity + quantity
-            avg_cost = ((avg_cost * held_quantity) + (fill_price * quantity)) / new_quantity
+            if held_quantity < 0:
+                # Covering a short settles its accrued borrow fees to SINK.
+                accrued_minor = int(accrued.quantize(Decimal("1"), ROUND_HALF_UP))
+                if accrued_minor > 0:
+                    await post_transfer(
+                        conn,
+                        from_account_id=account_id,
+                        to_account_id=sink_id,
+                        amount=accrued_minor,
+                        reason="BORROW_FEE",
+                        memo=ticker,
+                    )
+                settle_accrued = True
+                # Any remainder beyond the short becomes a fresh long.
+                if new_quantity > 0:
+                    avg_cost = fill_price
+            else:
+                avg_cost = ((avg_cost * held_quantity) + (fill_price * quantity)) / new_quantity
         else:
-            if quantity > held_quantity:
-                raise InsufficientSharesError(ticker, quantity, held_quantity)
+            # SELL always credits proceeds -- selling past zero opens a true
+            # short (margin-gated below).
             cash_transfer_id = await post_transfer(
                 conn,
                 from_account_id=market_maker_id,
@@ -218,6 +254,12 @@ async def execute_trade(
                 memo=ticker,
             )
             new_quantity = held_quantity - quantity
+            if held_quantity <= 0:
+                avg_cost = (
+                    (avg_cost * abs(held_quantity)) + (fill_price * quantity)
+                ) / abs(new_quantity)
+            elif new_quantity <= 0:
+                avg_cost = fill_price
             if new_quantity == 0:
                 avg_cost = Decimal(0)
 
@@ -242,9 +284,13 @@ async def execute_trade(
                 DO UPDATE SET
                     quantity = EXCLUDED.quantity,
                     avg_cost = EXCLUDED.avg_cost,
+                    borrow_fees_accrued = CASE
+                        WHEN EXCLUDED.quantity >= 0 OR %s THEN 0
+                        ELSE positions.borrow_fees_accrued
+                    END,
                     updated_at = now()
                 """,
-                (user_id, instrument_id, season_id, new_quantity, avg_cost),
+                (user_id, instrument_id, season_id, new_quantity, avg_cost, settle_accrued),
             )
 
             new_quoted_price = Decimal(str(round(base_price * math.exp(impact_after), 6)))
@@ -285,6 +331,38 @@ async def execute_trade(
             assert row is not None
             trade_id = row[0]
 
+        # Margin gates, evaluated on the post-trade state (raising rolls the
+        # whole trade back). Reducing a position is always allowed.
+        short_grew = max(0, -new_quantity) > max(0, -held_quantity)
+        gross_grew = abs(new_quantity) > abs(held_quantity)
+        if short_grew or gross_grew:
+            cfg = await margin.margin_config(conn)
+            tier = await margin.margin_tier(conn, user_id, season_id)
+            health = await margin.compute_health(conn, user_id, season_id)
+            if short_grew:
+                if tier < 1:
+                    raise MarginNotUnlockedError(user_id)
+                si_shares, float_shares = await margin._instrument_short_interest(
+                    conn, instrument_id
+                )
+                if (
+                    float_shares > 0
+                    and Decimal(si_shares)
+                    > cfg["margin.max_short_interest_pct"] * float_shares
+                ):
+                    raise ShortInterestLimitError(ticker)
+                if health.equity_minor < health.init_req_minor:
+                    raise InsufficientMarginError(
+                        health.equity_minor, health.init_req_minor
+                    )
+            if gross_grew:
+                cap = margin.leverage_cap(tier, cfg)
+                if Decimal(health.gross_notional_minor) > cap * health.equity_minor:
+                    raise PositionLimitError(
+                        health.gross_notional_minor, int(cap * health.equity_minor)
+                    )
+
+        async with conn.cursor() as cur:
             if season_id is not None:
                 await cur.execute(
                     """

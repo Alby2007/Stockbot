@@ -35,6 +35,7 @@ from stockbot.ledger.service import (
     get_user_account_id,
     post_transfer,
 )
+from stockbot.margin import service as margin
 from stockbot.market.engine import TICKS_PER_DAY
 from stockbot.seasons.errors import (
     AlreadyEnteredError,
@@ -208,6 +209,7 @@ async def join_season(conn: AsyncConnection, user_id: int, season_id: int | None
         sink_id = await get_system_account_id(conn, "SINK")
         faucet_id = await get_system_account_id(conn, "FAUCET")
         if season.entry_fee_minor > 0:
+            await margin.assert_spend_ok(conn, user_id, season.entry_fee_minor)
             await post_transfer(
                 conn,
                 from_account_id=account_id,
@@ -310,10 +312,11 @@ async def league_equity_minor(conn: AsyncConnection, season_id: int, user_id: in
             JOIN accounts a ON a.id = e.account_id
             LEFT JOIN (
                 SELECT p.user_id,
-                       CAST(SUM(p.quantity * i.quoted_price * 100) AS BIGINT) AS value_minor
+                       CAST(SUM(p.quantity * i.quoted_price * 100
+                                - p.borrow_fees_accrued) AS BIGINT) AS value_minor
                 FROM positions p
                 JOIN instruments i ON i.id = p.instrument_id
-                WHERE p.season_id = %s AND p.quantity > 0
+                WHERE p.season_id = %s AND p.quantity <> 0
                 GROUP BY p.user_id
             ) pos ON pos.user_id = e.user_id
             LEFT JOIN ({_SHORT_VALUE_SUBQUERY}) sh
@@ -373,11 +376,12 @@ async def on_tick(
                 JOIN accounts a ON a.id = e.account_id
                 LEFT JOIN (
                     SELECT p.season_id, p.user_id,
-                           CAST(SUM(p.quantity * i.quoted_price * 100) AS BIGINT)
+                           CAST(SUM(p.quantity * i.quoted_price * 100
+                                    - p.borrow_fees_accrued) AS BIGINT)
                                AS value_minor
                     FROM positions p
                     JOIN instruments i ON i.id = p.instrument_id
-                    WHERE p.season_id IS NOT NULL AND p.quantity > 0
+                    WHERE p.season_id IS NOT NULL AND p.quantity <> 0
                     GROUP BY p.season_id, p.user_id
                 ) pos ON pos.season_id = e.season_id AND pos.user_id = e.user_id
                 LEFT JOIN ({_SHORT_VALUE_SUBQUERY}) sh
@@ -415,11 +419,12 @@ async def standings(conn: AsyncConnection, season_id: int) -> list[Standing]:
             JOIN accounts a ON a.id = e.account_id
             LEFT JOIN (
                 SELECT p.season_id, p.user_id,
-                       CAST(SUM(p.quantity * i.quoted_price * 100) AS BIGINT)
+                       CAST(SUM(p.quantity * i.quoted_price * 100
+                                - p.borrow_fees_accrued) AS BIGINT)
                            AS value_minor
                 FROM positions p
                 JOIN instruments i ON i.id = p.instrument_id
-                WHERE p.season_id = %s AND p.quantity > 0
+                WHERE p.season_id = %s AND p.quantity <> 0
                 GROUP BY p.season_id, p.user_id
             ) pos ON pos.user_id = e.user_id
             LEFT JOIN ({_SHORT_VALUE_SUBQUERY}) sh

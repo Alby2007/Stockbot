@@ -9,10 +9,28 @@ trading (`/buy` `/sell`), `/balance` `/portfolio` `/market` `/stock` `/claim`
 season-create` `/admin season-close`), wash-trade detection, the economy
 simulation harness (`python -m stockbot.simulation.harness`, use a scratch
 DB), seasons/league (`/league info|join|standings`, `league` flag on
-`/buy` `/sell` `/portfolio`), and Phase 1.5 bounded shorts (`/short`
-`/shorts` `/cover`, `stockbot.shorts`, knockout sweep inside `apply_tick`)
-are all done. Phase 2 (true margin, signed positions, liquidation,
-insurance fund, SBX-40 index) not started.
+`/buy` `/sell` `/portfolio`), Phase 1.5 bounded shorts (`/short`
+`/shorts` `/cover`, `stockbot.shorts`, knockout sweep inside `apply_tick`),
+and Phase 2 true margin (`stockbot.margin`, signed positions, liquidation
+engine, insurance fund, short interest + squeeze, SBX-40 index, `/margin`
+`/collateral` `/liquidations`, `margin_tier` shop unlock) are all done.
+
+Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
+preserved -- short proceeds credit to cash and are spendable; leverage is
+bounded by post-trade margin gates, not negative cash). Maintenance applies
+to SHORT notional only, so `sweep_undermargined` only scans accounts with
+`quantity < 0`. `check_and_liquidate` opens its own tx (locks the user's
+position instruments id-ordered, then the account) because post-trade
+liquidation can't take new instrument locks while holding the account lock
+without inverting the ordering. The tick path calls `_liquidate_account`
+inline (instruments already locked). Backstop chain on negative equity:
+INSURANCE_FUND pays what it can -> MARKET_MAKER absorbs the residual;
+every leg is recorded in `liquidations` / `insurance_fund_flows`
+(reconciliation: fund balance == SUM(flows.amount_minor)). Borrow fees
+accrue fractionally on `positions.borrow_fees_accrued` and settle to SINK
+on cover/liquidation. Shorts consume portfolio slots (`quantity <> 0`).
+League accounts get effective margin tier 1 (equal start). Bounded shorts
+do NOT count toward short interest (they're collateralized, not borrowed).
 
 Bounded-shorts design notes: `bounded_shorts` rows are separate from
 long-only `positions` (defined-risk product: collateral = Q·entry·

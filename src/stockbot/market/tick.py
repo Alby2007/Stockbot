@@ -8,6 +8,7 @@ import math
 from psycopg import AsyncConnection, sql
 from psycopg.rows import dict_row
 
+from stockbot.margin import service as margin
 from stockbot.market import engine, events
 from stockbot.seasons import service as seasons
 from stockbot.shorts import service as shorts
@@ -33,9 +34,11 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             # No accounts are touched here, so this is just instruments-by-id.
             await cur.execute(
                 """
-                SELECT i.id, i.ticker, s.key AS sector_key, i.drift, i.sigma, i.beta, i.gamma,
+                SELECT i.id, i.ticker, i.kind, s.key AS sector_key, i.drift, i.sigma,
+                       i.beta, i.gamma,
                        i.kappa, i.fundamental_sigma, i.tau_ticks, i.base_price,
-                       i.fundamental_value, i.impact, i.circuit_halted_until_tick
+                       i.fundamental_value, i.impact, i.circuit_halted_until_tick,
+                       i.float_shares, i.index_divisor
                 FROM instruments i
                 JOIN sectors s ON s.id = i.sector_id
                 WHERE i.is_active
@@ -62,7 +65,10 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         halts: dict[int, int | None] = {}
         opens: dict[int, float] = {}
 
+        index_rows = [row for row in instrument_rows if row["kind"] == "INDEX"]
         for row in instrument_rows:
+            if row["kind"] == "INDEX":
+                continue  # priced from components below
             state = engine.InstrumentState(
                 id=row["id"],
                 sector_key=row["sector_key"],
@@ -94,6 +100,34 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                     tick_index + engine.CIRCUIT_HALT_TICKS if result.circuit_breached else None
                 )
             results.append(result)
+
+        # Index instruments: level = cap-weighted component basket / divisor.
+        # They draw no factor-model randomness (rng stream untouched) but do
+        # carry their own trade impact, which decays like everyone else's.
+        quoted_by_id = {res.id: res.quoted_price for res in results}
+        for row in index_rows:
+            opens[row["id"]] = float(row["base_price"]) * math.exp(float(row["impact"]))
+            divisor = float(row["index_divisor"])
+            level = (
+                sum(
+                    float(r["float_shares"]) * quoted_by_id[r["id"]]
+                    for r in instrument_rows
+                    if r["kind"] != "INDEX"
+                )
+                / divisor
+            )
+            decayed = float(row["impact"]) * math.exp(-1.0 / float(row["tau_ticks"]))
+            results.append(
+                engine.InstrumentTickResult(
+                    id=row["id"],
+                    base_price=level,
+                    fundamental_value=level,
+                    impact=decayed,
+                    quoted_price=level * math.exp(decayed),
+                    circuit_breached=False,
+                )
+            )
+            halts[row["id"]] = None
 
         # Single-statement writes: executemany still round-trips per row,
         # which dominates tick latency (~100ms -> ~15ms measured on a local
@@ -178,6 +212,14 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # knockout price this tick. Before season snapshots so closed shorts
         # stop contributing to equity.
         await shorts.sweep_knockouts(conn, tick_index)
+
+        # Phase 2 margin maintenance, all inside the tick transaction where
+        # every instrument is already locked: refresh published short
+        # interest, accrue borrow fees on shorts, then liquidate any account
+        # that fell below maintenance margin at the new marks.
+        await margin.refresh_short_interest(conn)
+        await margin.accrue_borrow_fees(conn)
+        await margin.sweep_undermargined(conn, tick_index)
 
         # Season lifecycle: activate due seasons, write day-boundary equity
         # snapshots, close finished seasons (all inside this tick's tx).

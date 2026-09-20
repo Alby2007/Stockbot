@@ -25,6 +25,10 @@ TUNABLE_PARAMS = (
     "lambda_impact",
     "tau_ticks",
     "max_impact",
+    "short_knockout_pct",
+    "init_margin_pct",
+    "maint_margin_pct",
+    "float_shares",
 )
 
 

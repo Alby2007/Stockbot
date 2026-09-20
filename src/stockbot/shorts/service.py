@@ -27,6 +27,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from stockbot.ledger.service import get_system_account_id, get_user_account_id, post_transfer
+from stockbot.margin import service as margin
 from stockbot.market import engine
 from stockbot.seasons.service import get_active_entry
 from stockbot.shorts.errors import ShortNotFoundError
@@ -167,6 +168,9 @@ async def open_bounded_short(
         )
         if collateral_minor <= 0:
             raise ValueError("collateral rounds to zero; increase quantity")
+        # The fee is a discretionary equity spend -- don't let it push a
+        # margined account below maintenance.
+        await margin.assert_spend_ok(conn, user_id, fee_minor, season_id)
 
         market_maker_id = await get_system_account_id(conn, "MARKET_MAKER")
         sink_id = await get_system_account_id(conn, "SINK")

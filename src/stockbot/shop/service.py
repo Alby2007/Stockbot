@@ -13,11 +13,16 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from stockbot.ledger.service import get_system_account_id, get_user_account_id, post_transfer
+from stockbot.margin import service as margin
 from stockbot.shop.errors import AlreadyOwnedError, UnknownItemError
 
 BASE_SLOTS = 5
 SLOT_BASE_PRICE_MINOR = 500
 SLOT_PRICE_STEP_MINOR = 250
+
+# Phase 2: escalating margin-tier prices. Tier N unlocks shorts with a
+# gross-leverage cap of min(N+1, max_gross_leverage) x equity.
+MARGIN_TIER_PRICES_MINOR = (50_000, 200_000, 500_000)
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,7 @@ async def buy_slot(conn: AsyncConnection, user_id: int) -> int:
         owned = row[0] if row else 0
         price = slot_price(owned)
 
+        await margin.assert_spend_ok(conn, user_id, price)
         sink_id = await get_system_account_id(conn, "SINK")
         await post_transfer(
             conn,
@@ -110,10 +116,53 @@ async def buy_slot(conn: AsyncConnection, user_id: int) -> int:
     return price
 
 
+async def buy_margin_tier(conn: AsyncConnection, user_id: int) -> int:
+    """Buy the next margin tier. Returns the price paid, minor units."""
+    async with conn.transaction():
+        account_id = await get_user_account_id(conn, user_id)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT quantity FROM entitlements
+                WHERE user_id = %s AND item_key = 'margin_tier'
+                FOR UPDATE
+                """,
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        owned = row[0] if row else 0
+        if owned >= len(MARGIN_TIER_PRICES_MINOR):
+            raise AlreadyOwnedError("margin_tier")
+        price = MARGIN_TIER_PRICES_MINOR[owned]
+
+        await margin.assert_spend_ok(conn, user_id, price)
+        sink_id = await get_system_account_id(conn, "SINK")
+        await post_transfer(
+            conn,
+            from_account_id=account_id,
+            to_account_id=sink_id,
+            amount=price,
+            reason="SHOP_MARGIN_TIER",
+        )
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO entitlements (user_id, item_key, quantity)
+                VALUES (%s, 'margin_tier', 1)
+                ON CONFLICT (user_id, item_key)
+                DO UPDATE SET quantity = entitlements.quantity + 1
+                """,
+                (user_id,),
+            )
+    return price
+
+
 async def buy_item(conn: AsyncConnection, user_id: int, item_key: str) -> int:
     """Buy (or renew) a shop item. Returns the price paid, minor units."""
     if item_key == "slot":
         return await buy_slot(conn, user_id)
+    if item_key == "margin_tier":
+        return await buy_margin_tier(conn, user_id)
 
     async with conn.transaction():
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -136,6 +185,7 @@ async def buy_item(conn: AsyncConnection, user_id: int, item_key: str) -> int:
 
         sink_id = await get_system_account_id(conn, "SINK")
         price = int(item["price_minor"])
+        await margin.assert_spend_ok(conn, user_id, price)
         await post_transfer(
             conn,
             from_account_id=account_id,

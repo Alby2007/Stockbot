@@ -25,6 +25,13 @@ from stockbot.compliance.wash_trade import scan_for_wash_trades
 from stockbot.config import get_settings
 from stockbot.ledger.errors import InsufficientFundsError
 from stockbot.ledger.service import get_balance
+from stockbot.margin.errors import MarginError
+from stockbot.margin.service import (
+    check_and_liquidate,
+    compute_health,
+    list_liquidations,
+    margin_tier,
+)
 from stockbot.market.data import (
     InstrumentSnapshot,
     all_instrument_snapshots,
@@ -47,6 +54,7 @@ from stockbot.seasons.service import (
 from stockbot.shop.errors import ShopError
 from stockbot.shop.service import (
     BASE_SLOTS,
+    MARGIN_TIER_PRICES_MINOR,
     buy_item,
     get_slot_count,
     get_user_entitlements,
@@ -155,6 +163,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         if snapshot.day_change_pct is not None:
             embed.add_field(name="24h change", value=format_pct(snapshot.day_change_pct))
         embed.add_field(name="Impact", value=format_pct(float(snapshot.impact)))
+        embed.add_field(
+            name="Short interest",
+            value=f"{float(snapshot.short_interest_pct) * 100:.1f}% of float",
+        )
         if snapshot.is_halted:
             embed.add_field(name="Status", value="Halted (circuit breaker)")
         await interaction.response.send_message(embed=embed)
@@ -341,7 +353,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     SELECT i.ticker, p.quantity, p.avg_cost, i.quoted_price
                     FROM positions p
                     JOIN instruments i ON i.id = p.instrument_id
-                    WHERE p.user_id = %s AND p.quantity > 0
+                    WHERE p.user_id = %s AND p.quantity <> 0
                       AND p.season_id IS NOT DISTINCT FROM %s
                     ORDER BY i.ticker
                     """,
@@ -354,9 +366,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         for ticker, quantity, avg_cost, quoted_price in positions:
             market_value = Decimal(quantity) * Decimal(quoted_price)
             holdings_value += market_value
-            unrealized_pct = float(quoted_price) / float(avg_cost) - 1 if avg_cost else 0.0
+            is_short = quantity < 0
+            unrealized_pct = (
+                1 - float(quoted_price) / float(avg_cost) if is_short
+                else float(quoted_price) / float(avg_cost) - 1
+            ) if avg_cost else 0.0
+            tag = "SHORT " if is_short else ""
             lines.append(
-                f"{ticker:<6} {quantity:>6} @ {format_price(avg_cost):>10}  "
+                f"{tag}{ticker:<6} {quantity:>6} @ {format_price(avg_cost):>10}  "
                 f"now {format_price(quoted_price):>10}  {format_pct(unrealized_pct):>8}"
             )
         net_worth_minor = int(cash + holdings_value * 100)
@@ -426,14 +443,16 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     "Insufficient funds for that trade.", ephemeral=True
                 )
                 return
-            except TradingError as exc:
+            except (TradingError, MarginError) as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
                 return
+            legs = await check_and_liquidate(conn, interaction.user.id, season_id)
 
         verb = "Bought" if side == "BUY" else "Sold"
+        suffix = f" ({legs} liquidation leg(s) fired)" if legs else ""
         await interaction.response.send_message(
             f"{verb} **{result.quantity}** {result.ticker} @ {format_price(result.fill_price)} "
-            f"(fee {format_money(result.fee_minor)})"
+            f"(fee {format_money(result.fee_minor)}){suffix}"
         )
 
     @tree.command(
@@ -543,6 +562,119 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"{format_money(result.payout_minor)}."
         )
 
+    @tree.command(name="margin", description="Show your margin account health")
+    @app_commands.describe(league="Show your league account's margin instead")
+    async def margin_cmd(interaction: discord.Interaction, league: bool = False) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            season_id: int | None = None
+            if league:
+                entry = await get_active_entry(conn, interaction.user.id)
+                if entry is None:
+                    await interaction.response.send_message(
+                        "You're not entered in an active season. `/league join` first.",
+                        ephemeral=True,
+                    )
+                    return
+                season_id = entry[0]
+            health = await compute_health(conn, interaction.user.id, season_id)
+            tier = await margin_tier(conn, interaction.user.id, season_id)
+
+        embed = discord.Embed(
+            title=f"{'League m' if league else 'M'}argin — {interaction.user.display_name}"
+        )
+        embed.add_field(name="Equity", value=format_money(health.equity_minor))
+        embed.add_field(
+            name="Cash", value=format_money(health.cash_minor)
+        )
+        embed.add_field(
+            name="Positions value", value=format_money(health.positions_value_minor)
+        )
+        embed.add_field(
+            name="Maintenance req", value=format_money(health.maint_req_minor)
+        )
+        embed.add_field(name="Initial req", value=format_money(health.init_req_minor))
+        ratio = health.ratio
+        embed.add_field(
+            name="Margin ratio",
+            value="not margined" if ratio is None else f"{float(ratio):.2f}",
+        )
+        embed.add_field(name="Margin tier", value=str(tier))
+        if health.accrued_fees_minor:
+            embed.add_field(
+                name="Accrued borrow fees", value=format_money(health.accrued_fees_minor)
+            )
+        if health.undermargined:
+            embed.set_footer(text="Below maintenance — liquidation may fire on the next tick.")
+        await interaction.response.send_message(embed=embed)
+
+    @tree.command(
+        name="collateral",
+        description="Show per-position margin requirements for your shorts",
+    )
+    @app_commands.describe(league="Show league positions instead")
+    async def collateral(interaction: discord.Interaction, league: bool = False) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            season_id: int | None = None
+            if league:
+                entry = await get_active_entry(conn, interaction.user.id)
+                if entry is None:
+                    await interaction.response.send_message(
+                        "You're not entered in an active season. `/league join` first.",
+                        ephemeral=True,
+                    )
+                    return
+                season_id = entry[0]
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT i.ticker, p.quantity, i.quoted_price, i.maint_margin_pct,
+                           i.init_margin_pct, i.short_interest_pct, p.borrow_fees_accrued
+                    FROM positions p
+                    JOIN instruments i ON i.id = p.instrument_id
+                    WHERE p.user_id = %s AND p.quantity < 0
+                      AND p.season_id IS NOT DISTINCT FROM %s
+                    ORDER BY i.ticker
+                    """,
+                    (interaction.user.id, season_id),
+                )
+                rows = await cur.fetchall()
+        if not rows:
+            await interaction.response.send_message(
+                "No open margin shorts.", ephemeral=True
+            )
+            return
+        lines = []
+        for r in rows:
+            notional = -int(r[1]) * Decimal(r[2])
+            fees = int(Decimal(r[6]).quantize(Decimal("1")))
+            lines.append(
+                f"{r[0]:<6} {r[1]:>6}  notional {format_price(notional):>10}  "
+                f"maint {format_money(int(notional * Decimal(r[3]) * 100)):>9}  "
+                f"SI {float(r[5]) * 100:.1f}%  fees {format_money(fees)}"
+            )
+        embed = discord.Embed(title="Collateral — open shorts")
+        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        await interaction.response.send_message(embed=embed)
+
+    @tree.command(name="liquidations", description="Show your recent liquidation events")
+    async def liquidations(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            rows = await list_liquidations(conn, interaction.user.id)
+        if not rows:
+            await interaction.response.send_message("No liquidations.", ephemeral=True)
+            return
+        lines = [
+            f"#{r['id']:<4} {r['ticker']:<6} {r['side']:<4} {r['quantity_closed']:>6} @ "
+            f"{format_price(r['fill_price']):>10}  penalty {format_money(r['penalty_minor'])}"
+            for r in rows
+        ]
+        embed = discord.Embed(title="Liquidations")
+        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        await interaction.response.send_message(embed=embed)
+
     shop_group = app_commands.Group(
         name="shop", description="Portfolio slots, analyst tools, and cosmetics"
     )
@@ -555,12 +687,23 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             slot_count = await get_slot_count(conn, interaction.user.id)
             owned = await get_user_entitlements(conn, interaction.user.id)
 
-        owned_keys = {row["item_key"] for row in owned}
+        owned_keys = {row["item_key"]: row["quantity"] for row in owned}
         lines = []
         for item in items:
             if item.key == "slot":
                 price = slot_price(slot_count - BASE_SLOTS)
                 lines.append(f"{item.key:<15} {format_money(price):>10}  (you have {slot_count})")
+                continue
+            if item.key == "margin_tier":
+                tier = owned_keys.get("margin_tier", 0)
+                if tier >= len(MARGIN_TIER_PRICES_MINOR):
+                    lines.append(f"{item.key:<15}  max tier ({tier}) owned")
+                else:
+                    price = MARGIN_TIER_PRICES_MINOR[tier]
+                    lines.append(
+                        f"{item.key:<15} {format_money(price):>10}  "
+                        f"(tier {tier} -> {tier + 1})"
+                    )
                 continue
             marker = " (owned)" if item.key in owned_keys and item.duration_days is None else ""
             recurring = f" every {item.duration_days}d" if item.duration_days else ""
@@ -586,7 +729,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     "Insufficient funds for that purchase.", ephemeral=True
                 )
                 return
-            except ShopError as exc:
+            except (ShopError, MarginError) as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
                 return
         await interaction.response.send_message(
