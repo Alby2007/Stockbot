@@ -4,6 +4,7 @@ import asyncio
 import sys
 from collections.abc import AsyncIterator
 
+import psycopg
 import pytest
 import pytest_asyncio
 from psycopg import AsyncConnection
@@ -30,20 +31,21 @@ def _migrated_test_db() -> None:
 
 @pytest_asyncio.fixture
 async def conn() -> AsyncIterator[AsyncConnection]:
-    """A connection to a clean test database, with a fresh transaction per test.
+    """A connection wrapping the whole test in one transaction that is always
+    rolled back at teardown, whether the test passed or failed.
 
-    Non-system tables are wiped and system accounts reset to a zero balance
-    before each test so tests are independent and can run in any order.
+    Every service function opens its own `async with conn.transaction():`
+    block; because this fixture already has an outer transaction open, those
+    nest as savepoints instead of top-level commits, so nothing here ever
+    touches disk. That keeps tests independent (any order, no manual
+    per-table cleanup) even though trading/tick tests mutate `instruments`,
+    `positions`, etc. alongside the ledger tables.
     """
     settings = get_settings()
     connection = await AsyncConnection.connect(settings.test_database_url, autocommit=False)
     try:
-        async with connection.cursor() as cur:
-            await cur.execute("DELETE FROM ledger_entries")
-            await cur.execute("DELETE FROM accounts WHERE kind = 'USER'")
-            await cur.execute("DELETE FROM users")
-            await cur.execute("UPDATE accounts SET balance = 0 WHERE kind = 'SYSTEM'")
-        await connection.commit()
-        yield connection
+        async with connection.transaction() as tx:
+            yield connection
+            raise psycopg.Rollback(tx)
     finally:
         await connection.close()

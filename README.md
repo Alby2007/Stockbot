@@ -5,9 +5,14 @@ shared currency, a factor-model price engine with decaying user price
 impact, and a phased path from long-only trading to true margin shorts with
 liquidation. See the design doc for the full plan.
 
-Current status: **Phase 0 — foundation** (double-entry ledger, account
-bootstrap, migrations, process skeleton). No trading or Discord commands
-yet.
+Current status: **Phase 1 in progress**. Phase 0 (double-entry ledger,
+account bootstrap, migrations, process skeleton) is done. The tick engine is
+live (factor model, impact decay, mean reversion, circuit breaker,
+deterministic replay) over 40 seeded instruments across 8 sectors, and
+trading works end to end: `/balance`, `/portfolio`, `/buy`, `/sell`,
+`/market`, `/stock`, `/claim`. Not yet built: richer market data
+(`/movers`, `/sectors`, `/news`, `/calendar`, charts), the shop, seasons and
+the league, admin tuning, and the economy simulation harness.
 
 ## Stack
 

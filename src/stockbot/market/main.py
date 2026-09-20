@@ -1,8 +1,8 @@
-"""Market service entrypoint.
+"""Market service entrypoint: the singleton tick engine process.
 
-Phase 0 placeholder: the tick engine itself lands in Phase 1. This just
-proves out the process must be a singleton, guarded by a Postgres advisory
-lock, so an accidental second instance can never double-tick.
+Guarded by a Postgres advisory lock so an accidental second instance can
+never double-tick (see `docker-compose.yml`'s `market` service and the
+scale-to-2 check in AGENTS.md).
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import sys
 
 from stockbot import db
 from stockbot.config import get_settings
+from stockbot.market.tick import apply_tick
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s market %(levelname)s %(message)s")
 log = logging.getLogger("stockbot.market")
@@ -20,6 +21,8 @@ log = logging.getLogger("stockbot.market")
 # Arbitrary fixed key identifying "the market tick engine" lock, shared by all
 # instances so Postgres will only ever grant it to one of them at a time.
 ADVISORY_LOCK_KEY = 0x5350_4B_54  # "stock" (truncated), just needs to be a stable constant
+
+TICK_INTERVAL_SECONDS = 60
 
 
 async def run() -> None:
@@ -34,11 +37,25 @@ async def run() -> None:
             if not acquired:
                 log.error("another market instance already holds the singleton lock; exiting")
                 return
+            # pg_try_advisory_lock is session-scoped, not transaction-scoped, so
+            # committing here does not release it -- but it's essential: without
+            # this, the connection would sit in the implicit transaction this
+            # SELECT opened for the rest of the process's life, and every
+            # "async with conn.transaction()" inside apply_tick would silently
+            # become a savepoint of that never-committed transaction instead of
+            # a real commit.
+            await conn.commit()
             log.info("acquired singleton advisory lock; market service starting")
 
-            # Phase 1 will replace this with the real 60s tick loop.
             while True:
-                await asyncio.sleep(60)
+                start = asyncio.get_event_loop().time()
+                try:
+                    tick_index = await apply_tick(conn, settings.master_seed)
+                    log.info("applied tick %d", tick_index)
+                except Exception:
+                    log.exception("tick failed; will retry next interval")
+                elapsed = asyncio.get_event_loop().time() - start
+                await asyncio.sleep(max(0.0, TICK_INTERVAL_SECONDS - elapsed))
     finally:
         await db.close_pool()
 

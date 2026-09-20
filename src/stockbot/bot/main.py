@@ -1,9 +1,4 @@
-"""Discord bot entrypoint.
-
-Phase 0 placeholder: no slash commands yet (Phase 1). This just wires up the
-DB pool and a bare discord.py client so the process topology (two services,
-one database) is real from the start.
-"""
+"""Discord bot entrypoint: the gateway + slash command surface."""
 
 from __future__ import annotations
 
@@ -14,6 +9,7 @@ import sys
 import discord
 
 from stockbot import db
+from stockbot.bot.commands import register_commands
 from stockbot.config import get_settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s bot %(levelname)s %(message)s")
@@ -25,6 +21,7 @@ class StockBotClient(discord.Client):
         # Slash-command-only surface: no privileged intents required.
         super().__init__(intents=discord.Intents.none())
         self.tree = discord.app_commands.CommandTree(self)
+        register_commands(self.tree)
 
     async def setup_hook(self) -> None:
         await self.tree.sync()
