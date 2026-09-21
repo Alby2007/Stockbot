@@ -49,7 +49,12 @@ SECTOR_SIGMA = SECTOR_DAILY_VOL / TICKS_PER_DAY**0.5
 # guards gap reopens -- the real-world analogue of limit-halts at the
 # open. Lowering it further mostly raises gap-halt frequency; raising it
 # removes halts entirely.
-CIRCUIT_BREAKER_CAP = 0.03  # max |Δlog P| allowed in a single tick
+# Max |Δlog P| in a single tick. Calibrated in F6 to a few halts per
+# instrument per simulated week. Every measured breach is an overnight-gap
+# tick (intraday |r| never gets near this), and Phase I's drift_state
+# applies its full drift to the gap, so the realized gap distribution is
+# wide: 0.03 -> ~5.4 halts/instr/wk, 0.035 -> ~5.2, 0.045 lands mid-band.
+CIRCUIT_BREAKER_CAP = 0.045
 CIRCUIT_HALT_TICKS = 5  # ticks an instrument stays halted after a breach
 
 # Fat tails: the idiosyncratic draw is Student-t(5) rescaled to unit

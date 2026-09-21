@@ -210,7 +210,15 @@ amend `close` intra-tick, so replay can't recover r_model from OHLC;
 `candles.flow_ret` is the bounded flow the EWMA consumed. Replay
 guarantee narrowed: vol_state is flow-fed and can't be re-derived from
 the seed — `replay` verifies internal consistency against stored
-model_ret/flow_ret, NOT seed-determinism.
+model_ret/flow_ret, NOT seed-determinism. F6 calibration: every measured
+breach is an overnight-gap tick (intraday |r| never gets near the cap);
+the gap's dt=480 step plus I1's drift_state·480 term make the realized
+gap distribution wide — CIRCUIT_BREAKER_CAP = 0.045 yields ~a few halts
+per instrument-week (measured 5.2/wk at 0.035, 5.4/wk at 0.03 pre-I1
+measured 2.4/wk before drift_state existed). Because the clamp censors
+candles.model_ret at the cap, the breach distribution can't be
+re-measured above the cap from stored candles — calibrate against a
+harness run, not SQL.
 
 Microstructure notes (Phase G): fills print on a price grid —
 `engine.tick_size(price)` is a 1-2-5 multiple of 10^n at or above
