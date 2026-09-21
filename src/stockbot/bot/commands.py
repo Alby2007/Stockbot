@@ -7,7 +7,10 @@ input, call a service inside one DB connection, and format the result.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -18,7 +21,16 @@ from psycopg.rows import dict_row
 
 from stockbot import db
 from stockbot.accounts.service import bootstrap_user
-from stockbot.admin.service import TUNABLE_PARAMS, ledger_audit, tune_instrument
+from stockbot.admin.service import (
+    TUNABLE_CONFIG_KEYS,
+    TUNABLE_PARAMS,
+    admin_adjust,
+    admin_cancel_order,
+    ledger_audit,
+    recalc_balances,
+    set_config,
+    tune_instrument,
+)
 from stockbot.bot.charts import render_candle_chart
 from stockbot.bot.format import format_money, format_pct, format_price
 from stockbot.claims.errors import AlreadyClaimedTodayError
@@ -1207,6 +1219,103 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             "```\n" + "\n".join(lines) + "\n```", ephemeral=True
         )
 
+    @admin_group.command(
+        name="config", description="Set a global config knob (bounded, allow-listed)"
+    )
+    @app_commands.describe(
+        key=f"One of: {', '.join(TUNABLE_CONFIG_KEYS[:8])}… (see CONFIG_BOUNDS)",
+        value="New value",
+    )
+    async def admin_config(
+        interaction: discord.Interaction, key: str, value: float
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            try:
+                await set_config(conn, key, value)
+            except ValueError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Set config `{key}` = {value}", ephemeral=True
+        )
+
+    @admin_group.command(
+        name="adjust",
+        description="Ledger repair: credit (Faucet→user) or debit (user→Sink) an account",
+    )
+    @app_commands.describe(
+        user="Discord user",
+        amount="Signed amount, minor units (+ credits, - debits)",
+        memo="Why this adjustment exists (required for the audit trail)",
+    )
+    async def admin_adjust_cmd(
+        interaction: discord.Interaction,
+        user: discord.User,
+        amount: app_commands.Range[int, -9_000_000_000_000_000, 9_000_000_000_000_000],
+        memo: str,
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            try:
+                await admin_adjust(
+                    conn,
+                    user_id=user.id,
+                    amount=amount,
+                    memo=memo,
+                    admin_id=interaction.user.id,
+                )
+            except (ValueError, InsufficientFundsError, TradingError) as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Adjusted {user.display_name} by {format_money(amount)} "
+            f"(ledger `ADMIN_ADJUST`).",
+            ephemeral=True,
+        )
+
+    @admin_group.command(
+        name="order-cancel", description="Force-cancel any OPEN order (zombie repair)"
+    )
+    @app_commands.describe(order_id="Order id")
+    async def admin_order_cancel(interaction: discord.Interaction, order_id: int) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            cancelled = await admin_cancel_order(conn, order_id)
+        msg = f"Order {order_id} cancelled." if cancelled else (
+            f"Order {order_id} is not OPEN (already filled/cancelled, or no such order)."
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @admin_group.command(
+        name="recalc-balances",
+        description="Rebuild accounts.balance from SUM(ledger_entries); reports drift fixed",
+    )
+    async def admin_recalc(interaction: discord.Interaction) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            try:
+                fixed = await recalc_balances(conn)
+            except Exception as exc:
+                # A rebuild that would push a USER/LEAGUE balance negative
+                # fails on the CHECK -- that failure IS the signal.
+                await interaction.response.send_message(
+                    f"Rebuild failed: {exc}", ephemeral=True
+                )
+                return
+        await interaction.response.send_message(
+            f"Recalculated balances: **{fixed}** account(s) had drifted and were repaired.",
+            ephemeral=True,
+        )
+
     @admin_group.command(name="season-create", description="Create a league season")
     @app_commands.describe(
         name="Season name",
@@ -1264,3 +1373,71 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
 
     tree.add_command(admin_group)
+
+    _instrument_commands(tree)
+
+
+def _instrument_commands(tree: app_commands.CommandTree) -> None:
+    """Wrap every registered callback with one structured log line
+    (command, user, interaction id = correlation key) and a
+    fire-and-forget `command_stats` row. Applied once at registration so
+    command bodies stay oblivious."""
+    for cmd in tree.get_commands():
+        _instrument_one(cmd)
+
+
+def _instrument_one(cmd: Any) -> None:
+    if isinstance(cmd, app_commands.Group):
+        for sub in cmd.commands:
+            _instrument_one(sub)
+        return
+    if not isinstance(cmd, app_commands.Command):
+        return
+    original = cmd.callback
+
+    @functools.wraps(original)
+    async def wrapper(
+        interaction: discord.Interaction, *args: Any, **kwargs: Any
+    ) -> Any:
+        name = cmd.qualified_name
+        started = time.perf_counter()
+        ok, error = True, None
+        try:
+            return await original(interaction, *args, **kwargs)
+        except Exception as exc:
+            ok, error = False, f"{type(exc).__name__}: {exc}"[:200]
+            raise
+        finally:
+            ms = (time.perf_counter() - started) * 1000
+            log.info(
+                "cmd=%s user=%s iid=%s ok=%s ms=%.1f",
+                name,
+                interaction.user.id,
+                interaction.id,
+                ok,
+                ms,
+            )
+            # Stats write is best-effort on its own connection -- it must
+            # never surface to the user or delay the response.
+            asyncio.get_running_loop().create_task(
+                _record_command_stat(name, ok, ms, error)
+            )
+
+    # Command.callback is a read-only property; _do_call invokes the
+    # private backing attribute, which is what must be replaced.
+    cmd._callback = wrapper  # noqa: SLF001
+
+
+async def _record_command_stat(
+    command: str, ok: bool, ms: float, error: str | None
+) -> None:
+    try:
+        async with db.connection() as conn, conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO command_stats (command, ok, duration_ms, error) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (command, ok, round(ms, 3), error),
+                )
+    except Exception:
+        log.debug("command_stats write failed for %s", command)

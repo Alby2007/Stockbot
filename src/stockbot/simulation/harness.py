@@ -64,6 +64,7 @@ from stockbot.ledger.service import (
 from stockbot.margin.errors import MarginError
 from stockbot.margin.service import compute_health
 from stockbot.market.tick import apply_tick
+from stockbot.observability import run_periodic_audit
 from stockbot.orders.service import cancel_order, list_open_orders, place_order
 from stockbot.shop.service import buy_item
 from stockbot.simulation.metrics import faucet_sink_ratio, gini_coefficient
@@ -574,10 +575,11 @@ async def run_simulation(
 
     starting_net_worth = await net_worth_by_user(conn, user_ids)
     timeline: list[dict[str, object]] = []
+    last_tick = -1
 
     for day in range(num_days):
         for _ in range(ticks_per_day):
-            await apply_tick(conn, master_seed)
+            last_tick = await apply_tick(conn, master_seed)
         sim_today = SIM_CLAIM_EPOCH + timedelta(days=day)
         for agent in agents:
             await _run_agent_day(conn, agent, rng, sim_today)
@@ -626,6 +628,17 @@ async def run_simulation(
     grinder_avg = by_archetype.get("grinder", {}).get("avg_gain_minor", 0.0)
     for stats in by_archetype.values():
         stats["outperformed_grinder"] = stats["avg_gain_minor"] > grinder_avg
+
+    # Soak assertion: after thousands of ticks of mixed agent behavior the
+    # core invariants must still hold -- a drift here is a real bug the
+    # archetypes found, not a statistics question. Doubles as a free soak
+    # test on every run (persisted to audit_results like the tick loop's
+    # periodic audit).
+    if not await run_periodic_audit(conn, last_tick):
+        raise RuntimeError(
+            "simulation ended with failed invariants -- check audit_results "
+            "and CRITICAL log lines for which check drifted"
+        )
 
     return {
         "num_users": num_users,

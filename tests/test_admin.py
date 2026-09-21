@@ -5,8 +5,17 @@ import pytest
 from psycopg import AsyncConnection
 
 from stockbot.accounts.service import bootstrap_user
-from stockbot.admin.service import ledger_audit, tune_instrument
+from stockbot.admin.service import (
+    admin_adjust,
+    admin_cancel_order,
+    ledger_audit,
+    recalc_balances,
+    set_config,
+    tune_instrument,
+)
 from stockbot.claims.service import claim_daily
+from stockbot.ledger.service import get_balance
+from stockbot.orders.service import place_order
 from stockbot.trading.errors import UnknownInstrumentError
 
 
@@ -88,3 +97,68 @@ async def test_ledger_audit_flags_accounts_whose_balance_drifted(conn: AsyncConn
     report = await ledger_audit(conn)
     assert not report.healthy
     assert account_id in report.mismatched_accounts
+
+
+async def test_set_config_updates_within_bounds(conn: AsyncConnection) -> None:
+    await set_config(conn, "spread.base_bps", 42.0)
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT value FROM config WHERE key = 'spread.base_bps'")
+        assert float((await cur.fetchone())[0]) == 42.0
+
+
+async def test_set_config_rejects_unknown_out_of_range_and_nonfinite(
+    conn: AsyncConnection,
+) -> None:
+    with pytest.raises(ValueError, match="not a known config key"):
+        await set_config(conn, "nonsense.key", 1.0)
+    with pytest.raises(ValueError, match="within"):
+        await set_config(conn, "trading.enabled", 5)  # kill switches are 0/1
+    with pytest.raises(ValueError, match="finite"):
+        await set_config(conn, "spread.base_bps", float("nan"))
+
+
+async def test_admin_adjust_posts_ledger_entries(conn: AsyncConnection) -> None:
+    account_id = await bootstrap_user(conn, 4003)
+    before = await get_balance(conn, account_id)
+    await admin_adjust(
+        conn, user_id=4003, amount=500, memo="test credit", admin_id=1
+    )
+    assert await get_balance(conn, account_id) == before + 500
+    await admin_adjust(
+        conn, user_id=4003, amount=-200, memo="test debit", admin_id=1
+    )
+    assert await get_balance(conn, account_id) == before + 300
+    # The ledger still balances -- adjustments are transfers, not edits.
+    report = await ledger_audit(conn)
+    assert report.healthy
+
+
+async def test_admin_cancel_order_cancels_any_open_order(
+    conn: AsyncConnection,
+) -> None:
+    await bootstrap_user(conn, 4004)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT ticker, quoted_price FROM instruments "
+            "WHERE is_active AND kind != 'INDEX' ORDER BY ticker LIMIT 1"
+        )
+        ticker, mark = await cur.fetchone()
+    result = await place_order(
+        conn, user_id=4004, ticker=ticker, side="BUY", quantity=1,
+        limit_price=float(mark) * 2, stop_price=None,
+    )
+    assert await admin_cancel_order(conn, result.order_id) is True
+    # Second cancel: no longer OPEN.
+    assert await admin_cancel_order(conn, result.order_id) is False
+
+
+async def test_recalc_balances_repairs_cache_drift(conn: AsyncConnection) -> None:
+    account_id = await bootstrap_user(conn, 4005)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE accounts SET balance = balance + 1 WHERE id = %s", (account_id,)
+        )
+    assert await recalc_balances(conn) == 1
+    assert await get_balance(conn, account_id) == 0 + 10_000  # grant only
+    # Clean run: nothing to fix.
+    assert await recalc_balances(conn) == 0

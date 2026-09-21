@@ -149,7 +149,29 @@ service entry points raise `FeatureDisabledError` while
 `data.feature_enabled_flag`, the non-raising variant). Trade rows carry
 fill provenance: `trades.half_spread` and `trades.impact_delta` — "why
 did this fill cost X" is a query. Shared `stockbot/logging.py` owns
-handler setup for both service mains.
+handler setup for both service mains. Every registered command callback
+is wrapped once at the end of `register_commands`
+(`_instrument_commands`) -- one `cmd=… user=… iid=… ok=… ms=…` log line
+(the interaction id is the correlation key) plus a fire-and-forget
+`command_stats` row on its own connection. The wrap replaces
+`cmd._callback` because `Command.callback` is a read-only property and
+`_do_call` invokes the private attr. Ops surface: `/admin config`
+(CONFIG_BOUNDS allow-list + ranges on all 35 config keys),
+`/admin adjust` (FAUCET/SINK transfers, never a balance UPDATE),
+`/admin order-cancel` (any OPEN order), `/admin recalc-balances`
+(rebuild the balance cache from SUM(ledger_entries) -- a rebuild that
+would go negative fails on the CHECK, which IS the signal).
+`python -m stockbot.tools.doctor` checks migrations, advisory lock,
+tick staleness, ledger invariants, config bounds, index presence, and
+heartbeat freshness; `python -m stockbot.tools.replay --from N --to M`
+re-derives each OPEN tick's market/sector factors from the master seed
+and diffs them against `market_ticks`, plus checks
+`quoted_price ≈ base·exp(impact)` (1e-6 tol -- the column is
+NUMERIC(18,6)) and candle OHLC/CLOSED-flatness. Replay caveat: sort
+sector keys with Python `sorted()`, never Postgres ORDER BY -- locale
+collation puts 'index' before 'INDUSTRIAL', ASCII sort puts it last,
+and that shifts every sector draw by one. A `backup` compose service
+pg_dumps daily into the `stockbot-backups` volume (14-day retention).
 
 Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
 preserved -- short proceeds credit to cash and are spendable; leverage is

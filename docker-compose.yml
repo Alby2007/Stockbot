@@ -52,5 +52,29 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  # Daily pg_dump into a named volume -- trivial to have, painful to learn
+  # you needed. Restore: `docker compose exec backup ls /backups`, copy the
+  # .sql.gz out, `gunzip | psql`.
+  backup:
+    image: postgres:17-alpine
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          ts=$$(date +%Y%m%d-%H%M%S)
+          pg_dump -Fc "postgresql://stockbot:stockbot@postgres:5432/stockbot" \
+            -f "/backups/stockbot-$$ts.dump" && \
+          find /backups -name 'stockbot-*.dump' -mtime +14 -delete
+          sleep 86400
+        done
+    volumes:
+      - stockbot-backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   stockbot-postgres-data:
+  stockbot-backups:
