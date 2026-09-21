@@ -49,6 +49,7 @@ class MarginHealth:
     positions_value_minor: int
     bshort_value_minor: int
     accrued_fees_minor: int
+    accrued_dividends_minor: int
     equity_minor: int
     maint_req_minor: int
     init_req_minor: int
@@ -110,6 +111,7 @@ async def compute_health(
             SELECT a.id AS account_id, a.balance,
                    COALESCE(pv.positions_value, 0) AS positions_value,
                    COALESCE(pv.accrued, 0) AS accrued_fees,
+                   COALESCE(pv.accrued_div, 0) AS accrued_div,
                    COALESCE(pv.maint_req, 0) AS maint_req,
                    COALESCE(pv.init_req, 0) AS init_req,
                    COALESCE(pv.gross, 0) AS gross_notional,
@@ -120,6 +122,7 @@ async def compute_health(
                 SELECT
                     SUM(p.quantity * i.quoted_price * 100) AS positions_value,
                     SUM(p.borrow_fees_accrued) AS accrued,
+                    SUM(p.dividends_accrued) AS accrued_div,
                     SUM(CASE WHEN p.quantity < 0
                         THEN -p.quantity * i.quoted_price * i.maint_margin_pct * 100
                         END) AS maint_req,
@@ -158,8 +161,9 @@ async def compute_health(
     cash = int(row["balance"])
     positions_value = int(Decimal(row["positions_value"]).quantize(Decimal("1"), ROUND_HALF_UP))
     accrued = int(Decimal(row["accrued_fees"]).quantize(Decimal("1"), ROUND_HALF_UP))
+    accrued_div = int(Decimal(row["accrued_div"]).quantize(Decimal("1"), ROUND_HALF_UP))
     bshort_value = int(Decimal(row["bshort_value"]).quantize(Decimal("1"), ROUND_HALF_UP))
-    equity = cash + positions_value + bshort_value - accrued
+    equity = cash + positions_value + bshort_value - accrued - accrued_div
 
     return MarginHealth(
         account_id=int(row["account_id"]),
@@ -167,6 +171,7 @@ async def compute_health(
         positions_value_minor=positions_value,
         bshort_value_minor=bshort_value,
         accrued_fees_minor=accrued,
+        accrued_dividends_minor=accrued_div,
         equity_minor=equity,
         maint_req_minor=int(Decimal(row["maint_req"]).quantize(Decimal("1"), ROUND_HALF_UP)),
         init_req_minor=int(Decimal(row["init_req"]).quantize(Decimal("1"), ROUND_HALF_UP)),
@@ -374,9 +379,11 @@ async def _liquidate_leg(
             )
             cash -= paid_penalty
 
-        # Settle accrued borrow fees proportionally on the closed quantity.
+        # Settle accrued borrow fees (to SINK) and dividend obligations
+        # (to MARKET_MAKER) proportionally on the closed quantity.
         accrued = Decimal(position["borrow_fees_accrued"])
         settled_minor = 0
+        div_accrued = Decimal(position["dividends_accrued"])
         if qty < 0 and accrued > 0:
             settle = accrued * Decimal(close_qty) / Decimal(-qty)
             settled_minor = int(settle.quantize(Decimal("1"), ROUND_HALF_UP))
@@ -391,6 +398,20 @@ async def _liquidate_leg(
                     memo=str(position["ticker"]),
                 )
             accrued -= settle
+        if qty < 0 and div_accrued > 0:
+            div_settle = div_accrued * Decimal(close_qty) / Decimal(-qty)
+            div_minor = int(div_settle.quantize(Decimal("1"), ROUND_HALF_UP))
+            div_paid = min(div_minor, cash)
+            if div_paid > 0:
+                await post_transfer(
+                    conn,
+                    from_account_id=account_id,
+                    to_account_id=mm_id,
+                    amount=div_paid,
+                    reason="DIVIDEND",
+                    memo=str(position["ticker"]),
+                )
+            div_accrued -= div_settle
 
         new_qty = qty + close_qty if qty < 0 else qty - close_qty
         await cur.execute(
@@ -399,10 +420,11 @@ async def _liquidate_leg(
             SET quantity = %s,
                 avg_cost = CASE WHEN %s = 0 THEN 0 ELSE avg_cost END,
                 borrow_fees_accrued = CASE WHEN %s = 0 THEN 0 ELSE %s END,
+                dividends_accrued = CASE WHEN %s = 0 THEN 0 ELSE %s END,
                 updated_at = now()
             WHERE id = %s
             """,
-            (new_qty, new_qty, new_qty, accrued, position["id"]),
+            (new_qty, new_qty, new_qty, accrued, new_qty, div_accrued, position["id"]),
         )
 
         new_quoted = Decimal(str(round(base_price * math.exp(impact_after), 6)))
@@ -488,6 +510,7 @@ async def _liquidate_account(
             await cur.execute(
                 """
                 SELECT p.id, p.instrument_id, p.quantity, p.borrow_fees_accrued,
+                       p.dividends_accrued,
                        i.ticker, i.base_price, i.impact, i.liquidity,
                        i.lambda_impact, i.max_impact, i.quoted_price, i.maint_margin_pct,
                        i.sigma, i.next_event_tick, i.last_halt_end_tick
@@ -538,6 +561,7 @@ async def _liquidate_account(
                 await cur.execute(
                     """
                     SELECT p.id, p.instrument_id, p.quantity, p.borrow_fees_accrued,
+                           p.dividends_accrued,
                            i.ticker, i.base_price, i.impact, i.liquidity,
                            i.lambda_impact, i.max_impact, i.quoted_price,
                            i.maint_margin_pct, i.sigma, i.next_event_tick,
@@ -591,6 +615,7 @@ async def _liquidate_account(
         await cur.execute(
             """
             SELECT p.id, p.instrument_id, p.quantity, p.borrow_fees_accrued,
+                   p.dividends_accrued,
                    i.ticker, i.base_price, i.impact, i.liquidity,
                    i.lambda_impact, i.max_impact, i.quoted_price, i.maint_margin_pct
             FROM positions p

@@ -18,6 +18,7 @@ def test_build_cohort_covers_all_archetypes() -> None:
         "whale",
         "shorter",
         "liquidity_provider",
+        "stop_loss",
     }
 
     wash_traders = [a for a in agents if a.archetype == "wash_trader"]

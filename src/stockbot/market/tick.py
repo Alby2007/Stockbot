@@ -39,7 +39,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                        i.beta, i.gamma,
                        i.kappa, i.fundamental_sigma, i.tau_ticks, i.base_price,
                        i.fundamental_value, i.impact, i.circuit_halted_until_tick,
-                       i.float_shares, i.index_divisor
+                       i.float_shares, i.index_divisor, i.dividend_drift_offset
                 FROM instruments i
                 JOIN sectors s ON s.id = i.sector_id
                 WHERE i.is_active
@@ -58,8 +58,11 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # they can't perturb the price engine's own draw sequence.
         events_rng = engine.rng_for_tick(f"{master_seed}|events", tick_index)
         await events.schedule_initial_earnings(conn, events_rng, tick_index)
+        await events.schedule_initial_dividends(conn, events_rng, tick_index)
         fundamentals = {row["id"]: float(row["fundamental_value"]) for row in instrument_rows}
-        fundamentals = await events.resolve_due_events(conn, events_rng, tick_index, fundamentals)
+        fundamentals, dividend_drops = await events.resolve_due_events(
+            conn, events_rng, tick_index, fundamentals
+        )
         await events.maybe_create_news(conn, events_rng, tick_index, instrument_rows)
         await events.refresh_next_event_ticks(conn)
 
@@ -71,17 +74,23 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         for row in instrument_rows:
             if row["kind"] == "INDEX":
                 continue  # priced from components below
+            # Ex-date drop: the dividend subtracts from the base (immediate,
+            # permanent) rather than the decaying impact term, and the
+            # accrual-window drift offset already lowered the expected path.
+            div_drop = float(dividend_drops.get(row["id"], 0))
             state = engine.InstrumentState(
                 id=row["id"],
                 sector_key=row["sector_key"],
-                drift=float(row["drift"]),
+                drift=float(row["drift"]) - float(row["dividend_drift_offset"]),
                 sigma=float(row["sigma"]),
                 beta=float(row["beta"]),
                 gamma=float(row["gamma"]),
                 kappa=float(row["kappa"]),
                 fundamental_sigma=float(row["fundamental_sigma"]),
                 tau_ticks=float(row["tau_ticks"]),
-                base_price=float(row["base_price"]),
+                base_price=max(
+                    events.MIN_POST_DIV_PRICE, float(row["base_price"]) - div_drop
+                ),
                 fundamental_value=fundamentals[row["id"]],
                 impact=float(row["impact"]),
             )

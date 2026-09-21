@@ -48,7 +48,9 @@ async def test_resolved_earnings_reschedules_the_next_one(conn: AsyncConnection)
 
     rng = np.random.default_rng(1)
     fundamentals = {instrument_id: 100.0}
-    await events.resolve_due_events(conn, rng, current_tick=5, fundamentals=fundamentals)
+    fundamentals, _ = await events.resolve_due_events(
+        conn, rng, current_tick=5, fundamentals=fundamentals
+    )
 
     assert fundamentals[instrument_id] != 100.0  # a jump was applied
 
@@ -87,7 +89,9 @@ async def test_news_hint_resolves_and_reveals_magnitude(conn: AsyncConnection) -
 
     rng = np.random.default_rng(2)
     fundamentals = {instrument_id: 100.0}
-    await events.resolve_due_events(conn, rng, current_tick=10, fundamentals=fundamentals)
+    fundamentals, _ = await events.resolve_due_events(
+        conn, rng, current_tick=10, fundamentals=fundamentals
+    )
 
     assert fundamentals[instrument_id] == 100.0 * float(np.exp(0.03))
 

@@ -21,6 +21,9 @@ Behavioral archetypes:
                  day without cancelling -- stale quotes at old marks cross
                  fresh ones (and the MM) as prices drift, exercising the
                  crossing book
+    stop_loss    holds one name under a protective SELL stop trailing
+                 ~4-9% below the mark; re-enters after being stopped out,
+                 exercising stop triggers and cascades
 
 Usage:
     python -m stockbot.simulation.harness --database-url ... --users 200 --days 90
@@ -73,6 +76,7 @@ SYNTHETIC_USER_ID_BASE = 900_000_000_000_000
 WHALE_STARTING_GRANT_MINOR = 500_000  # $5,000
 SHORTER_STARTING_GRANT_MINOR = 200_000  # $2,000: tier 1 ($500) + trading cash
 LP_STARTING_GRANT_MINOR = 300_000  # $3,000: two-sided quotes need cash + inventory
+STOPLOSS_STARTING_GRANT_MINOR = 100_000  # $1,000: needs a position worth protecting
 TICKS_PER_SIMULATED_DAY = 1440
 # Simulated days are mapped onto consecutive calendar dates starting here so
 # `claim_daily` runs its real per-day logic (streaks included). Without this
@@ -89,6 +93,7 @@ class Agent:
     wash_ticker: str | None = None
     short_ticker: str | None = None
     quote_ticker: str | None = None
+    stop_ticker: str | None = None
 
 
 def build_cohort(num_users: int, rng: random.Random) -> list[Agent]:
@@ -99,8 +104,15 @@ def build_cohort(num_users: int, rng: random.Random) -> list[Agent]:
     yolo_count = round(remaining * 0.2)
     shorter_count = round(remaining * 0.1)
     lp_count = round(remaining * 0.1)
+    stoploss_count = round(remaining * 0.1)
     farmer_count = max(
-        0, remaining - grinder_count - yolo_count - shorter_count - lp_count
+        0,
+        remaining
+        - grinder_count
+        - yolo_count
+        - shorter_count
+        - lp_count
+        - stoploss_count,
     )
 
     agents: list[Agent] = []
@@ -122,6 +134,7 @@ def build_cohort(num_users: int, rng: random.Random) -> list[Agent]:
     _add("yolo", yolo_count)
     _add("shorter", shorter_count)
     _add("liquidity_provider", lp_count)
+    _add("stop_loss", stoploss_count)
     _add("farmer", farmer_count)
 
     rng.shuffle(agents)
@@ -141,12 +154,13 @@ async def initialize_agents(conn: AsyncConnection, agents: list[Agent]) -> None:
     lp_slot = 0
     for agent in agents:
         await bootstrap_user(conn, agent.user_id)
-        if agent.archetype in ("whale", "shorter", "liquidity_provider"):
+        if agent.archetype in ("whale", "shorter", "liquidity_provider", "stop_loss"):
             account_id = await get_user_account_id(conn, agent.user_id)
             grant = {
                 "whale": WHALE_STARTING_GRANT_MINOR,
                 "shorter": SHORTER_STARTING_GRANT_MINOR,
                 "liquidity_provider": LP_STARTING_GRANT_MINOR,
+                "stop_loss": STOPLOSS_STARTING_GRANT_MINOR,
             }[agent.archetype]
             await post_transfer(
                 conn,
@@ -339,6 +353,71 @@ async def _run_agent_day(
                 )
             return
 
+        if agent.archetype == "stop_loss":
+            # Holds one name with a protective SELL stop trailing ~4-9%
+            # under the mark; re-enters a day or two after being stopped
+            # out. Exercises the stop trigger/cascade path every run.
+            await _safe_claim(conn, agent.user_id, sim_today)
+            if agent.stop_ticker is None:
+                agent.stop_ticker = await _random_active_ticker(conn, rng)
+            ticker = agent.stop_ticker
+            if ticker is None:
+                return
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT p.quantity FROM positions p
+                    JOIN instruments i ON i.id = p.instrument_id
+                    WHERE p.user_id = %s AND i.ticker = %s AND p.season_id IS NULL
+                    """,
+                    (agent.user_id, ticker),
+                )
+                pos_row = await cur.fetchone()
+                await cur.execute(
+                    "SELECT quoted_price FROM instruments WHERE ticker = %s "
+                    "AND circuit_halted_until_tick IS NULL",
+                    (ticker,),
+                )
+                px_row = await cur.fetchone()
+            if px_row is None:
+                return  # halted or gone: leave the stop to rest
+            mark = Decimal(str(px_row[0]))
+            held = int(pos_row[0]) if pos_row else 0
+            open_orders = await list_open_orders(conn, agent.user_id)
+            has_stop = any(
+                o["order_type"] != "LIMIT" and o["ticker"] == ticker
+                for o in open_orders
+            )
+            if held <= 0:
+                # Flat (fresh start or just stopped out): re-enter at market
+                # most days, then re-arm the stop below.
+                if rng.random() >= 0.6:
+                    return
+                account_id = await get_user_account_id(conn, agent.user_id)
+                balance = await get_balance(conn, account_id)
+                spend = int(balance * rng.uniform(0.4, 0.7))
+                qty = await _quantity_for_spend(spend, int(mark * 100))
+                if qty < 1:
+                    return
+                await execute_trade(
+                    conn, user_id=agent.user_id, ticker=ticker, side="BUY",
+                    quantity=qty,
+                )
+                held = qty
+            if held > 0 and not has_stop:
+                stop_pct = Decimal(str(round(rng.uniform(0.04, 0.09), 4)))
+                await place_order(
+                    conn,
+                    user_id=agent.user_id,
+                    ticker=ticker,
+                    side="SELL",
+                    quantity=held,
+                    limit_price=None,
+                    stop_price=(mark * (1 - stop_pct)).quantize(Decimal("0.000001")),
+                    expires_in_ticks=3 * TICKS_PER_SIMULATED_DAY,
+                )
+            return
+
         if agent.archetype == "shorter":
             await _safe_claim(conn, agent.user_id, sim_today)
             if rng.random() >= 0.4:
@@ -389,7 +468,8 @@ async def _run_agent_day(
 
 
 async def net_worth_by_user(conn: AsyncConnection, user_ids: list[int]) -> dict[int, int]:
-    """Cash + mark value of positions (at current quoted price), minor units."""
+    """Cash + mark value of positions minus accrued borrow/dividend
+    liabilities (at current quoted price), minor units."""
     async with conn.cursor() as cur:
         await cur.execute(
             "SELECT user_id, balance FROM accounts WHERE kind = 'USER' AND user_id = ANY(%s)",
@@ -400,7 +480,9 @@ async def net_worth_by_user(conn: AsyncConnection, user_ids: list[int]) -> dict[
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            SELECT p.user_id, SUM(p.quantity * i.quoted_price)
+            SELECT p.user_id, SUM(p.quantity * i.quoted_price * 100
+                                  - p.borrow_fees_accrued
+                                  - p.dividends_accrued)
             FROM positions p
             JOIN instruments i ON i.id = p.instrument_id
             WHERE p.user_id = ANY(%s) AND p.quantity <> 0 AND p.season_id IS NULL
@@ -408,10 +490,10 @@ async def net_worth_by_user(conn: AsyncConnection, user_ids: list[int]) -> dict[
             """,
             (user_ids,),
         )
-        holdings_major: dict[int, float] = dict(await cur.fetchall())
+        holdings_minor: dict[int, float] = dict(await cur.fetchall())
 
     return {
-        uid: cash.get(uid, 0) + int(float(holdings_major.get(uid, 0)) * 100) for uid in user_ids
+        uid: cash.get(uid, 0) + int(holdings_minor.get(uid, 0)) for uid in user_ids
     }
 
 
@@ -443,6 +525,12 @@ async def economy_snapshot(conn: AsyncConnection) -> dict[str, float]:
         short_row = await cur.fetchone()
         short_positions = int(short_row[0]) if short_row else 0
         short_notional = float(short_row[1]) if short_row else 0.0
+        await cur.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM ledger_entries "
+            "WHERE reason = 'DIVIDEND' AND amount > 0"
+        )
+        div_row = await cur.fetchone()
+        dividends_paid = int(div_row[0]) if div_row else 0
     return {
         "faucet_printed": -faucet_balance,
         "sink_destroyed": sink_balance,
@@ -452,6 +540,7 @@ async def economy_snapshot(conn: AsyncConnection) -> dict[str, float]:
         "liquidations": liquidation_count,
         "open_shorts": short_positions,
         "short_notional_major": short_notional,
+        "dividends_paid": dividends_paid,
     }
 
 
@@ -500,7 +589,7 @@ async def run_simulation(
             timeline.append({"day": day, "gini": gini, **econ})
             log.info(
                 "day %d: money_supply=%s gini=%.3f faucet_sink=%.3f "
-                "liquidations=%d insurance=%s open_shorts=%d",
+                "liquidations=%d insurance=%s open_shorts=%d dividends=%s",
                 day,
                 econ["money_supply"],
                 gini,
@@ -508,6 +597,7 @@ async def run_simulation(
                 int(econ["liquidations"]),
                 econ["insurance_fund"],
                 int(econ["open_shorts"]),
+                int(econ["dividends_paid"]),
             )
 
     final_net_worth = await net_worth_by_user(conn, user_ids)
@@ -521,6 +611,7 @@ async def run_simulation(
         "whale",
         "shorter",
         "liquidity_provider",
+        "stop_loss",
     }:
         members = [uid for uid in user_ids if archetype_by_user[uid] == archetype]
         if not members:

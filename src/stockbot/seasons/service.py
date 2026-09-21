@@ -313,7 +313,8 @@ async def league_equity_minor(conn: AsyncConnection, season_id: int, user_id: in
             LEFT JOIN (
                 SELECT p.user_id,
                        CAST(SUM(p.quantity * i.quoted_price * 100
-                                - p.borrow_fees_accrued) AS BIGINT) AS value_minor
+                                - p.borrow_fees_accrued
+                                - p.dividends_accrued) AS BIGINT) AS value_minor
                 FROM positions p
                 JOIN instruments i ON i.id = p.instrument_id
                 WHERE p.season_id = %s AND p.quantity <> 0
@@ -377,7 +378,8 @@ async def on_tick(
                 LEFT JOIN (
                     SELECT p.season_id, p.user_id,
                            CAST(SUM(p.quantity * i.quoted_price * 100
-                                    - p.borrow_fees_accrued) AS BIGINT)
+                                    - p.borrow_fees_accrued
+                                    - p.dividends_accrued) AS BIGINT)
                                AS value_minor
                     FROM positions p
                     JOIN instruments i ON i.id = p.instrument_id
@@ -420,7 +422,8 @@ async def standings(conn: AsyncConnection, season_id: int) -> list[Standing]:
             LEFT JOIN (
                 SELECT p.season_id, p.user_id,
                        CAST(SUM(p.quantity * i.quoted_price * 100
-                                - p.borrow_fees_accrued) AS BIGINT)
+                                - p.borrow_fees_accrued
+                                - p.dividends_accrued) AS BIGINT)
                            AS value_minor
                 FROM positions p
                 JOIN instruments i ON i.id = p.instrument_id

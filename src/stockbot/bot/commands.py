@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import discord
 from discord import app_commands
@@ -611,6 +612,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             embed.add_field(
                 name="Accrued borrow fees", value=format_money(health.accrued_fees_minor)
             )
+        if health.accrued_dividends_minor:
+            embed.add_field(
+                name="Accrued dividends",
+                value=format_money(health.accrued_dividends_minor),
+            )
         if health.undermargined:
             embed.set_footer(text="Below maintenance — liquidation may fire on the next tick.")
         await interaction.response.send_message(embed=embed)
@@ -637,7 +643,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 await cur.execute(
                     """
                     SELECT i.ticker, p.quantity, i.quoted_price, i.maint_margin_pct,
-                           i.init_margin_pct, i.short_interest_pct, p.borrow_fees_accrued
+                           i.init_margin_pct, i.short_interest_pct,
+                           p.borrow_fees_accrued, p.dividends_accrued
                     FROM positions p
                     JOIN instruments i ON i.id = p.instrument_id
                     WHERE p.user_id = %s AND p.quantity < 0
@@ -656,10 +663,12 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         for r in rows:
             notional = -int(r[1]) * Decimal(r[2])
             fees = int(Decimal(r[6]).quantize(Decimal("1")))
+            divs = int(Decimal(r[7]).quantize(Decimal("1")))
             lines.append(
                 f"{r[0]:<6} {r[1]:>6}  notional {format_price(notional):>10}  "
                 f"maint {format_money(int(notional * Decimal(r[3]) * 100)):>9}  "
                 f"SI {float(r[5]) * 100:.1f}%  fees {format_money(fees)}"
+                + (f"  divs {format_money(divs)}" if divs else "")
             )
         embed = discord.Embed(title="Collateral — open shorts")
         embed.description = "```\n" + "\n".join(lines) + "\n```"
@@ -691,10 +700,17 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ticker: str,
         side: str,
         quantity: int,
-        limit: float,
+        limit: float | None,
+        stop: float | None,
         hours: float | None,
         league: bool,
     ) -> None:
+        if limit is None and stop is None:
+            await interaction.response.send_message(
+                "Give a `limit` price, a `stop` price, or both (stop-limit).",
+                ephemeral=True,
+            )
+            return
         async with db.connection() as conn:
             await bootstrap_user(conn, interaction.user.id)
             season_id: int | None = None
@@ -714,12 +730,13 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     ticker=ticker,
                     side=side,  # type: ignore[arg-type]
                     quantity=quantity,
-                    limit_price=Decimal(str(limit)),
+                    limit_price=None if limit is None else Decimal(str(limit)),
                     season_id=season_id,
                     expires_in_ticks=(
                         None if hours is None else int(hours * TICKS_PER_DAY / 24)
                     ),
                     interaction_id=str(interaction.id),
+                    stop_price=None if stop is None else Decimal(str(stop)),
                 )
             except (TradingError, ValueError) as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
@@ -729,17 +746,27 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             if result.expires_tick is None
             else f"expires tick {result.expires_tick}"
         )
+        if result.order_type == "STOP":
+            price_part = f"stop {format_price(result.stop_price or 0)}"
+        elif result.order_type == "STOP_LIMIT":
+            price_part = (
+                f"stop {format_price(result.stop_price or 0)} "
+                f"limit {format_price(result.limit_price or 0)}"
+            )
+        else:
+            price_part = f"@ {format_price(result.limit_price or 0)}"
         await interaction.response.send_message(
             f"Order **#{result.order_id}** resting: {result.side} "
-            f"**{result.quantity}** {result.ticker} @ {format_price(result.limit_price)} "
+            f"**{result.quantity}** {result.ticker} {price_part} "
             f"({expiry}). Fills when the market reaches it."
         )
 
-    @order_group.command(name="buy", description="Rest a limit buy")
+    @order_group.command(name="buy", description="Rest a limit/stop buy")
     @app_commands.describe(
         ticker="Instrument ticker",
         quantity="Number of shares",
-        limit="Max price you'll pay",
+        limit="Max price you'll pay (omit for a pure stop order)",
+        stop="Trigger once the mark rises to this price",
         hours="Auto-expire after this many hours (omit for GTC)",
         league="Place the order in your league portfolio",
     )
@@ -748,20 +775,24 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ticker: str,
         quantity: app_commands.Range[int, 1, 1_000_000_000],
         # NUMERIC(18, 6) tops out just under 1e12; keep the bound inside it.
-        limit: app_commands.Range[float, 0.0001, 999_999_999_999],
+        limit: app_commands.Range[float, 0.0001, 999_999_999_999] | None = None,
+        stop: app_commands.Range[float, 0.0001, 999_999_999_999] | None = None,
         hours: app_commands.Range[float, 0.02, 8760] | None = None,
         league: bool = False,
     ) -> None:
-        await _place_order(interaction, ticker, "BUY", quantity, limit, hours, league)
+        await _place_order(
+            interaction, ticker, "BUY", quantity, limit, stop, hours, league
+        )
 
     @order_group.command(
         name="sell",
-        description="Rest a limit sell (past your holdings opens a short — needs margin)",
+        description="Rest a limit/stop sell (stops double as stop-losses)",
     )
     @app_commands.describe(
         ticker="Instrument ticker",
         quantity="Number of shares",
-        limit="Min price you'll accept",
+        limit="Min price you'll accept (omit for a pure stop order)",
+        stop="Trigger once the mark falls to this price (stop-loss)",
         hours="Auto-expire after this many hours (omit for GTC)",
         league="Place the order in your league portfolio",
     )
@@ -769,11 +800,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         interaction: discord.Interaction,
         ticker: str,
         quantity: app_commands.Range[int, 1, 1_000_000_000],
-        limit: app_commands.Range[float, 0.0001, 999_999_999_999],
+        limit: app_commands.Range[float, 0.0001, 999_999_999_999] | None = None,
+        stop: app_commands.Range[float, 0.0001, 999_999_999_999] | None = None,
         hours: app_commands.Range[float, 0.02, 8760] | None = None,
         league: bool = False,
     ) -> None:
-        await _place_order(interaction, ticker, "SELL", quantity, limit, hours, league)
+        await _place_order(
+            interaction, ticker, "SELL", quantity, limit, stop, hours, league
+        )
 
     @order_group.command(name="list", description="Show your resting orders")
     @app_commands.describe(league="Show league orders instead of main-portfolio ones")
@@ -793,13 +827,24 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         if not rows:
             await interaction.response.send_message("No open orders.", ephemeral=True)
             return
-        lines = [
-            f"#{r['id']:<4} {r['side']:<4} {r['quantity'] - r['filled_quantity']:>5} "
-            f"{r['ticker']:<6} "
-            f"@ {format_price(r['limit_price']):>10} "
-            f"(mark {format_price(r['quoted_price'])})"
-            for r in rows
-        ]
+        def _order_line(r: dict[str, Any]) -> str:
+            remaining = r["quantity"] - r["filled_quantity"]
+            if r["order_type"] == "STOP":
+                price = f"stop {format_price(r['stop_price'])}"
+            elif r["order_type"] == "STOP_LIMIT":
+                price = (
+                    f"stop {format_price(r['stop_price'])} "
+                    f"lim {format_price(r['limit_price'])}"
+                )
+            else:
+                price = f"@ {format_price(r['limit_price'])}"
+            triggered = " [TRIGGERED]" if r["triggered_tick"] is not None else ""
+            return (
+                f"#{r['id']:<4} {r['side']:<4} {remaining:>5} {r['ticker']:<6} "
+                f"{price:>24} (mark {format_price(r['quoted_price'])}){triggered}"
+            )
+
+        lines = [_order_line(r) for r in rows]
         embed = discord.Embed(title="Open orders")
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(embed=embed)

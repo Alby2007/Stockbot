@@ -25,6 +25,7 @@ Liquidity plan (phases A–E) status: **Phase A done** (dynamic
 fees; `next_event_tick`/`last_halt_end_tick`; chart volume; `0013` param
 bounds + `0014` spread config). **Phase B done** (crossing book).
 **Phase C done** (participation cap + sqrt impact + fill epsilon).
+**Phase D done** (stop orders + dividends).
 
 Crossing-book design notes: `match_orders` runs two passes inside
 `apply_tick`. Pass 1 walks each (instrument, season_id) book in
@@ -62,6 +63,27 @@ also need the mark to cross the limit by `order_book.fill_epsilon_bps`,
 not merely touch it (no free trade-throughs). When resizing tests: a
 failing-depth order raises before funds/margin checks — keep test sizes
 under the cap when testing other rejections.
+
+Stops/dividends notes: `orders.order_type` LIMIT/STOP/STOP_LIMIT with
+`stop_price` and `triggered_tick`; untriggered stops are invisible to the
+book, `_trigger_due_stops` flips them when the mark crosses, and a
+triggered STOP is marketable (never the maker — a marketable maker defers
+to the counterparty's limit, two marketable orders cross at the mark).
+`match_orders` is an outer loop of `_match_once` bounded by
+`order.stop_cascade_max_iters` with `depth_used` carrying the per-tick
+participation budget across cascade iterations — post-0016 lambdas are
+~0.01, so one fill moves an illiquid mark ≪1%; cascades need several
+orders or several ticks to matter. Dividends: `events.kind='DIVIDEND'`
+(scheduled like earnings for a hash-selected payer subset), funded by
+`drift_offset` — a per-tick drift reduction over the accrual window
+(aggregate `instruments.dividend_drift_offset` recomputed in
+`refresh_next_event_ticks`), so payouts redistribute rather than mint.
+Ex-date: `base_price` and `fundamental_value` both drop by the dividend
+(permanent, not the decaying impact term), MARKET_MAKER pays longs
+(`reason='DIVIDEND'`), and shorts accrue `positions.dividends_accrued`
+(minor units) settled to MARKET_MAKER on cover/liquidation — the cash
+CHECK means shorts can never be debited directly. Bounded shorts are NOT
+charged (collateralized derivative, not borrowed stock).
 
 Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
 preserved -- short proceeds credit to cash and are spendable; leverage is

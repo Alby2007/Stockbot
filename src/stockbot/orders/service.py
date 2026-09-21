@@ -50,6 +50,7 @@ from stockbot.trading.service import (
 )
 
 Side = Literal["BUY", "SELL"]
+OrderType = Literal["LIMIT", "STOP", "STOP_LIMIT"]
 
 
 @dataclass(frozen=True)
@@ -58,8 +59,10 @@ class OrderResult:
     ticker: str
     side: Side
     quantity: int
-    limit_price: Decimal
+    limit_price: Decimal | None
     expires_tick: int | None
+    order_type: OrderType = "LIMIT"
+    stop_price: Decimal | None = None
 
 
 async def _current_tick(conn: AsyncConnection) -> int | None:
@@ -76,17 +79,31 @@ async def place_order(
     ticker: str,
     side: Side,
     quantity: int,
-    limit_price: Decimal,
+    limit_price: Decimal | None,
     season_id: int | None = None,
     expires_in_ticks: int | None = None,
     interaction_id: str | None = None,
+    stop_price: Decimal | None = None,
 ) -> OrderResult:
-    """Validate and rest a limit order. Marketability/margin are re-checked at
-    fill time; placement only rejects structurally bad orders."""
+    """Validate and rest an order. Marketability/margin are re-checked at
+    fill time; placement only rejects structurally bad orders.
+
+    limit only -> LIMIT; stop only -> STOP (triggers to a marketable
+    order); both -> STOP_LIMIT (triggers to a limit order at limit_price).
+    """
     if quantity <= 0:
         raise ValueError("quantity must be positive")
-    if limit_price <= 0:
+    if limit_price is not None and limit_price <= 0:
         raise ValueError("limit price must be positive")
+    if stop_price is not None and stop_price <= 0:
+        raise ValueError("stop price must be positive")
+    order_type: OrderType
+    if stop_price is None:
+        if limit_price is None:
+            raise ValueError("need a limit price, a stop price, or both")
+        order_type = "LIMIT"
+    else:
+        order_type = "STOP_LIMIT" if limit_price is not None else "STOP"
     ticker = ticker.upper()
 
     async with conn.transaction(), conn.cursor() as cur:
@@ -107,8 +124,8 @@ async def place_order(
             """
             INSERT INTO orders
                 (user_id, instrument_id, season_id, side, quantity,
-                 limit_price, opened_tick, expires_tick)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                 limit_price, opened_tick, expires_tick, order_type, stop_price)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -120,6 +137,8 @@ async def place_order(
                 limit_price,
                 tick,
                 expires_tick,
+                order_type,
+                stop_price,
             ),
         )
         order_row = await cur.fetchone()
@@ -133,6 +152,8 @@ async def place_order(
         quantity=quantity,
         limit_price=limit_price,
         expires_tick=expires_tick,
+        order_type=order_type,
+        stop_price=stop_price,
     )
 
 
@@ -156,7 +177,8 @@ async def list_open_orders(
         await cur.execute(
             """
             SELECT o.id, i.ticker, o.side, o.quantity, o.filled_quantity,
-                   o.limit_price, i.quoted_price, o.expires_tick, o.created_at
+                   o.limit_price, o.order_type, o.stop_price, o.triggered_tick,
+                   i.quoted_price, o.expires_tick, o.created_at
             FROM orders o
             JOIN instruments i ON i.id = o.instrument_id
             WHERE o.user_id = %s AND o.status = 'OPEN'
@@ -330,6 +352,54 @@ async def _settle_cross(
     return new_mark, new_impact, halted
 
 
+def _marketable(order: dict[str, Any]) -> bool:
+    """A triggered STOP has no limit price -- it takes whatever the book
+    or MM gives it. (Untriggered stops are excluded from matching.)"""
+    return bool(order["order_type"] == "STOP")
+
+
+def _bid_sort_key(o: dict[str, Any]) -> tuple[Decimal, Any, Any]:
+    # Marketable bids sort first (effective limit +inf -> -inf key).
+    return (
+        Decimal("-Infinity") if _marketable(o) else -o["limit_price"],
+        o["opened_tick"] or -1,
+        o["id"],
+    )
+
+
+def _ask_sort_key(o: dict[str, Any]) -> tuple[Decimal, Any, Any]:
+    # Marketable asks sort first (effective limit 0).
+    return (
+        Decimal(0) if _marketable(o) else o["limit_price"],
+        o["opened_tick"] or -1,
+        o["id"],
+    )
+
+
+async def _trigger_due_stops(conn: AsyncConnection, tick_index: int) -> int:
+    """Flip every OPEN stop whose stop price the mark has crossed to
+    triggered (triggered_tick = this tick). Returns how many fired.
+
+    BUY stops trigger at/above their stop, SELL stops at/below -- the
+    standard stop-loss/stop-buy semantics.
+    """
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE orders o SET triggered_tick = %s
+            FROM instruments i
+            WHERE o.instrument_id = i.id
+              AND o.status = 'OPEN'
+              AND o.triggered_tick IS NULL
+              AND o.order_type <> 'LIMIT'
+              AND ((o.side = 'BUY'  AND i.quoted_price >= o.stop_price)
+                OR (o.side = 'SELL' AND i.quoted_price <= o.stop_price))
+            """,
+            (tick_index,),
+        )
+        return cur.rowcount
+
+
 async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
     """Match the book (crosses, then MM fills) for this tick.
 
@@ -337,9 +407,15 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
     locked, accounts lock afterwards in ascending id order -- consistent
     with the project's lock ordering. Returns the number of fill events
     (a cross counts once, an MM fill counts once).
+
+    Stop orders add an outer loop: triggering converts them to marketable
+    orders whose fills move the mark, which can trigger more stops on the
+    same tick (a cascade). The loop is bounded by
+    order.stop_cascade_max_iters, and `depth_used` enforces the per-tick
+    participation budget across iterations so a cascade can't drain more
+    depth than one tick allows.
     """
-    fills = 0
-    async with conn.cursor(row_factory=dict_row) as cur:
+    async with conn.cursor() as cur:
         await cur.execute(
             """
             UPDATE orders SET status = 'EXPIRED'
@@ -348,10 +424,47 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
             """,
             (tick_index,),
         )
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT key, value FROM config WHERE key IN "
+            "('cross.collar_pct', 'cross.trade_through_epsilon', "
+            " 'order.stop_cascade_max_iters')"
+        )
+        cfg_rows = {str(r["key"]): float(r["value"]) for r in await cur.fetchall()}
+    collar = Decimal(str(cfg_rows.get("cross.collar_pct", 0.02)))
+    epsilon = float(cfg_rows.get("cross.trade_through_epsilon", 0.0005))
+    cascade_max = int(cfg_rows.get("order.stop_cascade_max_iters", 8))
+
+    depth_used: dict[int, int] = {}
+    fills = 0
+    await _trigger_due_stops(conn, tick_index)
+    for _ in range(cascade_max):
+        fills += await _match_once(
+            conn, tick_index, collar=collar, epsilon=epsilon, depth_used=depth_used
+        )
+        if await _trigger_due_stops(conn, tick_index) == 0:
+            break
+    return fills
+
+
+async def _match_once(
+    conn: AsyncConnection,
+    tick_index: int,
+    *,
+    collar: Decimal,
+    epsilon: float,
+    depth_used: dict[int, int],
+) -> int:
+    """One matching pass over the book: crosses, then MM fallback.
+    `depth_used` accumulates MM-filled shares per order across cascade
+    iterations so the participation cap is per-tick, not per-pass."""
+    fills = 0
+    async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
             SELECT o.id, o.user_id, o.season_id, o.side, o.quantity,
-                   o.filled_quantity, o.limit_price, o.opened_tick,
+                   o.filled_quantity, o.limit_price, o.order_type,
+                   o.opened_tick,
                    o.instrument_id, i.ticker, i.base_price, i.impact,
                    i.quoted_price, i.liquidity, i.lambda_impact, i.max_impact,
                    i.sigma, i.next_event_tick, i.last_halt_end_tick,
@@ -359,17 +472,11 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
             FROM orders o
             JOIN instruments i ON i.id = o.instrument_id
             WHERE o.status = 'OPEN'
+              AND (o.order_type = 'LIMIT' OR o.triggered_tick IS NOT NULL)
             ORDER BY o.instrument_id, o.id
             """,
         )
         open_orders = await cur.fetchall()
-        await cur.execute(
-            "SELECT key, value FROM config WHERE key IN "
-            "('cross.collar_pct', 'cross.trade_through_epsilon')"
-        )
-        cfg_rows = {str(r["key"]): float(r["value"]) for r in await cur.fetchall()}
-    collar = Decimal(str(cfg_rows.get("cross.collar_pct", 0.02)))
-    epsilon = float(cfg_rows.get("cross.trade_through_epsilon", 0.0005))
 
     # --- Pass 1: crossing book -------------------------------------------
     # Per (instrument, season scope): bids and asks walk price-time
@@ -387,14 +494,10 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
         base_price = float(ref["base_price"])
         max_impact = float(ref["max_impact"])
         mark = float(ref["quoted_price"])
-        bids = sorted(
-            sides["BUY"],
-            key=lambda o: (-o["limit_price"], o["opened_tick"] or -1, o["id"]),
-        )
-        asks = sorted(
-            sides["SELL"],
-            key=lambda o: (o["limit_price"], o["opened_tick"] or -1, o["id"]),
-        )
+        # Effective limit: a marketable (triggered STOP) bid pays anything,
+        # a marketable ask takes anything -- they sort first on their side.
+        bids = sorted(sides["BUY"], key=_bid_sort_key)
+        asks = sorted(sides["SELL"], key=_ask_sort_key)
         remaining = {
             int(o["id"]): int(o["quantity"]) - int(o["filled_quantity"])
             for o in bids + asks
@@ -402,7 +505,9 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
         i = j = 0
         while i < len(bids) and j < len(asks):
             bid, ask = bids[i], asks[j]
-            if bid["limit_price"] < ask["limit_price"]:
+            bid_eff = Decimal("Infinity") if _marketable(bid) else bid["limit_price"]
+            ask_eff = Decimal(0) if _marketable(ask) else ask["limit_price"]
+            if bid_eff < ask_eff:
                 break
             bid_maker = _is_maker(bid, ask)
             if bid["user_id"] == ask["user_id"]:
@@ -414,7 +519,15 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
                     i += 1
                 continue
             maker = bid if bid_maker else ask
-            cross_price = Decimal(maker["limit_price"])
+            # The print is the maker's price -- except a marketable order
+            # has none, so a marketable maker defers to the counterparty's
+            # limit, and two marketable orders cross at the mark.
+            if maker["limit_price"] is not None:
+                cross_price = Decimal(maker["limit_price"])
+            elif (ask if bid_maker else bid)["limit_price"] is not None:
+                cross_price = Decimal((ask if bid_maker else bid)["limit_price"])
+            else:
+                cross_price = Decimal(str(mark))
             if abs(cross_price - Decimal(str(mark))) / Decimal(str(mark)) > collar:
                 # The maker's price is too far off the mark to print --
                 # it rests; try the pair without it.
@@ -460,18 +573,22 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
         # A BUY needs quoted <= limit*(1-eps), a SELL quoted >= limit*(1+eps)
         # -- the mark must cross the limit by epsilon, not merely touch it
         # (the crossing book provides the real queue priority; this is the
-        # cheap trade-through rule for the infinite-depth MM).
+        # cheap trade-through rule for the infinite-depth MM). A triggered
+        # STOP has no limit: it's always a candidate.
         await cur.execute(
             """
             SELECT o.id, o.user_id, o.season_id, o.side, o.quantity,
-                   o.filled_quantity, o.limit_price, i.ticker, i.base_price,
+                   o.filled_quantity, o.limit_price, o.order_type, i.ticker,
+                   i.base_price,
                    i.impact, i.liquidity, i.lambda_impact, i.max_impact,
                    i.sigma, i.next_event_tick, i.last_halt_end_tick
             FROM orders o
             JOIN instruments i ON i.id = o.instrument_id
             WHERE o.status = 'OPEN'
               AND i.circuit_halted_until_tick IS NULL
-              AND ((o.side = 'BUY'  AND i.quoted_price <= o.limit_price * (1 - %s))
+              AND (o.order_type = 'LIMIT' OR o.triggered_tick IS NOT NULL)
+              AND (o.order_type = 'STOP'
+                OR (o.side = 'BUY'  AND i.quoted_price <= o.limit_price * (1 - %s))
                 OR (o.side = 'SELL' AND i.quoted_price >= o.limit_price * (1 + %s)))
             ORDER BY o.id
             """,
@@ -486,7 +603,9 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
         sign = 1 if order["side"] == "BUY" else -1
         # Participation cap: a resting order works over multiple ticks --
         # fill up to cap*liquidity in notional this tick, the rest next
-        # tick. Estimated on the full-size fill price (conservative).
+        # tick. Estimated on the full-size fill price (conservative). The
+        # budget is per-tick: `depth_used` carries it across stop-cascade
+        # iterations.
         fill_full, _ = engine.apply_trade_impact(
             base_price=float(order["base_price"]),
             impact_before=float(order["impact"]),
@@ -497,12 +616,13 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
             half_spread=half_spread_for(order, tick_index, spread_cfg),
         )
         cap_qty = int(cap * float(order["liquidity"]) / fill_full)
-        trade_qty = min(remaining_qty, cap_qty)
+        budget = cap_qty - depth_used.get(int(order["id"]), 0)
+        trade_qty = min(remaining_qty, budget)
         if trade_qty < 1:
             continue
         # Executable price check at the actual size: the fill path includes
         # half-spread and impact; verify the fill respects the limit before
-        # committing to the trade.
+        # committing to the trade. (Triggered STOPs have no limit.)
         fill_f, _ = engine.apply_trade_impact(
             base_price=float(order["base_price"]),
             impact_before=float(order["impact"]),
@@ -512,11 +632,12 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
             max_impact=float(order["max_impact"]),
             half_spread=half_spread_for(order, tick_index, spread_cfg),
         )
-        limit = Decimal(order["limit_price"])
-        if order["side"] == "BUY" and Decimal(str(fill_f)) > limit:
-            continue
-        if order["side"] == "SELL" and Decimal(str(fill_f)) < limit:
-            continue
+        if order["limit_price"] is not None:
+            limit = Decimal(order["limit_price"])
+            if order["side"] == "BUY" and Decimal(str(fill_f)) > limit:
+                continue
+            if order["side"] == "SELL" and Decimal(str(fill_f)) < limit:
+                continue
 
         try:
             async with conn.transaction():
@@ -550,6 +671,9 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
                         (trade_qty, trade_qty, trade_qty, tick_index,
                          result.fill_price, order["id"]),
                     )
+                depth_used[int(order["id"])] = (
+                    depth_used.get(int(order["id"]), 0) + trade_qty
+                )
                 fills += 1
         except (TradingError, MarginError, LedgerError, ValueError):
             # Not fillable right now (funds, margin gates, slot limits) --

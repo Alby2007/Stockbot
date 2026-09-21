@@ -20,17 +20,24 @@ perturb the price engine's own draw sequence).
 
 from __future__ import annotations
 
+import math
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 import numpy as np
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
+from stockbot.ledger.service import get_system_account_id, post_transfer
 from stockbot.market.engine import TICKS_PER_DAY
 
 EARNINGS_INTERVAL_TICKS = 30 * TICKS_PER_DAY
 EARNINGS_JITTER_TICKS = 5 * TICKS_PER_DAY
 EARNINGS_SHOCK_SIGMA = 0.05
+
+# Lower bound for fundamental/base values after an ex-date drop, so a
+# dividend can never push the factor model into nonpositive prices.
+MIN_POST_DIV_PRICE = 0.01
 
 NEWS_CHANCE_PER_INSTRUMENT_PER_TICK = 0.0005
 NEWS_MIN_LAG_TICKS = 30
@@ -83,6 +90,73 @@ async def schedule_initial_earnings(
             )
 
 
+async def _dividend_config(conn: AsyncConnection) -> dict[str, float]:
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT key, value FROM config WHERE key LIKE 'dividend.%'")
+        return {str(k): float(v) for k, v in await cur.fetchall()}
+
+
+def _pays_dividends(instrument_id: int, payer_pct: float) -> bool:
+    """Deterministic payer flag: a stable hash of the instrument id puts a
+    fixed subset of names on a dividend schedule (like real indices where
+    only some constituents pay)."""
+    return (instrument_id * 2654435761) % 100 < payer_pct
+
+
+def _dividend_fields(
+    rng: np.random.Generator,
+    cfg: dict[str, float],
+    quoted: float,
+    window: int,
+) -> tuple[Decimal, Decimal]:
+    """Per-share dividend and the per-tick drift offset that funds it:
+    cumulatively -ln(1-yield) over the window, so the expected price path
+    is lower by exactly the payout fraction (redistribute, don't mint)."""
+    yield_frac = float(rng.uniform(cfg["dividend.min_yield"], cfg["dividend.max_yield"]))
+    div_per_share = Decimal(str(round(quoted * yield_frac, 6)))
+    drift_offset = Decimal(str(-math.log(1.0 - yield_frac) / max(window, 1)))
+    return div_per_share, drift_offset
+
+
+async def schedule_initial_dividends(
+    conn: AsyncConnection, rng: np.random.Generator, current_tick: int
+) -> None:
+    """Seed one upcoming ex-date for each dividend-paying instrument that
+    doesn't have one pending. Mirrors schedule_initial_earnings."""
+    cfg = await _dividend_config(conn)
+    payer_pct = cfg.get("dividend.payer_pct", 35.0)
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT i.id, i.quoted_price FROM instruments i
+            WHERE i.is_active AND i.kind <> 'INDEX' AND NOT EXISTS (
+                SELECT 1 FROM events e
+                WHERE e.instrument_id = i.id AND e.kind = 'DIVIDEND' AND NOT e.resolved
+            )
+            ORDER BY i.id
+            """
+        )
+        rows = await cur.fetchall()
+
+    interval = int(cfg.get("dividend.interval_ticks", 86400))
+    jitter = int(cfg.get("dividend.jitter_ticks", 20160))
+    for row in rows:
+        if not _pays_dividends(int(row["id"]), payer_pct):
+            continue
+        window = max(1, interval + int(rng.integers(-jitter, jitter + 1)))
+        div, offset = _dividend_fields(rng, cfg, float(row["quoted_price"]), window)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO events
+                    (instrument_id, kind, scheduled_tick, resolve_tick,
+                     dividend_per_share, drift_offset)
+                VALUES (%s, 'DIVIDEND', %s, %s, %s, %s)
+                """,
+                (row["id"], current_tick, current_tick + window, div, offset),
+            )
+
+
 async def maybe_create_news(
     conn: AsyncConnection,
     rng: np.random.Generator,
@@ -108,15 +182,109 @@ async def maybe_create_news(
             )
 
 
+async def _resolve_dividend(
+    conn: AsyncConnection,
+    rng: np.random.Generator,
+    event: dict[str, Any],
+    current_tick: int,
+) -> Decimal:
+    """Ex-date processing for one DIVIDEND event: pay longs from
+    MARKET_MAKER, accrue the obligation on shorts (settled on cover, like
+    borrow fees), and reschedule the next ex-date. Returns the per-share
+    amount so the caller can drop the instrument's base/fundamental by it.
+
+    Bounded shorts are NOT charged: they're a collateralized derivative
+    against MARKET_MAKER, not borrowed stock.
+    """
+    instrument_id = int(event["instrument_id"])
+    div = Decimal(event["dividend_per_share"])
+    mm_id = await get_system_account_id(conn, "MARKET_MAKER")
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        # Accounts join straight on (user_id, season_id) -- league
+        # positions pay their league account. ORDER BY for determinism.
+        await cur.execute(
+            """
+            SELECT p.user_id, p.quantity, a.id AS account_id, i.ticker
+            FROM positions p
+            JOIN accounts a ON a.user_id = p.user_id
+              AND a.season_id IS NOT DISTINCT FROM p.season_id
+              AND a.kind <> 'SYSTEM'
+            JOIN instruments i ON i.id = p.instrument_id
+            WHERE p.instrument_id = %s AND p.quantity > 0
+            ORDER BY p.user_id, p.season_id
+            """,
+            (instrument_id,),
+        )
+        longs = await cur.fetchall()
+    for pos in longs:
+        amount_minor = int(
+            (Decimal(int(pos["quantity"])) * div * 100).quantize(
+                Decimal("1"), ROUND_HALF_UP
+            )
+        )
+        if amount_minor <= 0:
+            continue
+        await post_transfer(
+            conn,
+            from_account_id=mm_id,
+            to_account_id=int(pos["account_id"]),
+            amount=amount_minor,
+            reason="DIVIDEND",
+            memo=str(pos["ticker"]),
+        )
+
+    async with conn.cursor() as cur:
+        # Shorts owe the dividend but can't be debited (cash CHECK >= 0) --
+        # accrue it on the position, settled to MARKET_MAKER on cover.
+        await cur.execute(
+            """
+            UPDATE positions
+            SET dividends_accrued = dividends_accrued + %s * (-quantity) * 100
+            WHERE instrument_id = %s AND quantity < 0
+            """,
+            (div, instrument_id),
+        )
+
+    # Reschedule the next ex-date (like earnings' rolling calendar).
+    cfg = await _dividend_config(conn)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT quoted_price FROM instruments WHERE id = %s", (instrument_id,)
+        )
+        row = await cur.fetchone()
+    quoted = float(row[0]) if row else float(div)
+    interval = int(cfg.get("dividend.interval_ticks", 86400))
+    jitter = int(cfg.get("dividend.jitter_ticks", 20160))
+    window = max(1, interval + int(rng.integers(-jitter, jitter + 1)))
+    next_div, next_offset = _dividend_fields(rng, cfg, quoted, window)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            INSERT INTO events
+                (instrument_id, kind, scheduled_tick, resolve_tick,
+                 dividend_per_share, drift_offset)
+            VALUES (%s, 'DIVIDEND', %s, %s, %s, %s)
+            """,
+            (instrument_id, current_tick, current_tick + window, next_div, next_offset),
+        )
+    return div
+
+
 async def resolve_due_events(
     conn: AsyncConnection,
     rng: np.random.Generator,
     current_tick: int,
     fundamentals: dict[int, float],
-) -> dict[int, float]:
-    """Apply any events due this tick as a log-return jump to `fundamentals`
-    (instrument_id -> fundamental value), mutating and returning it.
-    Earnings events are rescheduled ~30 days out once resolved.
+) -> tuple[dict[int, float], dict[int, Decimal]]:
+    """Apply any events due this tick, mutating and returning
+    `fundamentals` (instrument_id -> fundamental value). Earnings/news are
+    log-return jumps; earnings are rescheduled ~30 days out once resolved.
+
+    The second return value maps instrument_id -> dividend per share for
+    DIVIDEND events resolved this tick: the caller subtracts it from the
+    instrument's base price (the immediate ex-date drop) while this
+    function subtracts it from the fundamental (permanent value loss).
     """
     async with conn.cursor(row_factory=dict_row) as cur:
         # ORDER BY matters: earnings magnitudes and reschedule jitter are
@@ -124,7 +292,8 @@ async def resolve_due_events(
         # different draws to the same events across replays.
         await cur.execute(
             """
-            SELECT id, instrument_id, kind, magnitude FROM events
+            SELECT id, instrument_id, kind, magnitude, dividend_per_share
+            FROM events
             WHERE resolve_tick <= %s AND NOT resolved
             ORDER BY id
             FOR UPDATE
@@ -133,8 +302,23 @@ async def resolve_due_events(
         )
         due = await cur.fetchall()
 
+    dividend_drops: dict[int, Decimal] = {}
     for event in due:
         instrument_id = event["instrument_id"]
+
+        if event["kind"] == "DIVIDEND":
+            div = await _resolve_dividend(conn, rng, event, current_tick)
+            dividend_drops[instrument_id] = div
+            if instrument_id in fundamentals:
+                fundamentals[instrument_id] = max(
+                    MIN_POST_DIV_PRICE, fundamentals[instrument_id] - float(div)
+                )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE events SET resolved = TRUE WHERE id = %s", (event["id"],)
+                )
+            continue
+
         if event["kind"] == "EARNINGS":
             magnitude = float(rng.normal(0, EARNINGS_SHOCK_SIGMA))
         else:
@@ -161,22 +345,30 @@ async def resolve_due_events(
                     (instrument_id, current_tick, next_resolve),
                 )
 
-    return fundamentals
+    return fundamentals, dividend_drops
 
 
 async def refresh_next_event_ticks(conn: AsyncConnection) -> None:
-    """Recompute instruments.next_event_tick = earliest unresolved resolve_tick.
+    """Recompute per-instrument event aggregates.
 
     One aggregate UPDATE per tick, called after all event creation/resolution
     in apply_tick, so it's self-healing: no per-insert bookkeeping and it can
-    never drift. Feeds the spread's event-proximity term.
+    never drift. `next_event_tick` feeds the spread's event-proximity term;
+    `dividend_drift_offset` is the sum of pending dividends' per-tick drift
+    reductions, subtracted from the instrument's drift while accruing.
     """
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            UPDATE instruments i SET next_event_tick = (
-                SELECT MIN(e.resolve_tick) FROM events e
-                WHERE e.instrument_id = i.id AND NOT e.resolved
-            )
+            UPDATE instruments i SET
+                next_event_tick = (
+                    SELECT MIN(e.resolve_tick) FROM events e
+                    WHERE e.instrument_id = i.id AND NOT e.resolved
+                ),
+                dividend_drift_offset = COALESCE((
+                    SELECT SUM(e.drift_offset) FROM events e
+                    WHERE e.instrument_id = i.id AND e.kind = 'DIVIDEND'
+                      AND NOT e.resolved
+                ), 0)
             """
         )

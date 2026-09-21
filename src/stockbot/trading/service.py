@@ -142,7 +142,8 @@ async def _apply_fill(
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            SELECT quantity, avg_cost, borrow_fees_accrued FROM positions
+            SELECT quantity, avg_cost, borrow_fees_accrued, dividends_accrued
+            FROM positions
             WHERE user_id = %s AND instrument_id = %s
               AND season_id IS NOT DISTINCT FROM %s
             FOR UPDATE
@@ -153,6 +154,7 @@ async def _apply_fill(
     held_quantity = int(position[0]) if position else 0
     avg_cost = Decimal(position[1]) if position else Decimal(0)
     accrued = Decimal(position[2]) if position else Decimal(0)
+    div_accrued = Decimal(position[3]) if position else Decimal(0)
 
     if held_quantity == 0:
         # League plays with the base allotment for everyone --
@@ -202,7 +204,9 @@ async def _apply_fill(
             )
         new_quantity = held_quantity + quantity
         if held_quantity < 0:
-            # Covering a short settles its accrued borrow fees to SINK.
+            # Covering a short settles its accrued borrow fees to SINK and
+            # its accrued dividend obligations to MARKET_MAKER (who fronts
+            # the payouts to longs at the ex-date).
             accrued_minor = int(accrued.quantize(Decimal("1"), ROUND_HALF_UP))
             if accrued_minor > 0:
                 await post_transfer(
@@ -211,6 +215,17 @@ async def _apply_fill(
                     to_account_id=sink_id,
                     amount=accrued_minor,
                     reason="BORROW_FEE",
+                    memo=ticker,
+                )
+            div_minor = int(div_accrued.quantize(Decimal("1"), ROUND_HALF_UP))
+            if div_minor > 0:
+                mm_id = await get_system_account_id(conn, "MARKET_MAKER")
+                await post_transfer(
+                    conn,
+                    from_account_id=account_id,
+                    to_account_id=mm_id,
+                    amount=div_minor,
+                    reason="DIVIDEND",
                     memo=ticker,
                 )
             settle_accrued = True
@@ -280,9 +295,21 @@ async def _apply_fill(
                     WHEN EXCLUDED.quantity >= 0 OR %s THEN 0
                     ELSE positions.borrow_fees_accrued
                 END,
+                dividends_accrued = CASE
+                    WHEN EXCLUDED.quantity >= 0 OR %s THEN 0
+                    ELSE positions.dividends_accrued
+                END,
                 updated_at = now()
             """,
-            (user_id, instrument_id, season_id, new_quantity, avg_cost, settle_accrued),
+            (
+                user_id,
+                instrument_id,
+                season_id,
+                new_quantity,
+                avg_cost,
+                settle_accrued,
+                settle_accrued,
+            ),
         )
 
         await cur.execute(
