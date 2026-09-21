@@ -23,7 +23,7 @@ async def render_candle_chart(
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            SELECT tick_index, high, low, close FROM candles
+            SELECT tick_index, high, low, close, volume FROM candles
             WHERE instrument_id = %s
             ORDER BY tick_index DESC
             LIMIT %s
@@ -47,15 +47,22 @@ def _render_png(rows: list[Any], ticker: str) -> io.BytesIO:
     highs = [float(r[1]) for r in rows]
     lows = [float(r[2]) for r in rows]
     closes = [float(r[3]) for r in rows]
+    volumes = [int(r[4]) for r in rows]
 
-    fig = Figure(figsize=(8, 4))
-    ax = fig.add_subplot(111)
+    fig = Figure(figsize=(8, 5))
+    ax = fig.add_subplot(211)
     ax.plot(ticks, closes, color="#4C9AFF", linewidth=1.5, label="close")
     ax.fill_between(ticks, lows, highs, color="#4C9AFF", alpha=0.15, label="range")
     ax.set_title(f"{ticker} — last {len(ticks)} ticks")
-    ax.set_xlabel("tick")
     ax.set_ylabel("price")
     ax.grid(alpha=0.3)
+    ax.legend()
+
+    axv = fig.add_subplot(212, sharex=ax)
+    axv.bar(ticks, volumes, color="#9BA4B5", width=1.0)
+    axv.set_xlabel("tick")
+    axv.set_ylabel("volume")
+    axv.grid(alpha=0.3)
     fig.tight_layout()
 
     buf = io.BytesIO()

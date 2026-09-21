@@ -37,6 +37,7 @@ from stockbot.margin.errors import (
     ShortInterestLimitError,
 )
 from stockbot.market import engine
+from stockbot.market.data import current_tick_index, half_spread_for, spread_config
 from stockbot.shop.service import BASE_SLOTS, get_slot_count
 from stockbot.trading.errors import (
     InstrumentHaltedError,
@@ -46,7 +47,9 @@ from stockbot.trading.errors import (
 )
 
 FEE_BPS = Decimal("10")  # 0.10% trading fee, paid to SINK
-HALF_SPREAD_BPS = Decimal("5")  # 0.05% half-spread folded into the fill price
+# The half-spread folded into fills is dynamic now: market.data.half_spread_for
+# computes it per instrument from the `spread.*` config namespace (vol,
+# liquidity, post-halt decay, event proximity).
 
 Side = Literal["BUY", "SELL"]
 
@@ -113,7 +116,8 @@ async def execute_trade(
             await cur.execute(
                 """
                 SELECT id, base_price, impact, liquidity, lambda_impact, max_impact,
-                       is_active, circuit_halted_until_tick, short_interest_pct
+                       is_active, circuit_halted_until_tick, short_interest_pct,
+                       sigma, next_event_tick, last_halt_end_tick
                 FROM instruments
                 WHERE ticker = %s
                 FOR UPDATE
@@ -125,6 +129,7 @@ async def execute_trade(
             raise UnknownInstrumentError(ticker)
         if instrument["circuit_halted_until_tick"] is not None:
             raise InstrumentHaltedError(ticker)
+        current_tick = await current_tick_index(conn)
 
         if season_id is None:
             account_id = await get_user_account_id(conn, user_id)
@@ -171,6 +176,7 @@ async def execute_trade(
                 lambda_impact *= float(
                     1 + cfg["margin.squeeze_lambda_boost"] * over
                 )
+        spread_cfg = await spread_config(conn)
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=impact_before,
@@ -178,7 +184,7 @@ async def execute_trade(
             liquidity=liquidity,
             lambda_impact=lambda_impact,
             max_impact=max_impact,
-            half_spread=float(HALF_SPREAD_BPS) / 10_000,
+            half_spread=half_spread_for(instrument, current_tick, spread_cfg),
         )
         fill_price = Decimal(str(round(fill_price_f, 6)))
 
@@ -313,10 +319,6 @@ async def execute_trade(
                 (impact_after, new_quoted_price, instrument_id),
             )
 
-            await cur.execute("SELECT MAX(tick_index) FROM market_ticks")
-            tick_row = await cur.fetchone()
-            current_tick_index = tick_row[0] if tick_row else None
-
             await cur.execute(
                 """
                 INSERT INTO trades (
@@ -337,7 +339,7 @@ async def execute_trade(
                     fee_minor,
                     cash_transfer_id,
                     fee_transfer_id,
-                    current_tick_index,
+                    current_tick,
                     season_id,
                 ),
             )

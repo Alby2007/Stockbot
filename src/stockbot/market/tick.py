@@ -61,6 +61,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         fundamentals = {row["id"]: float(row["fundamental_value"]) for row in instrument_rows}
         fundamentals = await events.resolve_due_events(conn, events_rng, tick_index, fundamentals)
         await events.maybe_create_news(conn, events_rng, tick_index, instrument_rows)
+        await events.refresh_next_event_ticks(conn)
 
         results: list[engine.InstrumentTickResult] = []
         halts: dict[int, int | None] = {}
@@ -141,7 +142,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             if results:
                 update_rows = sql.SQL(", ").join(
                     sql.SQL("({})").format(
-                        sql.SQL(", ").join(sql.Placeholder() for _ in range(6))
+                        sql.SQL(", ").join(sql.Placeholder() for _ in range(7))
                     )
                     for _ in results
                 )
@@ -153,10 +154,12 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                             fundamental_value = v.fundamental_value::numeric,
                             impact = v.impact::numeric,
                             quoted_price = v.quoted_price::numeric,
-                            circuit_halted_until_tick = v.circuit_halted_until_tick::bigint
+                            circuit_halted_until_tick = v.circuit_halted_until_tick::bigint,
+                            last_halt_end_tick = COALESCE(
+                                v.new_halt_end::bigint, i.last_halt_end_tick)
                         FROM (VALUES {}) AS v(
                             base_price, fundamental_value, impact, quoted_price,
-                            circuit_halted_until_tick, id
+                            circuit_halted_until_tick, new_halt_end, id
                         )
                         WHERE i.id = v.id::int
                         """
@@ -170,6 +173,11 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                             result.impact,
                             result.quoted_price,
                             halts[result.id],
+                            (
+                                halts[result.id]
+                                if result.circuit_breached
+                                else None
+                            ),
                             result.id,
                         )
                     ],

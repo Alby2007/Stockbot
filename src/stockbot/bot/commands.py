@@ -164,6 +164,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         if snapshot.day_change_pct is not None:
             embed.add_field(name="24h change", value=format_pct(snapshot.day_change_pct))
         embed.add_field(name="Impact", value=format_pct(float(snapshot.impact)))
+        embed.add_field(name="24h volume", value=f"{snapshot.day_volume:,} shares")
         embed.add_field(
             name="Short interest",
             value=f"{float(snapshot.short_interest_pct) * 100:.1f}% of float",

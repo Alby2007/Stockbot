@@ -187,3 +187,41 @@ def apply_trade_impact(
     fill_price *= 1.0 + spread_sign * half_spread
 
     return fill_price, impact_after
+
+
+def half_spread_fraction(
+    *,
+    cfg: dict[str, float],
+    sigma: float,
+    liquidity: float,
+    ticks_since_halt: float | None,
+    ticks_to_event: float | None,
+) -> float:
+    """Dynamic half-spread as a fraction of price (0.0005 = 5bps).
+
+    Wider for high-sigma and illiquid names (that's where adverse selection
+    lives), elevated right after a circuit halt ends and into a pending
+    event's resolution -- the two moments a taker is most likely to know
+    something the mark doesn't. `cfg` is the `spread.*` config namespace.
+    """
+    halt_term = (
+        0.0
+        if ticks_since_halt is None
+        else np.exp(-ticks_since_halt / cfg["spread.halt_decay_ticks"])
+    )
+    event_term = (
+        0.0
+        if ticks_to_event is None
+        else np.exp(-max(ticks_to_event, 0.0) / cfg["spread.event_window_ticks"])
+    )
+    bps = (
+        cfg["spread.base_bps"]
+        * (1 + cfg["spread.sigma_coeff"] * sigma / cfg["spread.sigma_ref"])
+        * (
+            1
+            + cfg["spread.inv_liquidity_coeff"] * cfg["spread.liquidity_ref"] / liquidity
+        )
+        * (1 + cfg["spread.halt_coeff"] * halt_term)
+        * (1 + cfg["spread.event_coeff"] * event_term)
+    )
+    return bps / 10_000

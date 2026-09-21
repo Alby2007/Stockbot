@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 from psycopg import AsyncConnection
 
+from stockbot.market import engine
 from stockbot.market.engine import TICKS_PER_DAY
 
 
@@ -27,6 +29,7 @@ class InstrumentSnapshot:
     halted_until_tick: int | None
     day_ago_close: Decimal | None
     short_interest_pct: Decimal = Decimal(0)
+    day_volume: int = 0
 
     @property
     def day_change_pct(self) -> float | None:
@@ -60,7 +63,8 @@ async def _fetch_snapshots(
         await cur.execute(
             """
             SELECT i.id, i.ticker, i.name, s.key, s.name, i.quoted_price, i.impact,
-                   i.circuit_halted_until_tick, c.close, i.short_interest_pct
+                   i.circuit_halted_until_tick, c.close, i.short_interest_pct,
+                   COALESCE(v.volume, 0)
             FROM instruments i
             JOIN sectors s ON s.id = i.sector_id
             LEFT JOIN LATERAL (
@@ -69,10 +73,14 @@ async def _fetch_snapshots(
                 ORDER BY candles.tick_index DESC
                 LIMIT 1
             ) c ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT SUM(volume) AS volume FROM candles
+                WHERE candles.instrument_id = i.id AND candles.tick_index > %s
+            ) v ON TRUE
             WHERE i.is_active AND (%s::text IS NULL OR i.ticker = %s)
             ORDER BY i.ticker
             """,
-            (day_ago_tick, ticker, ticker),
+            (day_ago_tick, day_ago_tick, ticker, ticker),
         )
         rows = await cur.fetchall()
 
@@ -88,9 +96,43 @@ async def _fetch_snapshots(
             halted_until_tick=r[7],
             day_ago_close=r[8],
             short_interest_pct=r[9],
+            day_volume=int(r[10]),
         )
         for r in rows
     ]
+
+
+async def spread_config(conn: AsyncConnection) -> dict[str, float]:
+    """The `spread.*` config namespace, read fresh so tuning takes effect
+    without a deploy (same pattern as `margin.margin_config`)."""
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT key, value FROM config WHERE key LIKE 'spread.%'")
+        return {str(k): float(v) for k, v in await cur.fetchall()}
+
+
+def half_spread_for(
+    row: dict[str, Any], current_tick: int | None, cfg: dict[str, float]
+) -> float:
+    """Dynamic half-spread fraction for an instrument row carrying `sigma`,
+    `liquidity`, `last_halt_end_tick`, and `next_event_tick`. Shared by all
+    fill paths (trades, bounded shorts, liquidation legs, order fills)."""
+    since_halt = (
+        None
+        if row["last_halt_end_tick"] is None or current_tick is None
+        else float(current_tick - int(row["last_halt_end_tick"]))
+    )
+    to_event = (
+        None
+        if row["next_event_tick"] is None or current_tick is None
+        else float(int(row["next_event_tick"]) - current_tick)
+    )
+    return engine.half_spread_fraction(
+        cfg=cfg,
+        sigma=float(row["sigma"]),
+        liquidity=float(row["liquidity"]),
+        ticks_since_halt=since_halt,
+        ticks_to_event=to_event,
+    )
 
 
 async def all_instrument_snapshots(conn: AsyncConnection) -> list[InstrumentSnapshot]:

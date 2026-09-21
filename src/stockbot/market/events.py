@@ -162,3 +162,21 @@ async def resolve_due_events(
                 )
 
     return fundamentals
+
+
+async def refresh_next_event_ticks(conn: AsyncConnection) -> None:
+    """Recompute instruments.next_event_tick = earliest unresolved resolve_tick.
+
+    One aggregate UPDATE per tick, called after all event creation/resolution
+    in apply_tick, so it's self-healing: no per-insert bookkeeping and it can
+    never drift. Feeds the spread's event-proximity term.
+    """
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE instruments i SET next_event_tick = (
+                SELECT MIN(e.resolve_tick) FROM events e
+                WHERE e.instrument_id = i.id AND NOT e.resolved
+            )
+            """
+        )

@@ -22,8 +22,9 @@ from stockbot.ledger.errors import LedgerError
 from stockbot.ledger.service import record_idempotency_key
 from stockbot.margin.errors import MarginError
 from stockbot.market import engine
+from stockbot.market.data import half_spread_for, spread_config
 from stockbot.trading.errors import TradingError, UnknownInstrumentError
-from stockbot.trading.service import HALF_SPREAD_BPS, execute_trade
+from stockbot.trading.service import execute_trade
 
 Side = Literal["BUY", "SELL"]
 
@@ -169,7 +170,8 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
             """
             SELECT o.id, o.user_id, o.season_id, o.side, o.quantity,
                    o.limit_price, i.ticker, i.base_price, i.impact,
-                   i.liquidity, i.lambda_impact, i.max_impact
+                   i.liquidity, i.lambda_impact, i.max_impact,
+                   i.sigma, i.next_event_tick, i.last_halt_end_tick
             FROM orders o
             JOIN instruments i ON i.id = o.instrument_id
             WHERE o.status = 'OPEN'
@@ -180,6 +182,7 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
         )
         candidates = await cur.fetchall()
 
+    spread_cfg = await spread_config(conn)
     for order in candidates:
         # Executable price check: the fill path includes half-spread and
         # impact; verify the worst-case fill respects the limit before
@@ -192,7 +195,7 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
             liquidity=float(order["liquidity"]),
             lambda_impact=float(order["lambda_impact"]),
             max_impact=float(order["max_impact"]),
-            half_spread=float(HALF_SPREAD_BPS) / 10_000,
+            half_spread=half_spread_for(order, tick_index, spread_cfg),
         )
         limit = Decimal(order["limit_price"])
         if order["side"] == "BUY" and Decimal(str(fill_f)) > limit:

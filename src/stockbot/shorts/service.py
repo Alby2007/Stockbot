@@ -34,6 +34,7 @@ from stockbot.ledger.service import (
 )
 from stockbot.margin import service as margin
 from stockbot.market import engine
+from stockbot.market.data import half_spread_for, spread_config
 from stockbot.seasons.service import get_active_entry
 from stockbot.shorts.errors import ShortNotFoundError
 from stockbot.trading.errors import (
@@ -43,7 +44,6 @@ from stockbot.trading.errors import (
 )
 from stockbot.trading.service import (
     FEE_BPS,
-    HALF_SPREAD_BPS,
     _to_minor_units,
     update_candle_with_fill,
 )
@@ -86,7 +86,8 @@ async def _lock_instrument(conn: AsyncConnection, ticker: str) -> dict[str, Any]
         await cur.execute(
             """
             SELECT id, base_price, impact, liquidity, lambda_impact, max_impact,
-                   is_active, circuit_halted_until_tick, short_knockout_pct
+                   is_active, circuit_halted_until_tick, short_knockout_pct,
+                   sigma, next_event_tick, last_halt_end_tick
             FROM instruments
             WHERE ticker = %s
             FOR UPDATE
@@ -144,6 +145,8 @@ async def open_bounded_short(
         account_id = await _resolve_account(conn, user_id, season_id)
 
         base_price = float(instrument["base_price"])
+        tick = await _current_tick(conn)
+        spread_cfg = await spread_config(conn)
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=float(instrument["impact"]),
@@ -151,7 +154,7 @@ async def open_bounded_short(
             liquidity=float(instrument["liquidity"]),
             lambda_impact=float(instrument["lambda_impact"]),
             max_impact=float(instrument["max_impact"]),
-            half_spread=float(HALF_SPREAD_BPS) / 10_000,
+            half_spread=half_spread_for(instrument, tick, spread_cfg),
         )
         fill_price = Decimal(str(round(fill_price_f, 6)))
         knockout_pct = Decimal(str(instrument["short_knockout_pct"]))
@@ -193,7 +196,6 @@ async def open_bounded_short(
 
         await _set_impact(conn, int(instrument["id"]), base_price, impact_after)
         await update_candle_with_fill(conn, int(instrument["id"]), fill_price, quantity)
-        tick = await _current_tick(conn)
 
         async with conn.cursor() as cur:
             await cur.execute(
@@ -246,7 +248,8 @@ async def cover_bounded_short(
                 """
                 SELECT bs.id, bs.user_id, bs.instrument_id, bs.quantity, bs.entry_price,
                        bs.collateral_minor, i.ticker, i.base_price, i.impact, i.liquidity,
-                       i.lambda_impact, i.max_impact, i.is_active, bs.season_id
+                       i.lambda_impact, i.max_impact, i.is_active, bs.season_id,
+                       i.sigma, i.next_event_tick, i.last_halt_end_tick
                 FROM bounded_shorts bs
                 JOIN instruments i ON i.id = bs.instrument_id
                 WHERE bs.id = %s AND bs.status = 'OPEN'
@@ -260,6 +263,8 @@ async def cover_bounded_short(
 
         base_price = float(short["base_price"])
         quantity = int(short["quantity"])
+        tick = await _current_tick(conn)
+        spread_cfg = await spread_config(conn)
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=float(short["impact"]),
@@ -267,7 +272,7 @@ async def cover_bounded_short(
             liquidity=float(short["liquidity"]),
             lambda_impact=float(short["lambda_impact"]),
             max_impact=float(short["max_impact"]),
-            half_spread=float(HALF_SPREAD_BPS) / 10_000,
+            half_spread=half_spread_for(short, tick, spread_cfg),
         )
         close_price = Decimal(str(round(fill_price_f, 6)))
 
@@ -292,7 +297,6 @@ async def cover_bounded_short(
 
         await _set_impact(conn, int(short["instrument_id"]), base_price, impact_after)
         await update_candle_with_fill(conn, int(short["instrument_id"]), close_price, quantity)
-        tick = await _current_tick(conn)
 
         async with conn.cursor() as cur:
             await cur.execute(

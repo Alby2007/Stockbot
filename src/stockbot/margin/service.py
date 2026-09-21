@@ -37,6 +37,7 @@ from psycopg.rows import dict_row
 from stockbot.ledger.service import get_system_account_id, post_transfer
 from stockbot.margin.errors import MarginSpendBlockedError
 from stockbot.market import engine
+from stockbot.market.data import half_spread_for, spread_config
 
 MAX_LIQUIDATION_LEGS = 64
 
@@ -271,12 +272,13 @@ async def _liquidate_leg(
     """
     # Lazy: trading.service imports this module, so a top-level import here
     # would be circular.
-    from stockbot.trading.service import FEE_BPS, HALF_SPREAD_BPS, update_candle_with_fill
+    from stockbot.trading.service import FEE_BPS, update_candle_with_fill
 
     instrument_id = int(position["instrument_id"])
     qty = int(position["quantity"])
     base_price = float(position["base_price"])
     signed = base_price * close_qty * (1 if qty < 0 else -1)
+    spread_cfg = await spread_config(conn)
     fill_f, impact_after = engine.apply_trade_impact(
         base_price=base_price,
         impact_before=float(position["impact"]),
@@ -284,7 +286,7 @@ async def _liquidate_leg(
         liquidity=float(position["liquidity"]),
         lambda_impact=float(position["lambda_impact"]),
         max_impact=float(position["max_impact"]),
-        half_spread=float(HALF_SPREAD_BPS) / 10_000,
+        half_spread=half_spread_for(position, tick_index, spread_cfg),
     )
     fill = Decimal(str(round(fill_f, 6)))
     notional_minor = int((fill * close_qty * 100).quantize(Decimal("1"), ROUND_HALF_UP))
@@ -483,7 +485,8 @@ async def _liquidate_account(
                 """
                 SELECT p.id, p.instrument_id, p.quantity, p.borrow_fees_accrued,
                        i.ticker, i.base_price, i.impact, i.liquidity,
-                       i.lambda_impact, i.max_impact, i.quoted_price, i.maint_margin_pct
+                       i.lambda_impact, i.max_impact, i.quoted_price, i.maint_margin_pct,
+                       i.sigma, i.next_event_tick, i.last_halt_end_tick
                 FROM positions p
                 JOIN instruments i ON i.id = p.instrument_id
                 WHERE p.user_id = %s
@@ -533,7 +536,8 @@ async def _liquidate_account(
                     SELECT p.id, p.instrument_id, p.quantity, p.borrow_fees_accrued,
                            i.ticker, i.base_price, i.impact, i.liquidity,
                            i.lambda_impact, i.max_impact, i.quoted_price,
-                           i.maint_margin_pct
+                           i.maint_margin_pct, i.sigma, i.next_event_tick,
+                           i.last_halt_end_tick
                     FROM positions p
                     JOIN instruments i ON i.id = p.instrument_id
                     WHERE p.user_id = %s
@@ -720,18 +724,29 @@ async def sweep_undermargined(conn: AsyncConnection, tick_index: int) -> int:
 
 async def accrue_borrow_fees(conn: AsyncConnection) -> None:
     """Accrue the per-tick borrow fee onto every short position. One UPDATE;
-    settles to SINK when the position is covered or liquidated."""
+    settles to SINK when the position is covered or liquidated.
+
+    Effective rate is utilization-scaled: bps * (1 + k*(SI/max_SI)^2), so a
+    crowded short bleeds superlinearly -- runs right after
+    `refresh_short_interest` in apply_tick, so i.short_interest_pct is fresh.
+    """
     cfg = await margin_config(conn)
     async with conn.cursor() as cur:
         await cur.execute(
             """
             UPDATE positions p
             SET borrow_fees_accrued = borrow_fees_accrued
-                  + (-p.quantity * i.quoted_price * 100 * %s / 10000)
+                  + (-p.quantity * i.quoted_price * 100 * %s
+                     * (1 + %s * POWER(
+                           i.short_interest_pct / NULLIF(%s, 0), 2)) / 10000)
             FROM instruments i
             WHERE i.id = p.instrument_id AND p.quantity < 0
             """,
-            (cfg["margin.borrow_fee_bps_per_tick"],),
+            (
+                cfg["margin.borrow_fee_bps_per_tick"],
+                cfg["margin.borrow_util_k"],
+                cfg["margin.max_short_interest_pct"],
+            ),
         )
 
 
