@@ -10,7 +10,15 @@ from stockbot.simulation.harness import build_cohort, run_simulation
 def test_build_cohort_covers_all_archetypes() -> None:
     agents = build_cohort(60, random.Random(0))
     archetypes = {a.archetype for a in agents}
-    assert archetypes == {"grinder", "yolo", "farmer", "wash_trader", "whale", "shorter"}
+    assert archetypes == {
+        "grinder",
+        "yolo",
+        "farmer",
+        "wash_trader",
+        "whale",
+        "shorter",
+        "liquidity_provider",
+    }
 
     wash_traders = [a for a in agents if a.archetype == "wash_trader"]
     assert len(wash_traders) % 2 == 0

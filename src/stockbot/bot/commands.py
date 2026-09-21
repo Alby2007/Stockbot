@@ -794,7 +794,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             await interaction.response.send_message("No open orders.", ephemeral=True)
             return
         lines = [
-            f"#{r['id']:<4} {r['side']:<4} {r['quantity']:>5} {r['ticker']:<6} "
+            f"#{r['id']:<4} {r['side']:<4} {r['quantity'] - r['filled_quantity']:>5} "
+            f"{r['ticker']:<6} "
             f"@ {format_price(r['limit_price']):>10} "
             f"(mark {format_price(r['quoted_price'])})"
             for r in rows

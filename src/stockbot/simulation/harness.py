@@ -16,6 +16,11 @@ Behavioral archetypes:
                  one buys, its partner sells into the pump, same tick --
                  exactly what compliance/wash_trade.py looks for
     whale        starts with a large synthetic balance, trades large blocks
+    shorter      buys a margin tier, opens/covers true shorts sized to equity
+    liquidity_provider  rests two-sided limit quotes around the mark each
+                 day without cancelling -- stale quotes at old marks cross
+                 fresh ones (and the MM) as prices drift, exercising the
+                 crossing book
 
 Usage:
     python -m stockbot.simulation.harness --database-url ... --users 200 --days 90
@@ -38,6 +43,7 @@ import random
 import sys
 from dataclasses import dataclass
 from datetime import date, timedelta
+from decimal import Decimal
 
 from psycopg import AsyncConnection
 
@@ -55,6 +61,7 @@ from stockbot.ledger.service import (
 from stockbot.margin.errors import MarginError
 from stockbot.margin.service import compute_health
 from stockbot.market.tick import apply_tick
+from stockbot.orders.service import cancel_order, list_open_orders, place_order
 from stockbot.shop.service import buy_item
 from stockbot.simulation.metrics import faucet_sink_ratio, gini_coefficient
 from stockbot.trading.errors import TradingError
@@ -65,6 +72,7 @@ log = logging.getLogger("stockbot.simulation")
 SYNTHETIC_USER_ID_BASE = 900_000_000_000_000
 WHALE_STARTING_GRANT_MINOR = 500_000  # $5,000
 SHORTER_STARTING_GRANT_MINOR = 200_000  # $2,000: tier 1 ($500) + trading cash
+LP_STARTING_GRANT_MINOR = 300_000  # $3,000: two-sided quotes need cash + inventory
 TICKS_PER_SIMULATED_DAY = 1440
 # Simulated days are mapped onto consecutive calendar dates starting here so
 # `claim_daily` runs its real per-day logic (streaks included). Without this
@@ -80,16 +88,20 @@ class Agent:
     wash_partner_id: int | None = None
     wash_ticker: str | None = None
     short_ticker: str | None = None
+    quote_ticker: str | None = None
 
 
 def build_cohort(num_users: int, rng: random.Random) -> list[Agent]:
     whale_count = max(1, num_users // 100)
     wash_pairs = max(1, num_users // 50)
     remaining = max(0, num_users - whale_count - wash_pairs * 2)
-    grinder_count = round(remaining * 0.45)
+    grinder_count = round(remaining * 0.35)
     yolo_count = round(remaining * 0.2)
     shorter_count = round(remaining * 0.1)
-    farmer_count = max(0, remaining - grinder_count - yolo_count - shorter_count)
+    lp_count = round(remaining * 0.1)
+    farmer_count = max(
+        0, remaining - grinder_count - yolo_count - shorter_count - lp_count
+    )
 
     agents: list[Agent] = []
     next_id = SYNTHETIC_USER_ID_BASE
@@ -109,6 +121,7 @@ def build_cohort(num_users: int, rng: random.Random) -> list[Agent]:
     _add("grinder", grinder_count)
     _add("yolo", yolo_count)
     _add("shorter", shorter_count)
+    _add("liquidity_provider", lp_count)
     _add("farmer", farmer_count)
 
     rng.shuffle(agents)
@@ -117,15 +130,24 @@ def build_cohort(num_users: int, rng: random.Random) -> list[Agent]:
 
 async def initialize_agents(conn: AsyncConnection, agents: list[Agent]) -> None:
     faucet_id = await get_system_account_id(conn, "FAUCET")
+    # Liquidity providers quote the most liquid names, assigned
+    # deterministically round-robin so their books overlap.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT ticker FROM instruments WHERE is_active AND kind != 'INDEX' "
+            "ORDER BY liquidity DESC, ticker LIMIT 8"
+        )
+        lp_tickers = [row[0] for row in await cur.fetchall()]
+    lp_slot = 0
     for agent in agents:
         await bootstrap_user(conn, agent.user_id)
-        if agent.archetype in ("whale", "shorter"):
+        if agent.archetype in ("whale", "shorter", "liquidity_provider"):
             account_id = await get_user_account_id(conn, agent.user_id)
-            grant = (
-                WHALE_STARTING_GRANT_MINOR
-                if agent.archetype == "whale"
-                else SHORTER_STARTING_GRANT_MINOR
-            )
+            grant = {
+                "whale": WHALE_STARTING_GRANT_MINOR,
+                "shorter": SHORTER_STARTING_GRANT_MINOR,
+                "liquidity_provider": LP_STARTING_GRANT_MINOR,
+            }[agent.archetype]
             await post_transfer(
                 conn,
                 from_account_id=faucet_id,
@@ -141,6 +163,22 @@ async def initialize_agents(conn: AsyncConnection, agents: list[Agent]) -> None:
                 await buy_item(conn, agent.user_id, "margin_tier")
             except (ShopError, InsufficientFundsError):
                 log.warning("shorter %s couldn't buy margin tier", agent.user_id)
+        if agent.archetype == "liquidity_provider" and lp_tickers:
+            # Starter inventory so the ask side can fill from day one.
+            agent.quote_ticker = str(lp_tickers[lp_slot % len(lp_tickers)])
+            lp_slot += 1
+            try:
+                await execute_trade(
+                    conn,
+                    user_id=agent.user_id,
+                    ticker=agent.quote_ticker,
+                    side="BUY",
+                    quantity=10,
+                )
+            except (InsufficientFundsError, TradingError, MarginError):
+                log.warning(
+                    "liquidity_provider %s couldn't seed inventory", agent.user_id
+                )
 
 
 async def _random_active_ticker(conn: AsyncConnection, rng: random.Random) -> str | None:
@@ -243,6 +281,63 @@ async def _run_agent_day(
             # exact pattern compliance/wash_trade.py is designed to catch.
             await execute_trade(conn, user_id=agent.user_id, ticker=ticker, side="BUY", quantity=20)
             await execute_trade(conn, user_id=partner_id, ticker=ticker, side="SELL", quantity=5)
+
+        if agent.archetype == "liquidity_provider" and agent.quote_ticker:
+            await _safe_claim(conn, agent.user_id, sim_today)
+            ticker = agent.quote_ticker
+            # Prune anything beyond ~2 days of accumulated quotes, then add
+            # today's two-sided quote. Stale quotes deliberately rest on:
+            # as the mark drifts they cross fresh quotes and fill vs the MM.
+            open_orders = await list_open_orders(conn, agent.user_id)
+            for open_order in open_orders[6:]:
+                await cancel_order(
+                    conn, user_id=agent.user_id, order_id=int(open_order["id"])
+                )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT quoted_price FROM instruments WHERE ticker = %s "
+                    "AND circuit_halted_until_tick IS NULL",
+                    (ticker,),
+                )
+                row = await cur.fetchone()
+            if row is None:
+                return
+            mark = Decimal(str(row[0]))
+            account_id = await get_user_account_id(conn, agent.user_id)
+            balance = await get_balance(conn, account_id)
+            offset = Decimal(str(round(rng.uniform(0.005, 0.015), 4)))
+            bid_qty = max(1, int(balance / 100 * 0.15 / float(mark)))
+            await place_order(
+                conn,
+                user_id=agent.user_id,
+                ticker=ticker,
+                side="BUY",
+                quantity=bid_qty,
+                limit_price=(mark * (1 - offset)).quantize(Decimal("0.000001")),
+                expires_in_ticks=2 * TICKS_PER_SIMULATED_DAY,
+            )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT p.quantity FROM positions p
+                    JOIN instruments i ON i.id = p.instrument_id
+                    WHERE p.user_id = %s AND i.ticker = %s AND p.season_id IS NULL
+                    """,
+                    (agent.user_id, ticker),
+                )
+                pos_row = await cur.fetchone()
+            held = int(pos_row[0]) if pos_row else 0
+            if held > 0:
+                await place_order(
+                    conn,
+                    user_id=agent.user_id,
+                    ticker=ticker,
+                    side="SELL",
+                    quantity=min(held, bid_qty),
+                    limit_price=(mark * (1 + offset)).quantize(Decimal("0.000001")),
+                    expires_in_ticks=2 * TICKS_PER_SIMULATED_DAY,
+                )
+            return
 
         if agent.archetype == "shorter":
             await _safe_claim(conn, agent.user_id, sim_today)
@@ -418,7 +513,15 @@ async def run_simulation(
     final_net_worth = await net_worth_by_user(conn, user_ids)
 
     by_archetype: dict[str, dict[str, float]] = {}
-    for archetype in {"grinder", "yolo", "farmer", "wash_trader", "whale", "shorter"}:
+    for archetype in {
+        "grinder",
+        "yolo",
+        "farmer",
+        "wash_trader",
+        "whale",
+        "shorter",
+        "liquidity_provider",
+    }:
         members = [uid for uid in user_ids if archetype_by_user[uid] == archetype]
         if not members:
             continue

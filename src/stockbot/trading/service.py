@@ -89,6 +89,279 @@ async def update_candle_with_fill(
         )
 
 
+async def _apply_fill(
+    conn: AsyncConnection,
+    *,
+    user_id: int,
+    account_id: int,
+    instrument_id: int,
+    ticker: str,
+    side: Side,
+    quantity: int,
+    fill_price: Decimal,
+    season_id: int | None,
+    current_tick: int | None,
+    cash_leg: Literal["pay", "receive", "none"],
+    counterparty_account_id: int,
+    cash_transfer_id: str | None = None,
+    maker_taker: str | None = None,
+    counterparty_user_id: int | None = None,
+    order_id: int | None = None,
+) -> TradeResult:
+    """Settle one side of a fill: cash leg, fee leg, position upsert, trade
+    row, and post-fill margin gates.
+
+    `counterparty_account_id` is MARKET_MAKER for market fills, or the
+    other user's account for book crosses. `cash_leg` controls who moves
+    the notional: "pay" sends it account -> counterparty, "receive" pulls
+    it counterparty -> account, and "none" means the caller already moved
+    it (a book cross posts one buyer->seller transfer shared by both legs)
+    -- in that case `cash_transfer_id` carries the transfer to record.
+
+    Caller must hold the instrument lock and run inside a transaction.
+    """
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT id FROM accounts WHERE id = %s FOR UPDATE", (account_id,)
+        )
+        await cur.fetchone()
+
+    notional = fill_price * quantity
+    fee = (notional * FEE_BPS / 10_000).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    notional_minor = _to_minor_units(notional)
+    fee_minor = _to_minor_units(fee)
+
+    sink_id = await get_system_account_id(conn, "SINK")
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT quantity, avg_cost, borrow_fees_accrued FROM positions
+            WHERE user_id = %s AND instrument_id = %s
+              AND season_id IS NOT DISTINCT FROM %s
+            FOR UPDATE
+            """,
+            (user_id, instrument_id, season_id),
+        )
+        position = await cur.fetchone()
+    held_quantity = int(position[0]) if position else 0
+    avg_cost = Decimal(position[1]) if position else Decimal(0)
+    accrued = Decimal(position[2]) if position else Decimal(0)
+
+    if held_quantity == 0:
+        # League plays with the base allotment for everyone --
+        # purchased slots are a main-economy advantage and the league
+        # promise is an equal start.
+        slot_count = (
+            BASE_SLOTS if season_id is not None else await get_slot_count(conn, user_id)
+        )
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT COUNT(*) FROM positions
+                WHERE user_id = %s AND quantity <> 0
+                  AND season_id IS NOT DISTINCT FROM %s
+                """,
+                (user_id, season_id),
+            )
+            open_positions_row = await cur.fetchone()
+            assert open_positions_row is not None
+            open_positions = open_positions_row[0]
+        if open_positions >= slot_count:
+            raise TooManyPositionsError(open_positions, slot_count)
+
+    settle_accrued = False
+    if side == "BUY":
+        if cash_leg == "pay":
+            cash_transfer_id = str(
+                await post_transfer(
+                    conn,
+                    from_account_id=account_id,
+                    to_account_id=counterparty_account_id,
+                    amount=notional_minor,
+                    reason="TRADE_BUY",
+                    memo=ticker,
+                )
+            )
+        elif cash_leg == "receive":
+            cash_transfer_id = str(
+                await post_transfer(
+                    conn,
+                    from_account_id=counterparty_account_id,
+                    to_account_id=account_id,
+                    amount=notional_minor,
+                    reason="TRADE_SELL",
+                    memo=ticker,
+                )
+            )
+        new_quantity = held_quantity + quantity
+        if held_quantity < 0:
+            # Covering a short settles its accrued borrow fees to SINK.
+            accrued_minor = int(accrued.quantize(Decimal("1"), ROUND_HALF_UP))
+            if accrued_minor > 0:
+                await post_transfer(
+                    conn,
+                    from_account_id=account_id,
+                    to_account_id=sink_id,
+                    amount=accrued_minor,
+                    reason="BORROW_FEE",
+                    memo=ticker,
+                )
+            settle_accrued = True
+            # Any remainder beyond the short becomes a fresh long.
+            if new_quantity > 0:
+                avg_cost = fill_price
+        else:
+            avg_cost = ((avg_cost * held_quantity) + (fill_price * quantity)) / new_quantity
+    else:
+        # SELL always credits proceeds -- selling past zero opens a true
+        # short (margin-gated below).
+        if cash_leg == "pay":
+            cash_transfer_id = str(
+                await post_transfer(
+                    conn,
+                    from_account_id=account_id,
+                    to_account_id=counterparty_account_id,
+                    amount=notional_minor,
+                    reason="TRADE_BUY",
+                    memo=ticker,
+                )
+            )
+        elif cash_leg == "receive":
+            cash_transfer_id = str(
+                await post_transfer(
+                    conn,
+                    from_account_id=counterparty_account_id,
+                    to_account_id=account_id,
+                    amount=notional_minor,
+                    reason="TRADE_SELL",
+                    memo=ticker,
+                )
+            )
+        new_quantity = held_quantity - quantity
+        if held_quantity <= 0:
+            avg_cost = (
+                (avg_cost * abs(held_quantity)) + (fill_price * quantity)
+            ) / abs(new_quantity)
+        elif new_quantity <= 0:
+            avg_cost = fill_price
+        if new_quantity == 0:
+            avg_cost = Decimal(0)
+    assert cash_transfer_id is not None
+
+    fee_transfer_id = None
+    if fee_minor > 0:
+        fee_transfer_id = await post_transfer(
+            conn,
+            from_account_id=account_id,
+            to_account_id=sink_id,
+            amount=fee_minor,
+            reason="TRADE_FEE",
+            memo=ticker,
+        )
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            INSERT INTO positions
+                (user_id, instrument_id, season_id, quantity, avg_cost, updated_at)
+            VALUES (%s, %s, %s, %s, %s, now())
+            ON CONFLICT (user_id, instrument_id, season_id)
+            DO UPDATE SET
+                quantity = EXCLUDED.quantity,
+                avg_cost = EXCLUDED.avg_cost,
+                borrow_fees_accrued = CASE
+                    WHEN EXCLUDED.quantity >= 0 OR %s THEN 0
+                    ELSE positions.borrow_fees_accrued
+                END,
+                updated_at = now()
+            """,
+            (user_id, instrument_id, season_id, new_quantity, avg_cost, settle_accrued),
+        )
+
+        await cur.execute(
+            """
+            INSERT INTO trades (
+                user_id, instrument_id, side, quantity, fill_price,
+                notional_minor, fee_minor, cash_transfer_id, fee_transfer_id,
+                tick_index, season_id, maker_taker, counterparty_user_id, order_id
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                user_id,
+                instrument_id,
+                side,
+                quantity,
+                fill_price,
+                notional_minor,
+                fee_minor,
+                cash_transfer_id,
+                fee_transfer_id,
+                current_tick,
+                season_id,
+                maker_taker,
+                counterparty_user_id,
+                order_id,
+            ),
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        trade_id = row[0]
+
+    # Margin gates, evaluated on the post-trade state (raising rolls the
+    # whole trade back). Reducing a position is always allowed.
+    short_grew = max(0, -new_quantity) > max(0, -held_quantity)
+    gross_grew = abs(new_quantity) > abs(held_quantity)
+    if short_grew or gross_grew:
+        cfg = await margin.margin_config(conn)
+        tier = await margin.margin_tier(conn, user_id, season_id)
+        health = await margin.compute_health(conn, user_id, season_id)
+        if short_grew:
+            if tier < 1:
+                raise MarginNotUnlockedError(user_id)
+            si_shares, float_shares = await margin._instrument_short_interest(
+                conn, instrument_id
+            )
+            if (
+                float_shares > 0
+                and Decimal(si_shares)
+                > cfg["margin.max_short_interest_pct"] * float_shares
+            ):
+                raise ShortInterestLimitError(ticker)
+            if health.equity_minor < health.init_req_minor:
+                raise InsufficientMarginError(
+                    health.equity_minor, health.init_req_minor
+                )
+        if gross_grew:
+            cap = margin.leverage_cap(tier, cfg)
+            if Decimal(health.gross_notional_minor) > cap * health.equity_minor:
+                raise PositionLimitError(
+                    health.gross_notional_minor, int(cap * health.equity_minor)
+                )
+
+    if season_id is not None:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE season_entries SET trades_count = trades_count + 1
+                WHERE season_id = %s AND user_id = %s
+                """,
+                (season_id, user_id),
+            )
+
+    return TradeResult(
+        trade_id=trade_id,
+        ticker=ticker,
+        side=side,
+        quantity=quantity,
+        fill_price=fill_price,
+        notional_minor=notional_minor,
+        fee_minor=fee_minor,
+    )
+
+
 async def execute_trade(
     conn: AsyncConnection,
     *,
@@ -98,10 +371,12 @@ async def execute_trade(
     quantity: int,
     interaction_id: str | None = None,
     season_id: int | None = None,
+    order_id: int | None = None,
 ) -> TradeResult:
     """When `season_id` is set, the trade runs against the user's LEAGUE
     account and a season-scoped position (league portfolio), keeping league
-    wealth isolated from the persistent main portfolio.
+    wealth isolated from the persistent main portfolio. `order_id` links the
+    trade row back to the resting order that produced it (MM order fills).
     """
     if quantity <= 0:
         raise ValueError("quantity must be positive")
@@ -153,9 +428,6 @@ async def execute_trade(
             if entry_row is None:
                 raise NotInLeagueError(user_id, season_id)
             account_id = int(entry_row[0])
-        async with conn.cursor() as cur:
-            await cur.execute("SELECT id FROM accounts WHERE id = %s FOR UPDATE", (account_id,))
-            await cur.fetchone()
 
         instrument_id = instrument["id"]
         base_price = float(instrument["base_price"])
@@ -188,214 +460,30 @@ async def execute_trade(
         )
         fill_price = Decimal(str(round(fill_price_f, 6)))
 
-        notional = fill_price * quantity
-        fee = (notional * FEE_BPS / 10_000).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        notional_minor = _to_minor_units(notional)
-        fee_minor = _to_minor_units(fee)
-
         market_maker_id = await get_system_account_id(conn, "MARKET_MAKER")
-        sink_id = await get_system_account_id(conn, "SINK")
+        result = await _apply_fill(
+            conn,
+            user_id=user_id,
+            account_id=account_id,
+            instrument_id=instrument_id,
+            ticker=ticker,
+            side=side,
+            quantity=quantity,
+            fill_price=fill_price,
+            season_id=season_id,
+            current_tick=current_tick,
+            cash_leg="pay" if side == "BUY" else "receive",
+            counterparty_account_id=market_maker_id,
+            order_id=order_id,
+        )
 
         async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                SELECT quantity, avg_cost, borrow_fees_accrued FROM positions
-                WHERE user_id = %s AND instrument_id = %s
-                  AND season_id IS NOT DISTINCT FROM %s
-                FOR UPDATE
-                """,
-                (user_id, instrument_id, season_id),
-            )
-            position = await cur.fetchone()
-        held_quantity = int(position[0]) if position else 0
-        avg_cost = Decimal(position[1]) if position else Decimal(0)
-        accrued = Decimal(position[2]) if position else Decimal(0)
-
-        if held_quantity == 0:
-            # League plays with the base allotment for everyone --
-            # purchased slots are a main-economy advantage and the league
-            # promise is an equal start.
-            slot_count = (
-                BASE_SLOTS if season_id is not None else await get_slot_count(conn, user_id)
-            )
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    SELECT COUNT(*) FROM positions
-                    WHERE user_id = %s AND quantity <> 0
-                      AND season_id IS NOT DISTINCT FROM %s
-                    """,
-                    (user_id, season_id),
-                )
-                open_positions_row = await cur.fetchone()
-                assert open_positions_row is not None
-                open_positions = open_positions_row[0]
-            if open_positions >= slot_count:
-                raise TooManyPositionsError(open_positions, slot_count)
-
-        settle_accrued = False
-        if side == "BUY":
-            cash_transfer_id = await post_transfer(
-                conn,
-                from_account_id=account_id,
-                to_account_id=market_maker_id,
-                amount=notional_minor,
-                reason="TRADE_BUY",
-                memo=ticker,
-            )
-            new_quantity = held_quantity + quantity
-            if held_quantity < 0:
-                # Covering a short settles its accrued borrow fees to SINK.
-                accrued_minor = int(accrued.quantize(Decimal("1"), ROUND_HALF_UP))
-                if accrued_minor > 0:
-                    await post_transfer(
-                        conn,
-                        from_account_id=account_id,
-                        to_account_id=sink_id,
-                        amount=accrued_minor,
-                        reason="BORROW_FEE",
-                        memo=ticker,
-                    )
-                settle_accrued = True
-                # Any remainder beyond the short becomes a fresh long.
-                if new_quantity > 0:
-                    avg_cost = fill_price
-            else:
-                avg_cost = ((avg_cost * held_quantity) + (fill_price * quantity)) / new_quantity
-        else:
-            # SELL always credits proceeds -- selling past zero opens a true
-            # short (margin-gated below).
-            cash_transfer_id = await post_transfer(
-                conn,
-                from_account_id=market_maker_id,
-                to_account_id=account_id,
-                amount=notional_minor,
-                reason="TRADE_SELL",
-                memo=ticker,
-            )
-            new_quantity = held_quantity - quantity
-            if held_quantity <= 0:
-                avg_cost = (
-                    (avg_cost * abs(held_quantity)) + (fill_price * quantity)
-                ) / abs(new_quantity)
-            elif new_quantity <= 0:
-                avg_cost = fill_price
-            if new_quantity == 0:
-                avg_cost = Decimal(0)
-
-        fee_transfer_id = None
-        if fee_minor > 0:
-            fee_transfer_id = await post_transfer(
-                conn,
-                from_account_id=account_id,
-                to_account_id=sink_id,
-                amount=fee_minor,
-                reason="TRADE_FEE",
-                memo=ticker,
-            )
-
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO positions
-                    (user_id, instrument_id, season_id, quantity, avg_cost, updated_at)
-                VALUES (%s, %s, %s, %s, %s, now())
-                ON CONFLICT (user_id, instrument_id, season_id)
-                DO UPDATE SET
-                    quantity = EXCLUDED.quantity,
-                    avg_cost = EXCLUDED.avg_cost,
-                    borrow_fees_accrued = CASE
-                        WHEN EXCLUDED.quantity >= 0 OR %s THEN 0
-                        ELSE positions.borrow_fees_accrued
-                    END,
-                    updated_at = now()
-                """,
-                (user_id, instrument_id, season_id, new_quantity, avg_cost, settle_accrued),
-            )
-
             new_quoted_price = Decimal(str(round(base_price * math.exp(impact_after), 6)))
             await cur.execute(
                 "UPDATE instruments SET impact = %s, quoted_price = %s WHERE id = %s",
                 (impact_after, new_quoted_price, instrument_id),
             )
 
-            await cur.execute(
-                """
-                INSERT INTO trades (
-                    user_id, instrument_id, side, quantity, fill_price,
-                    notional_minor, fee_minor, cash_transfer_id, fee_transfer_id,
-                    tick_index, season_id
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-                """,
-                (
-                    user_id,
-                    instrument_id,
-                    side,
-                    quantity,
-                    fill_price,
-                    notional_minor,
-                    fee_minor,
-                    cash_transfer_id,
-                    fee_transfer_id,
-                    current_tick,
-                    season_id,
-                ),
-            )
-            row = await cur.fetchone()
-            assert row is not None
-            trade_id = row[0]
-
         await update_candle_with_fill(conn, instrument_id, fill_price, quantity)
 
-        # Margin gates, evaluated on the post-trade state (raising rolls the
-        # whole trade back). Reducing a position is always allowed.
-        short_grew = max(0, -new_quantity) > max(0, -held_quantity)
-        gross_grew = abs(new_quantity) > abs(held_quantity)
-        if short_grew or gross_grew:
-            cfg = await margin.margin_config(conn)
-            tier = await margin.margin_tier(conn, user_id, season_id)
-            health = await margin.compute_health(conn, user_id, season_id)
-            if short_grew:
-                if tier < 1:
-                    raise MarginNotUnlockedError(user_id)
-                si_shares, float_shares = await margin._instrument_short_interest(
-                    conn, instrument_id
-                )
-                if (
-                    float_shares > 0
-                    and Decimal(si_shares)
-                    > cfg["margin.max_short_interest_pct"] * float_shares
-                ):
-                    raise ShortInterestLimitError(ticker)
-                if health.equity_minor < health.init_req_minor:
-                    raise InsufficientMarginError(
-                        health.equity_minor, health.init_req_minor
-                    )
-            if gross_grew:
-                cap = margin.leverage_cap(tier, cfg)
-                if Decimal(health.gross_notional_minor) > cap * health.equity_minor:
-                    raise PositionLimitError(
-                        health.gross_notional_minor, int(cap * health.equity_minor)
-                    )
-
-        async with conn.cursor() as cur:
-            if season_id is not None:
-                await cur.execute(
-                    """
-                    UPDATE season_entries SET trades_count = trades_count + 1
-                    WHERE season_id = %s AND user_id = %s
-                    """,
-                    (season_id, user_id),
-                )
-
-    return TradeResult(
-        trade_id=trade_id,
-        ticker=ticker,
-        side=side,
-        quantity=quantity,
-        fill_price=fill_price,
-        notional_minor=notional_minor,
-        fee_minor=fee_minor,
-    )
+    return result

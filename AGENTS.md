@@ -17,8 +17,36 @@ engine, insurance fund, short interest + squeeze, SBX-40 index, `/margin`
 Post-Phase-2: limit orders (`orders` table, `/order buy|sell|list|cancel`,
 matched inside `apply_tick` before the margin sweep; fills run through
 `execute_trade` in a savepoint so unfillable orders stay OPEN; league
-orders are cancelled on season close) and a `shorter` archetype in the sim
-harness are done.
+orders are cancelled on season close) and `shorter`/`liquidity_provider`
+archetypes in the sim harness are done.
+
+Liquidity plan (phases A–E) status: **Phase A done** (dynamic
+`spread.*` half-spreads at all four fill paths; utilization-scaled borrow
+fees; `next_event_tick`/`last_halt_end_tick`; chart volume; `0013` param
+bounds + `0014` spread config). **Phase B done** (crossing book).
+
+Crossing-book design notes: `match_orders` runs two passes inside
+`apply_tick`. Pass 1 walks each (instrument, season_id) book in
+price-time priority; crossing pairs settle via `_settle_cross` — one
+buyer→seller `TRADE_CROSS` transfer shared by both `_apply_fill` legs
+(`cash_leg="none"` records the shared transfer id on both trade rows;
+both sides still pay their own fee to SINK). The maker is the earlier
+order by `(opened_tick, id)` and the cross prints at the maker's price;
+the mark then moves to it (`impact = ln(cross/base)` clamped by
+`max_impact` and `CIRCUIT_BREAKER_CAP`, breach → halt + `last_halt_end_tick`
+like a tick-time breach). Crosses are collared to `cross.collar_pct`
+around the mark (a stale maker is skipped, its taker tries the next
+counterparty — the collar gates book prints only; off-market orders can
+still MM-fill at the mark). Self-matches (same user_id, any scope) are
+banned; settlement failures advance the taker pointer. Pass 2 is the old
+MM fallback on remaining `quantity - filled_quantity`, now recording
+`trades.order_id`. `execute_trade` was refactored: the counterparty-
+agnostic settlement core is `_apply_fill` (position upsert, borrow-fee
+settle, fee leg, trade row, margin gates, season trade counter);
+`execute_trade` = instrument lock + impact/spread + `_apply_fill` vs
+MARKET_MAKER + mark/candle update. Cross legs do NOT call
+`update_candle_with_fill` individually (would double-count volume) — the
+cross prints once.
 
 Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
 preserved -- short proceeds credit to cash and are spendable; leverage is
