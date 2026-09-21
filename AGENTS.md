@@ -26,6 +26,7 @@ fees; `next_event_tick`/`last_halt_end_tick`; chart volume; `0013` param
 bounds + `0014` spread config). **Phase B done** (crossing book).
 **Phase C done** (participation cap + sqrt impact + fill epsilon).
 **Phase D done** (stop orders + dividends).
+**Phase E done** (sessions + overnight gaps).
 
 Crossing-book design notes: `match_orders` runs two passes inside
 `apply_tick`. Pass 1 walks each (instrument, season_id) book in
@@ -84,6 +85,23 @@ Ex-date: `base_price` and `fundamental_value` both drop by the dividend
 (minor units) settled to MARKET_MAKER on cover/liquidation — the cash
 CHECK means shorts can never be debited directly. Bounded shorts are NOT
 charged (collateralized derivative, not borrowed stock).
+
+Sessions notes: `session_phase(tick, open, closed, offset)` in engine.py
+is pure -- session state derives from the tick index, no shared flag.
+Closed ticks still write `market_ticks` (`session_state='CLOSED'`) and
+flat volume-0 candles, accrue borrow fees, and run `seasons.on_tick` --
+everything else (events, steps, KOs, matching, margin sweep) is open-only.
+The first open tick after a close (`cycle_pos == 0`) steps once with
+`dt=closed_ticks` (the overnight gap, breaker-bounded like any move) and
+applies `session.open_impact_reset`. "Now" = phase of `MAX(tick_index)`;
+`assert_market_open` (market/data.py) gates `execute_trade`,
+`place_order`, and both bounded-short endpoints with `MarketClosedError`
+-- imported lazily there because `market.data -> trading.errors ->
+trading.__init__ -> trading.service -> margin -> market.data` is a real
+import cycle. Dividend drift offsets are divided by `window *
+open_fraction` since only open ticks step. Tests flip `session.*` config
+(open=2, closed=4) to cycle phases in a handful of ticks; the phase
+offset shifts where the cycle lands relative to tick 0.
 
 Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
 preserved -- short proceeds credit to cash and are spendable; leverage is

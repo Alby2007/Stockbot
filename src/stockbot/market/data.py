@@ -127,6 +127,59 @@ async def trade_through_epsilon(conn: AsyncConnection) -> float:
     return await _config_float(conn, "cross.trade_through_epsilon", 0.0005)
 
 
+async def session_config(conn: AsyncConnection) -> dict[str, float]:
+    """The `session.*` config namespace (open/closed ticks, phase offset,
+    open impact reset), read fresh like `spread_config`."""
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT key, value FROM config WHERE key LIKE 'session.%'")
+        return {str(k): float(v) for k, v in await cur.fetchall()}
+
+
+def session_parts(cfg: dict[str, float]) -> tuple[int, int, int]:
+    """(open_ticks, closed_ticks, offset_ticks) from a `session.*` cfg dict,
+    defaulting to a market that never closes."""
+    open_ticks = int(cfg.get("session.open_ticks", TICKS_PER_DAY))
+    closed_ticks = int(cfg.get("session.closed_ticks", 0))
+    offset = int(cfg.get("session.phase_offset_ticks", 0))
+    return open_ticks, closed_ticks, offset
+
+
+def session_open_fraction(cfg: dict[str, float]) -> float:
+    """Fraction of ticks that are open -- used to scale the dividend drift
+    offset so payouts stay funded when only open ticks step the model."""
+    open_ticks, closed_ticks, _ = session_parts(cfg)
+    return open_ticks / max(open_ticks + closed_ticks, 1)
+
+
+async def current_session(conn: AsyncConnection) -> tuple[str, int | None, dict[str, float]]:
+    """('OPEN'|'CLOSED', last applied tick, session cfg). No ticks applied
+    yet counts as OPEN so bootstrap/trading-before-first-tick still works."""
+    cfg = await session_config(conn)
+    tick = await current_tick_index(conn)
+    if tick is None:
+        return "OPEN", None, cfg
+    open_ticks, closed_ticks, offset = session_parts(cfg)
+    return engine.session_phase(tick, open_ticks, closed_ticks, offset), tick, cfg
+
+
+async def assert_market_open(conn: AsyncConnection) -> None:
+    """Raise MarketClosedError when the last applied tick is a closed tick.
+
+    The session of "now" is the phase of the most recent committed tick:
+    a trade between tick T and T+1 executes against tick-T marks, so it
+    belongs to T's session."""
+    # Lazy: trading.errors -> trading/__init__ -> trading.service imports
+    # this module back, so a top-level import here would be circular.
+    from stockbot.trading.errors import MarketClosedError
+
+    phase, tick, cfg = await current_session(conn)
+    if phase == "CLOSED" and tick is not None:
+        open_ticks, closed_ticks, offset = session_parts(cfg)
+        raise MarketClosedError(
+            engine.ticks_until_open(tick, open_ticks, closed_ticks, offset)
+        )
+
+
 def half_spread_for(
     row: dict[str, Any], current_tick: int | None, cfg: dict[str, float]
 ) -> float:

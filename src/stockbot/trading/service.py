@@ -38,6 +38,7 @@ from stockbot.margin.errors import (
 )
 from stockbot.market import engine
 from stockbot.market.data import (
+    assert_market_open,
     current_tick_index,
     half_spread_for,
     participation_cap,
@@ -418,6 +419,7 @@ async def execute_trade(
     async with conn.transaction():
         if interaction_id is not None:
             await record_idempotency_key(conn, interaction_id)
+        await assert_market_open(conn)
 
         # Lock ordering: instrument before account.
         async with conn.cursor(row_factory=dict_row) as cur:

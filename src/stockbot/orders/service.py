@@ -37,6 +37,7 @@ from stockbot.ledger.service import (
 from stockbot.margin.errors import MarginError
 from stockbot.market import engine
 from stockbot.market.data import (
+    assert_market_open,
     half_spread_for,
     participation_cap,
     spread_config,
@@ -109,6 +110,7 @@ async def place_order(
     async with conn.transaction(), conn.cursor() as cur:
         if interaction_id is not None:
             await record_idempotency_key(conn, interaction_id)
+        await assert_market_open(conn)
         await cur.execute(
             "SELECT id, is_active FROM instruments WHERE ticker = %s", (ticker,)
         )

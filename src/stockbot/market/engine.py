@@ -44,6 +44,35 @@ CIRCUIT_BREAKER_CAP = 0.15  # max |Δlog P| allowed in a single tick
 CIRCUIT_HALT_TICKS = 5  # ticks an instrument stays halted after a breach
 
 
+def session_phase(
+    tick_index: int, open_ticks: int, closed_ticks: int, offset_ticks: int = 0
+) -> str:
+    """'OPEN' or 'CLOSED' for a tick index. Pure: the first `open_ticks`
+    ticks of each (open+closed) cycle are the trading session; session
+    state is derived from the tick index so every process agrees on it
+    without a shared flag. `offset_ticks` shifts where the cycle lands
+    relative to tick 0 (used to align "market open" with a wall clock)."""
+    span = open_ticks + closed_ticks
+    return "OPEN" if (tick_index - offset_ticks) % span < open_ticks else "CLOSED"
+
+
+def ticks_until_open(
+    tick_index: int, open_ticks: int, closed_ticks: int, offset_ticks: int = 0
+) -> int:
+    """Ticks until the next open tick (0 when `tick_index` is itself open)."""
+    span = open_ticks + closed_ticks
+    pos = (tick_index - offset_ticks) % span
+    return 0 if pos < open_ticks else span - pos
+
+
+def ticks_until_close(
+    tick_index: int, open_ticks: int, closed_ticks: int, offset_ticks: int = 0
+) -> int:
+    """Ticks until the session closes (0 when already closed)."""
+    pos = (tick_index - offset_ticks) % (open_ticks + closed_ticks)
+    return open_ticks - pos if pos < open_ticks else 0
+
+
 def tick_seed(master_seed: str, tick_index: int) -> int:
     """Deterministic seed for a tick: HMAC(master_seed, tick_index).
 

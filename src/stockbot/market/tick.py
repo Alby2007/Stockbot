@@ -9,7 +9,7 @@ from psycopg import AsyncConnection, sql
 from psycopg.rows import dict_row
 
 from stockbot.margin import service as margin
-from stockbot.market import engine, events
+from stockbot.market import data, engine, events
 from stockbot.orders import service as orders
 from stockbot.seasons import service as seasons
 from stockbot.shorts import service as shorts
@@ -22,6 +22,18 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
     `market/main.py`'s advisory lock) -- there is no locking here against a
     concurrent second tick, only against concurrent trades touching the same
     instruments.
+
+    Session structure: ticks cycle through `session.open_ticks` open ticks
+    then `session.closed_ticks` closed ticks (derived from the tick index,
+    so every process agrees). Closed ticks do no factor-model work -- the
+    market row and flat zero-volume candles are still written, borrow fees
+    keep accruing (real markets charge calendar days), and season
+    snapshots still land, but no matching, knockouts, or liquidation run.
+    The first open tick after a close steps once with dt = closed_ticks,
+    producing the overnight gap (bounded by the circuit breaker), resets a
+    fraction of accumulated impact, then runs the full open-tick pipeline
+    -- events due during the close resolve into that gap, and the
+    knockout/margin sweeps fire immediately after it.
     """
     async with conn.transaction():
         async with conn.cursor() as cur:
@@ -29,6 +41,51 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             next_tick_row = await cur.fetchone()
             assert next_tick_row is not None
             tick_index: int = next_tick_row[0]
+
+        session_cfg = await data.session_config(conn)
+        open_ticks, closed_ticks, offset = data.session_parts(session_cfg)
+        phase = engine.session_phase(tick_index, open_ticks, closed_ticks, offset)
+
+        if phase == "CLOSED":
+            # Flat candles keep the chart's x-axis continuous; volume 0 marks
+            # them as non-trading ticks. No instrument writes at all, so no
+            # FOR UPDATE is needed (trades are gated on assert_market_open).
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO market_ticks
+                        (tick_index, market_factor, sector_factors, session_state)
+                    VALUES (%s, 0, '{}', 'CLOSED')
+                    """,
+                    (tick_index,),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO candles
+                        (instrument_id, tick_index, open, high, low, close, volume)
+                    SELECT id, %s, quoted_price, quoted_price, quoted_price,
+                           quoted_price, 0
+                    FROM instruments WHERE is_active
+                    ORDER BY id
+                    """,
+                    (tick_index,),
+                )
+            # Calendar-day accruals and lifecycle still run; nothing that
+            # depends on prices moving does.
+            await margin.accrue_borrow_fees(conn)
+            await seasons.on_tick(conn, tick_index)
+            return tick_index
+
+        # OPEN tick. Position in the cycle 0 means this is the first tick
+        # after the close: step with dt = closed_ticks so the overnight
+        # drift/vol lands as one gap (breaker-bounded like any move).
+        cycle_pos = (tick_index - offset) % (open_ticks + closed_ticks)
+        gap_dt = float(closed_ticks) if cycle_pos == 0 and closed_ticks > 0 else 1.0
+        impact_reset = (
+            float(session_cfg.get("session.open_impact_reset", 1.0))
+            if gap_dt > 1.0
+            else 1.0
+        )
 
         async with conn.cursor(row_factory=dict_row) as cur:
             # Lock ordering rule: instruments before accounts, sorted by id.
@@ -51,8 +108,8 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
 
         sector_keys = sorted({row["sector_key"] for row in instrument_rows})
         rng = engine.rng_for_tick(master_seed, tick_index)
-        market_factor = engine.draw_market_factor(rng)
-        sector_factors = engine.draw_sector_factors(rng, sector_keys)
+        market_factor = engine.draw_market_factor(rng, dt=gap_dt)
+        sector_factors = engine.draw_sector_factors(rng, sector_keys, dt=gap_dt)
 
         # Events (earnings + news) use their own deterministic RNG stream so
         # they can't perturb the price engine's own draw sequence.
@@ -104,14 +161,26 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                 and row["circuit_halted_until_tick"] >= tick_index
             )
             if still_halted:
-                result = engine.freeze_instrument(state)
+                result = engine.freeze_instrument(state, dt=gap_dt)
                 halts[state.id] = row["circuit_halted_until_tick"]
             else:
                 result = engine.step_instrument(
-                    rng, state, market_factor, sector_factors[state.sector_key]
+                    rng, state, market_factor, sector_factors[state.sector_key], dt=gap_dt
                 )
                 halts[state.id] = (
                     tick_index + engine.CIRCUIT_HALT_TICKS if result.circuit_breached else None
+                )
+            # Overnight open: the book absorbs part of the stale impact
+            # (new_impact already decayed by dt inside the step/freeze).
+            if impact_reset != 1.0:
+                new_impact = result.impact * impact_reset
+                result = engine.InstrumentTickResult(
+                    id=result.id,
+                    base_price=result.base_price,
+                    fundamental_value=result.fundamental_value,
+                    impact=new_impact,
+                    quoted_price=result.base_price * math.exp(new_impact),
+                    circuit_breached=result.circuit_breached,
                 )
             results.append(result)
 
@@ -130,7 +199,11 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                 )
                 / divisor
             )
-            decayed = float(row["impact"]) * math.exp(-1.0 / float(row["tau_ticks"]))
+            decayed = (
+                float(row["impact"])
+                * math.exp(-gap_dt / float(row["tau_ticks"]))
+                * impact_reset
+            )
             results.append(
                 engine.InstrumentTickResult(
                     id=row["id"],
@@ -194,8 +267,9 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
 
             await cur.execute(
                 """
-                INSERT INTO market_ticks (tick_index, market_factor, sector_factors)
-                VALUES (%s, %s, %s)
+                INSERT INTO market_ticks
+                    (tick_index, market_factor, sector_factors, session_state)
+                VALUES (%s, %s, %s, 'OPEN')
                 """,
                 (tick_index, market_factor, json.dumps(sector_factors)),
             )

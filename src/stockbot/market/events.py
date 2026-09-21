@@ -29,6 +29,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from stockbot.ledger.service import get_system_account_id, post_transfer
+from stockbot.market import data
 from stockbot.market.engine import TICKS_PER_DAY
 
 EARNINGS_INTERVAL_TICKS = 30 * TICKS_PER_DAY
@@ -108,13 +109,19 @@ def _dividend_fields(
     cfg: dict[str, float],
     quoted: float,
     window: int,
+    open_fraction: float = 1.0,
 ) -> tuple[Decimal, Decimal]:
     """Per-share dividend and the per-tick drift offset that funds it:
     cumulatively -ln(1-yield) over the window, so the expected price path
-    is lower by exactly the payout fraction (redistribute, don't mint)."""
+    is lower by exactly the payout fraction (redistribute, don't mint).
+
+    Only open ticks step the factor model, so the offset is spread over
+    the *open* ticks in the window (window * open_fraction), not all of
+    them -- otherwise payouts would be underfunded by the closed share."""
     yield_frac = float(rng.uniform(cfg["dividend.min_yield"], cfg["dividend.max_yield"]))
     div_per_share = Decimal(str(round(quoted * yield_frac, 6)))
-    drift_offset = Decimal(str(-math.log(1.0 - yield_frac) / max(window, 1)))
+    open_ticks_in_window = max(1, round(window * open_fraction))
+    drift_offset = Decimal(str(-math.log(1.0 - yield_frac) / open_ticks_in_window))
     return div_per_share, drift_offset
 
 
@@ -140,11 +147,14 @@ async def schedule_initial_dividends(
 
     interval = int(cfg.get("dividend.interval_ticks", 86400))
     jitter = int(cfg.get("dividend.jitter_ticks", 20160))
+    open_fraction = data.session_open_fraction(await data.session_config(conn))
     for row in rows:
         if not _pays_dividends(int(row["id"]), payer_pct):
             continue
         window = max(1, interval + int(rng.integers(-jitter, jitter + 1)))
-        div, offset = _dividend_fields(rng, cfg, float(row["quoted_price"]), window)
+        div, offset = _dividend_fields(
+            rng, cfg, float(row["quoted_price"]), window, open_fraction
+        )
         async with conn.cursor() as cur:
             await cur.execute(
                 """
@@ -256,8 +266,9 @@ async def _resolve_dividend(
     quoted = float(row[0]) if row else float(div)
     interval = int(cfg.get("dividend.interval_ticks", 86400))
     jitter = int(cfg.get("dividend.jitter_ticks", 20160))
+    open_fraction = data.session_open_fraction(await data.session_config(conn))
     window = max(1, interval + int(rng.integers(-jitter, jitter + 1)))
-    next_div, next_offset = _dividend_fields(rng, cfg, quoted, window)
+    next_div, next_offset = _dividend_fields(rng, cfg, quoted, window, open_fraction)
     async with conn.cursor() as cur:
         await cur.execute(
             """

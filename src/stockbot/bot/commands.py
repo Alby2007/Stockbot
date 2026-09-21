@@ -36,10 +36,12 @@ from stockbot.margin.service import (
 from stockbot.market.data import (
     InstrumentSnapshot,
     all_instrument_snapshots,
+    current_session,
     current_tick_index,
     get_instrument_snapshot,
+    session_parts,
 )
-from stockbot.market.engine import TICKS_PER_DAY
+from stockbot.market.engine import TICKS_PER_DAY, ticks_until_close, ticks_until_open
 from stockbot.orders.service import cancel_order, list_open_orders, place_order
 from stockbot.seasons.errors import SeasonError
 from stockbot.seasons.service import (
@@ -132,6 +134,17 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def market(interaction: discord.Interaction) -> None:
         async with db.connection() as conn:
             snapshots = await all_instrument_snapshots(conn)
+            phase, cur_tick, session_cfg = await current_session(conn)
+
+        status = ""
+        if cur_tick is not None:
+            open_ticks, closed_ticks, offset = session_parts(session_cfg)
+            if phase == "OPEN":
+                until = ticks_until_close(cur_tick, open_ticks, closed_ticks, offset)
+                status = f"Session: **OPEN** — closes in ~{until} min\n"
+            else:
+                until = ticks_until_open(cur_tick, open_ticks, closed_ticks, offset)
+                status = f"Session: **CLOSED** — reopens in ~{until} min\n"
 
         lines = []
         for s in sorted(snapshots, key=lambda s: (s.sector_key, s.ticker)):
@@ -144,7 +157,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
         embed = discord.Embed(
             title="Market",
-            description="```\n" + "\n".join(lines) + "\n```",
+            description=status + "```\n" + "\n".join(lines) + "\n```",
         )
         await interaction.response.send_message(embed=embed)
 

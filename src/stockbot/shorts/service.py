@@ -35,6 +35,7 @@ from stockbot.ledger.service import (
 from stockbot.margin import service as margin
 from stockbot.market import engine
 from stockbot.market.data import (
+    assert_market_open,
     half_spread_for,
     participation_cap,
     spread_config,
@@ -162,6 +163,7 @@ async def open_bounded_short(
     async with conn.transaction():
         if interaction_id is not None:
             await record_idempotency_key(conn, interaction_id)
+        await assert_market_open(conn)
 
         instrument = await _lock_instrument(conn, ticker)
         account_id = await _resolve_account(conn, user_id, season_id)
@@ -268,6 +270,7 @@ async def cover_bounded_short(
     (buy-side) fill. Pays out collateral + payoff floored at 0.
     """
     async with conn.transaction():
+        await assert_market_open(conn)
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """

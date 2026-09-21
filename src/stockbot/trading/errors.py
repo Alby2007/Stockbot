@@ -57,6 +57,16 @@ class DuplicateInteractionError(TradingError):
         super().__init__(f"interaction {interaction_id} was already processed")
 
 
+class MarketClosedError(TradingError):
+    """Trading while the market is in its closed session."""
+
+    def __init__(self, ticks_until_open: int):
+        self.ticks_until_open = ticks_until_open
+        super().__init__(
+            f"the market is closed -- it reopens in ~{ticks_until_open} min"
+        )
+
+
 class NotInLeagueError(TradingError):
     """League-scoped trade attempted without an entry in an ACTIVE season.
 
