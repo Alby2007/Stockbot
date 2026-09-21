@@ -83,12 +83,18 @@ async def post_transfer(
     try:
         async with conn.transaction():
             async with conn.cursor() as cur:
-                # Lock ordering: always ascending by id, regardless of debit/credit direction.
-                await cur.execute(
-                    "SELECT id FROM accounts WHERE id IN (%s, %s) ORDER BY id FOR UPDATE",
-                    (lo, hi),
-                )
-                locked = {row[0] for row in await cur.fetchall()}
+                # Lock ordering: always ascending by id, regardless of
+                # debit/credit direction. Two statements rather than one
+                # `ORDER BY id FOR UPDATE` -- whether FOR UPDATE locks follow
+                # the sorted output order is undocumented, so sort in code.
+                locked: set[int] = set()
+                for account_id in (lo, hi):
+                    await cur.execute(
+                        "SELECT id FROM accounts WHERE id = %s FOR UPDATE", (account_id,)
+                    )
+                    row = await cur.fetchone()
+                    if row is not None:
+                        locked.add(row[0])
                 for account_id in (from_account_id, to_account_id):
                     if account_id not in locked:
                         raise UnknownAccountError(account_id)
@@ -123,3 +129,24 @@ async def post_transfer(
         raise InsufficientFundsError(from_account_id) from exc
 
     return transfer_id
+
+
+async def record_idempotency_key(conn: AsyncConnection, interaction_id: str) -> None:
+    """Insert `interaction_id`; raise `DuplicateInteractionError` if seen.
+
+    Every user-triggered money-moving path (trades, bounded shorts, shop
+    buys) calls this first inside its transaction so a redelivered Discord
+    interaction is a no-op instead of a double charge.
+    """
+    # Deferred import: trading.errors is downstream of this module
+    # (trading.service imports ledger.service), so a top-level import would
+    # be circular.
+    from stockbot.trading.errors import DuplicateInteractionError
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO idempotency_keys (interaction_id) VALUES (%s) ON CONFLICT DO NOTHING",
+            (interaction_id,),
+        )
+        if cur.rowcount == 0:
+            raise DuplicateInteractionError(interaction_id)

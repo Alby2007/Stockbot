@@ -37,6 +37,7 @@ import logging
 import random
 import sys
 from dataclasses import dataclass
+from datetime import date, timedelta
 
 from psycopg import AsyncConnection
 
@@ -65,6 +66,11 @@ SYNTHETIC_USER_ID_BASE = 900_000_000_000_000
 WHALE_STARTING_GRANT_MINOR = 500_000  # $5,000
 SHORTER_STARTING_GRANT_MINOR = 200_000  # $2,000: tier 1 ($500) + trading cash
 TICKS_PER_SIMULATED_DAY = 1440
+# Simulated days are mapped onto consecutive calendar dates starting here so
+# `claim_daily` runs its real per-day logic (streaks included). Without this
+# a 90-simulated-day run inside one real hour would give each agent a single
+# claim and faucet income would barely exist in the results.
+SIM_CLAIM_EPOCH = date(2025, 1, 1)
 
 
 @dataclass
@@ -152,9 +158,9 @@ async def _random_active_ticker(conn: AsyncConnection, rng: random.Random) -> st
     return rng.choice(tickers) if tickers else None
 
 
-async def _safe_claim(conn: AsyncConnection, user_id: int) -> None:
+async def _safe_claim(conn: AsyncConnection, user_id: int, sim_today: date) -> None:
     try:
-        await claim_daily(conn, user_id)
+        await claim_daily(conn, user_id, as_of_date=sim_today)
     except AlreadyClaimedTodayError:
         pass
 
@@ -163,14 +169,16 @@ async def _quantity_for_spend(spend_minor: int, ticker_price_minor: int) -> int:
     return max(1, spend_minor // max(ticker_price_minor, 1))
 
 
-async def _run_agent_day(conn: AsyncConnection, agent: Agent, rng: random.Random) -> None:
+async def _run_agent_day(
+    conn: AsyncConnection, agent: Agent, rng: random.Random, sim_today: date
+) -> None:
     try:
         if agent.archetype == "farmer":
-            await _safe_claim(conn, agent.user_id)
+            await _safe_claim(conn, agent.user_id, sim_today)
             return
 
         if agent.archetype in ("whale", "grinder", "yolo"):
-            await _safe_claim(conn, agent.user_id)
+            await _safe_claim(conn, agent.user_id, sim_today)
             chance, spend_range = {
                 "whale": (0.4, (0.05, 0.2)),
                 "grinder": (0.3, (0.05, 0.15)),
@@ -202,8 +210,8 @@ async def _run_agent_day(conn: AsyncConnection, agent: Agent, rng: random.Random
             # Only the lower-id half of each pair drives the pair's schedule.
             if agent.user_id > agent.wash_partner_id:
                 return
-            await _safe_claim(conn, agent.user_id)
-            await _safe_claim(conn, agent.wash_partner_id)
+            await _safe_claim(conn, agent.user_id, sim_today)
+            await _safe_claim(conn, agent.wash_partner_id, sim_today)
 
             if agent.wash_ticker is None:
                 agent.wash_ticker = await _random_active_ticker(conn, rng)
@@ -237,7 +245,7 @@ async def _run_agent_day(conn: AsyncConnection, agent: Agent, rng: random.Random
             await execute_trade(conn, user_id=partner_id, ticker=ticker, side="SELL", quantity=5)
 
         if agent.archetype == "shorter":
-            await _safe_claim(conn, agent.user_id)
+            await _safe_claim(conn, agent.user_id, sim_today)
             if rng.random() >= 0.4:
                 return
             async with conn.cursor() as cur:
@@ -317,6 +325,11 @@ async def economy_snapshot(conn: AsyncConnection) -> dict[str, float]:
     sink_id = await get_system_account_id(conn, "SINK")
     faucet_balance = await get_balance(conn, faucet_id)
     sink_balance = await get_balance(conn, sink_id)
+    # "Money supply" = printed minus destroyed = whatever USER, LEAGUE,
+    # MARKET_MAKER and INSURANCE_FUND accounts currently hold. MM's balance
+    # drifts with net trade flow (it's the counterparty of every fill), so
+    # supply moves even when no faucet/sink activity happens -- intentional:
+    # it's cash sitting in the system, not destroyed.
     money_supply = -(faucet_balance + sink_balance)
     insurance_id = await get_system_account_id(conn, "INSURANCE_FUND")
     insurance_balance = await get_balance(conn, insurance_id)
@@ -381,8 +394,9 @@ async def run_simulation(
     for day in range(num_days):
         for _ in range(ticks_per_day):
             await apply_tick(conn, master_seed)
+        sim_today = SIM_CLAIM_EPOCH + timedelta(days=day)
         for agent in agents:
-            await _run_agent_day(conn, agent, rng)
+            await _run_agent_day(conn, agent, rng, sim_today)
 
         if day % snapshot_every_days == 0 or day == num_days - 1:
             net_worth = await net_worth_by_user(conn, user_ids)

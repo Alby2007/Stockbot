@@ -271,7 +271,7 @@ async def _liquidate_leg(
     """
     # Lazy: trading.service imports this module, so a top-level import here
     # would be circular.
-    from stockbot.trading.service import FEE_BPS, HALF_SPREAD_BPS
+    from stockbot.trading.service import FEE_BPS, HALF_SPREAD_BPS, update_candle_with_fill
 
     instrument_id = int(position["instrument_id"])
     qty = int(position["quantity"])
@@ -404,6 +404,8 @@ async def _liquidate_leg(
             "UPDATE instruments SET impact = %s, quoted_price = %s WHERE id = %s",
             (impact_after, new_quoted, instrument_id),
         )
+
+        await update_candle_with_fill(conn, instrument_id, fill, close_qty)
 
         await cur.execute(
             """

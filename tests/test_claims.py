@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 import pytest
 from psycopg import AsyncConnection
 
@@ -49,6 +51,22 @@ async def test_gap_of_more_than_one_day_resets_streak(conn: AsyncConnection) -> 
     amount, streak = await claim_daily(conn, 2005)
     assert streak == 1
     assert amount == BASE_CLAIM_MINOR
+
+
+async def test_claim_as_of_date_overrides_the_server_date(conn: AsyncConnection) -> None:
+    """The sim harness passes simulated dates; the override must drive the
+    same per-day uniqueness and streak logic as CURRENT_DATE."""
+    day = date(2025, 6, 1)
+    amount, streak = await claim_daily(conn, 2006, as_of_date=day)
+    assert streak == 1
+    assert amount == BASE_CLAIM_MINOR
+
+    with pytest.raises(AlreadyClaimedTodayError):
+        await claim_daily(conn, 2006, as_of_date=day)
+
+    amount, streak = await claim_daily(conn, 2006, as_of_date=day + timedelta(days=1))
+    assert streak == 2
+    assert amount == claim_amount(2)
 
 
 def test_claim_amount_caps_out() -> None:

@@ -16,11 +16,36 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s bot %(levelname)s %(
 log = logging.getLogger("stockbot.bot")
 
 
+class StockBotTree(discord.app_commands.CommandTree["StockBotClient"]):
+    """Last-resort error path: without it, an unexpected exception in a
+    command handler leaves the user staring at "the application did not
+    respond" with only a log line."""
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: discord.app_commands.AppCommandError,
+    ) -> None:
+        command_name = interaction.command.name if interaction.command else "unknown"
+        log.error("unhandled error in /%s", command_name, exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "Something went wrong running that command.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "Something went wrong running that command.", ephemeral=True
+                )
+        except discord.HTTPException:
+            pass  # interaction already expired/ack'd -- nothing more to do
+
+
 class StockBotClient(discord.Client):
     def __init__(self) -> None:
         # Slash-command-only surface: no privileged intents required.
         super().__init__(intents=discord.Intents.none())
-        self.tree = discord.app_commands.CommandTree(self)
+        self.tree = StockBotTree(self)
         register_commands(self.tree)
 
     async def setup_hook(self) -> None:

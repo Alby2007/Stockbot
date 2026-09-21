@@ -14,4 +14,9 @@ COPY migrations ./migrations
 
 RUN pip install --no-cache-dir .
 
+# Drop root: the services only need to read the installed package and reach
+# Postgres over the network.
+RUN useradd --system --uid 10001 stockbot
+USER stockbot
+
 ENV PYTHONUNBUFFERED=1

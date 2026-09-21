@@ -7,6 +7,7 @@ from stockbot.accounts.service import bootstrap_user
 from stockbot.ledger.errors import InsufficientFundsError
 from stockbot.ledger.service import get_balance, get_system_account_id, post_transfer
 from stockbot.margin.errors import MarginNotUnlockedError
+from stockbot.market.tick import apply_tick
 from stockbot.trading.errors import (
     DuplicateInteractionError,
     InstrumentHaltedError,
@@ -172,3 +173,30 @@ async def test_duplicate_interaction_id_is_a_replay_not_a_double_trade(
         await cur.execute("SELECT COUNT(*) FROM trades WHERE user_id = %s", (1008,))
         (trade_count,) = await cur.fetchone()
     assert trade_count == 1
+
+
+async def test_trade_prints_onto_the_latest_candle(conn: AsyncConnection) -> None:
+    """Fills between ticks extend the latest candle's high/low and volume --
+    otherwise intra-tick trades are invisible to /chart and volume stays 0."""
+    account_id = await bootstrap_user(conn, 1009)
+    await _give_cash(conn, account_id, 1_000_000)
+    ticker = await _first_ticker(conn)
+    tick_index = await apply_tick(conn, "candle-print-seed")
+
+    result = await execute_trade(conn, user_id=1009, ticker=ticker, side="BUY", quantity=10)
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT c.high, c.low, c.volume
+            FROM candles c
+            JOIN instruments i ON i.id = c.instrument_id
+            WHERE i.ticker = %s AND c.tick_index = %s
+            """,
+            (ticker, tick_index),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    high, low, volume = row
+    assert float(volume) == 10
+    assert float(low) <= float(result.fill_price) <= float(high)

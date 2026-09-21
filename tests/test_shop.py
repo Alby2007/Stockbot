@@ -8,7 +8,7 @@ from stockbot.ledger.errors import InsufficientFundsError
 from stockbot.ledger.service import get_balance
 from stockbot.shop.errors import AlreadyOwnedError, UnknownItemError
 from stockbot.shop.service import BASE_SLOTS, buy_item, get_slot_count, get_user_entitlements
-from stockbot.trading.errors import TooManyPositionsError
+from stockbot.trading.errors import DuplicateInteractionError, TooManyPositionsError
 from stockbot.trading.service import execute_trade
 
 
@@ -81,6 +81,22 @@ async def test_insufficient_funds_for_shop_purchase(conn: AsyncConnection) -> No
         await buy_item(conn, 3007, "slot")
         await buy_item(conn, 3007, "slot")
         await buy_item(conn, 3007, "slot")
+
+
+async def test_replayed_shop_buy_is_a_noop_not_a_double_charge(conn: AsyncConnection) -> None:
+    """A redelivered Discord interaction (client retry) carries the same id;
+    the second attempt must be a no-op, not a second charge."""
+    account_id = await bootstrap_user(conn, 3009)
+    await _give_cash(conn, 3009, 1_000_000)
+
+    await buy_item(conn, 3009, "slot", interaction_id="shop-interaction-1")
+    balance_after_first = await get_balance(conn, account_id)
+
+    with pytest.raises(DuplicateInteractionError):
+        await buy_item(conn, 3009, "slot", interaction_id="shop-interaction-1")
+
+    assert await get_balance(conn, account_id) == balance_after_first
+    assert await get_slot_count(conn, 3009) == BASE_SLOTS + 1
 
 
 async def test_buying_beyond_slot_count_is_rejected(conn: AsyncConnection) -> None:

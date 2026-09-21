@@ -12,7 +12,12 @@ from typing import Any
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
-from stockbot.ledger.service import get_system_account_id, get_user_account_id, post_transfer
+from stockbot.ledger.service import (
+    get_system_account_id,
+    get_user_account_id,
+    post_transfer,
+    record_idempotency_key,
+)
 from stockbot.margin import service as margin
 from stockbot.shop.errors import AlreadyOwnedError, UnknownItemError
 
@@ -77,10 +82,25 @@ async def get_user_entitlements(conn: AsyncConnection, user_id: int) -> list[dic
         return await cur.fetchall()
 
 
-async def buy_slot(conn: AsyncConnection, user_id: int) -> int:
+async def _lock_user_account(conn: AsyncConnection, account_id: int) -> None:
+    """Serialize this user's purchases. The entitlement row being read below
+    doesn't exist on a first-ever buy, so `FOR UPDATE` on entitlements locks
+    nothing and two concurrent first buys would both read owned=0 and both
+    pay the cheapest price. The account row always exists; locking it
+    serializes the read-modify-write (same pattern as claim_daily)."""
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT id FROM accounts WHERE id = %s FOR UPDATE", (account_id,))
+
+
+async def buy_slot(
+    conn: AsyncConnection, user_id: int, *, interaction_id: str | None = None
+) -> int:
     """Buy one additional portfolio slot. Returns the price paid, minor units."""
     async with conn.transaction():
+        if interaction_id is not None:
+            await record_idempotency_key(conn, interaction_id)
         account_id = await get_user_account_id(conn, user_id)
+        await _lock_user_account(conn, account_id)
         async with conn.cursor() as cur:
             await cur.execute(
                 """
@@ -116,10 +136,16 @@ async def buy_slot(conn: AsyncConnection, user_id: int) -> int:
     return price
 
 
-async def buy_margin_tier(conn: AsyncConnection, user_id: int) -> int:
+async def buy_margin_tier(
+    conn: AsyncConnection, user_id: int, *, interaction_id: str | None = None
+) -> int:
     """Buy the next margin tier. Returns the price paid, minor units."""
     async with conn.transaction():
+        if interaction_id is not None:
+            await record_idempotency_key(conn, interaction_id)
         account_id = await get_user_account_id(conn, user_id)
+        # Same first-buy race as buy_slot: the entitlement row may not exist.
+        await _lock_user_account(conn, account_id)
         async with conn.cursor() as cur:
             await cur.execute(
                 """
@@ -157,14 +183,20 @@ async def buy_margin_tier(conn: AsyncConnection, user_id: int) -> int:
     return price
 
 
-async def buy_item(conn: AsyncConnection, user_id: int, item_key: str) -> int:
+async def buy_item(
+    conn: AsyncConnection, user_id: int, item_key: str, *, interaction_id: str | None = None
+) -> int:
     """Buy (or renew) a shop item. Returns the price paid, minor units."""
     if item_key == "slot":
-        return await buy_slot(conn, user_id)
+        return await buy_slot(conn, user_id, interaction_id=interaction_id)
     if item_key == "margin_tier":
-        return await buy_margin_tier(conn, user_id)
+        return await buy_margin_tier(conn, user_id, interaction_id=interaction_id)
 
     async with conn.transaction():
+        if interaction_id is not None:
+            await record_idempotency_key(conn, interaction_id)
+        # Locking the shop_items row also serializes purchases of this item:
+        # a concurrent first buy waits here, then sees the entitlement row.
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute("SELECT * FROM shop_items WHERE key = %s FOR UPDATE", (item_key,))
             item = await cur.fetchone()

@@ -19,6 +19,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from stockbot.ledger.errors import LedgerError
+from stockbot.ledger.service import record_idempotency_key
 from stockbot.margin.errors import MarginError
 from stockbot.market import engine
 from stockbot.trading.errors import TradingError, UnknownInstrumentError
@@ -54,6 +55,7 @@ async def place_order(
     limit_price: Decimal,
     season_id: int | None = None,
     expires_in_ticks: int | None = None,
+    interaction_id: str | None = None,
 ) -> OrderResult:
     """Validate and rest a limit order. Marketability/margin are re-checked at
     fill time; placement only rejects structurally bad orders."""
@@ -64,6 +66,8 @@ async def place_order(
     ticker = ticker.upper()
 
     async with conn.transaction(), conn.cursor() as cur:
+        if interaction_id is not None:
+            await record_idempotency_key(conn, interaction_id)
         await cur.execute(
             "SELECT id, is_active FROM instruments WHERE ticker = %s", (ticker,)
         )

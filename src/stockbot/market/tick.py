@@ -86,9 +86,12 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             )
             opens[state.id] = state.base_price * math.exp(state.impact)
 
+            # `>=`: halted_until is the *last* frozen tick, so a breach at T
+            # freezes exactly CIRCUIT_HALT_TICKS ticks (T+1 .. T+N) and the
+            # instrument steps again at T+N+1.
             still_halted = (
                 row["circuit_halted_until_tick"] is not None
-                and row["circuit_halted_until_tick"] > tick_index
+                and row["circuit_halted_until_tick"] >= tick_index
             )
             if still_halted:
                 result = engine.freeze_instrument(state)

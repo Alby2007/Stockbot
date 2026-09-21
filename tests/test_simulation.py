@@ -10,7 +10,7 @@ from stockbot.simulation.harness import build_cohort, run_simulation
 def test_build_cohort_covers_all_archetypes() -> None:
     agents = build_cohort(60, random.Random(0))
     archetypes = {a.archetype for a in agents}
-    assert archetypes == {"grinder", "yolo", "farmer", "wash_trader", "whale"}
+    assert archetypes == {"grinder", "yolo", "farmer", "wash_trader", "whale", "shorter"}
 
     wash_traders = [a for a in agents if a.archetype == "wash_trader"]
     assert len(wash_traders) % 2 == 0
@@ -73,3 +73,23 @@ async def test_wash_traders_dont_systematically_beat_honest_play(conn: AsyncConn
     farmer = report["by_archetype"].get("farmer")
     assert farmer is not None
     assert wash["avg_gain_minor"] <= farmer["avg_gain_minor"] * 1.5
+
+
+async def test_simulated_days_drive_daily_claims(conn: AsyncConnection) -> None:
+    """Every archetype claims daily; with as_of_date wired through, a
+    num_days run must produce num_days of consecutive claims (max streak ==
+    num_days), not ~1 real-date claim for the whole run."""
+    num_days = 3
+    await run_simulation(
+        conn,
+        num_users=12,
+        num_days=num_days,
+        master_seed="claim-date-seed",
+        snapshot_every_days=1,
+        seed=42,
+        ticks_per_day=3,
+    )
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT MAX(streak) FROM claims")
+        (max_streak,) = await cur.fetchone()
+    assert max_streak == num_days

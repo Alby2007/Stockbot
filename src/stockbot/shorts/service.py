@@ -26,18 +26,27 @@ from typing import Any
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
-from stockbot.ledger.service import get_system_account_id, get_user_account_id, post_transfer
+from stockbot.ledger.service import (
+    get_system_account_id,
+    get_user_account_id,
+    post_transfer,
+    record_idempotency_key,
+)
 from stockbot.margin import service as margin
 from stockbot.market import engine
 from stockbot.seasons.service import get_active_entry
 from stockbot.shorts.errors import ShortNotFoundError
 from stockbot.trading.errors import (
-    DuplicateInteractionError,
     InstrumentHaltedError,
     NotInLeagueError,
     UnknownInstrumentError,
 )
-from stockbot.trading.service import FEE_BPS, HALF_SPREAD_BPS, _to_minor_units
+from stockbot.trading.service import (
+    FEE_BPS,
+    HALF_SPREAD_BPS,
+    _to_minor_units,
+    update_candle_with_fill,
+)
 
 
 @dataclass(frozen=True)
@@ -59,16 +68,6 @@ class CoverResult:
     close_price: Decimal
     payoff_minor: int
     payout_minor: int
-
-
-async def _record_idempotency_key(conn: AsyncConnection, interaction_id: str) -> None:
-    async with conn.cursor() as cur:
-        await cur.execute(
-            "INSERT INTO idempotency_keys (interaction_id) VALUES (%s) ON CONFLICT DO NOTHING",
-            (interaction_id,),
-        )
-        if cur.rowcount == 0:
-            raise DuplicateInteractionError(interaction_id)
 
 
 async def _resolve_account(
@@ -139,7 +138,7 @@ async def open_bounded_short(
 
     async with conn.transaction():
         if interaction_id is not None:
-            await _record_idempotency_key(conn, interaction_id)
+            await record_idempotency_key(conn, interaction_id)
 
         instrument = await _lock_instrument(conn, ticker)
         account_id = await _resolve_account(conn, user_id, season_id)
@@ -193,6 +192,7 @@ async def open_bounded_short(
             )
 
         await _set_impact(conn, int(instrument["id"]), base_price, impact_after)
+        await update_candle_with_fill(conn, int(instrument["id"]), fill_price, quantity)
         tick = await _current_tick(conn)
 
         async with conn.cursor() as cur:
@@ -291,6 +291,7 @@ async def cover_bounded_short(
             )
 
         await _set_impact(conn, int(short["instrument_id"]), base_price, impact_after)
+        await update_candle_with_fill(conn, int(short["instrument_id"]), close_price, quantity)
         tick = await _current_tick(conn)
 
         async with conn.cursor() as cur:

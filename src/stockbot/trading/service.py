@@ -23,7 +23,12 @@ from typing import Literal
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
-from stockbot.ledger.service import get_system_account_id, get_user_account_id, post_transfer
+from stockbot.ledger.service import (
+    get_system_account_id,
+    get_user_account_id,
+    post_transfer,
+    record_idempotency_key,
+)
 from stockbot.margin import service as margin
 from stockbot.margin.errors import (
     InsufficientMarginError,
@@ -34,7 +39,6 @@ from stockbot.margin.errors import (
 from stockbot.market import engine
 from stockbot.shop.service import BASE_SLOTS, get_slot_count
 from stockbot.trading.errors import (
-    DuplicateInteractionError,
     InstrumentHaltedError,
     NotInLeagueError,
     TooManyPositionsError,
@@ -62,14 +66,24 @@ def _to_minor_units(major_units: Decimal) -> int:
     return int((major_units * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-async def _record_idempotency_key(conn: AsyncConnection, interaction_id: str) -> None:
+async def update_candle_with_fill(
+    conn: AsyncConnection, instrument_id: int, fill_price: Decimal, quantity: int
+) -> None:
+    """Print a fill onto the instrument's most recent candle: extend high/low
+    and add to volume. Candles are written once per tick, so without this an
+    intra-tick trade would leave no trace on `/chart` (and `volume` would
+    stay 0 forever). No-op before the market's first tick.
+    """
     async with conn.cursor() as cur:
         await cur.execute(
-            "INSERT INTO idempotency_keys (interaction_id) VALUES (%s) ON CONFLICT DO NOTHING",
-            (interaction_id,),
+            """
+            UPDATE candles
+            SET high = GREATEST(high, %s), low = LEAST(low, %s), volume = volume + %s
+            WHERE instrument_id = %s
+              AND tick_index = (SELECT MAX(tick_index) FROM market_ticks)
+            """,
+            (fill_price, fill_price, quantity, instrument_id),
         )
-        if cur.rowcount == 0:
-            raise DuplicateInteractionError(interaction_id)
 
 
 async def execute_trade(
@@ -92,7 +106,7 @@ async def execute_trade(
 
     async with conn.transaction():
         if interaction_id is not None:
-            await _record_idempotency_key(conn, interaction_id)
+            await record_idempotency_key(conn, interaction_id)
 
         # Lock ordering: instrument before account.
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -330,6 +344,8 @@ async def execute_trade(
             row = await cur.fetchone()
             assert row is not None
             trade_id = row[0]
+
+        await update_candle_with_fill(conn, instrument_id, fill_price, quantity)
 
         # Margin gates, evaluated on the post-trade state (raising rolls the
         # whole trade back). Reducing a position is always allowed.

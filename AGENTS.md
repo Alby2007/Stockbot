@@ -96,7 +96,33 @@ can't be referenced in its own transaction -- that's why the enum lives in
 - `rng.choice(rows)` is only deterministic if the SQL has `ORDER BY` --
   Postgres row order shifts as UPDATEs rearrange tuples, which made the
   wash-trader sim test flaky until `_random_active_ticker` got `ORDER BY
-  ticker`.
+  ticker`. Same deal for `resolve_due_events`: earnings magnitudes and
+  reschedule jitter are drawn in row order, so its `FOR UPDATE` scan is
+  `ORDER BY id`.
+- The market tick loop's advisory lock is session-scoped: if the connection
+  dies, the lock is already gone and a second instance may hold it.
+  `_tick_loop` returns on `psycopg.OperationalError` (or a closed/broken
+  conn) and `run()` re-checks out a fresh conn and re-acquires the lock;
+  never keep ticking on a dead conn -- the pool won't heal it.
+- Shop buys take `FOR UPDATE` on the user's *account* row before reading
+  entitlements (same pattern as `claim_daily`): the entitlement row doesn't
+  exist on a first buy, so locking it directly locks nothing and two racing
+  first buys both price at `owned=0`.
+- Tunable engine params are bounded twice: `admin.service.PARAM_BOUNDS` and
+  the `instruments_engine_params_sane` CHECK (0013). Bounds are finite
+  ranges on purpose -- Postgres numeric comparisons treat NaN as greater
+  than everything, so `x >= 0` does NOT reject NaN.
+- `candles.volume`/high/low are extended by fills between ticks
+  (`trading.service.update_candle_with_fill`, also called by bounded shorts
+  and liquidation legs); candle T is written during tick T then amended by
+  intra-interval prints until T+1.
+- `claim_daily(..., as_of_date=...)` exists for the sim harness -- sim days
+  map to consecutive fake dates so faucet income is per-sim-day, not
+  per-real-day. Don't "fix" it back to CURRENT_DATE only.
+- Circuit halt semantics: `circuit_halted_until_tick` is the *last* frozen
+  tick (compared with `>=`), so a breach at T freezes T+1..T+CIRCUIT_HALT_TICKS.
+- Backlog: `idempotency_keys` and resolved `events` grow forever -- add a
+  retention cleanup when they get big.
 
 ## Environment
 

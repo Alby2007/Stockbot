@@ -5,14 +5,17 @@ shared currency, a factor-model price engine with decaying user price
 impact, and a phased path from long-only trading to true margin shorts with
 liquidation. See the design doc for the full plan.
 
-Current status: **Phase 1 in progress**. Phase 0 (double-entry ledger,
-account bootstrap, migrations, process skeleton) is done. The tick engine is
-live (factor model, impact decay, mean reversion, circuit breaker,
-deterministic replay) over 40 seeded instruments across 8 sectors, and
-trading works end to end: `/balance`, `/portfolio`, `/buy`, `/sell`,
-`/market`, `/stock`, `/claim`. Not yet built: richer market data
-(`/movers`, `/sectors`, `/news`, `/calendar`, charts), the shop, seasons and
-the league, admin tuning, and the economy simulation harness.
+Current status: **Phase 2 complete**, plus resting limit orders on top.
+The tick engine is live (factor model, impact decay, mean reversion,
+circuit breaker, deterministic replay) over 40 seeded instruments across 8
+sectors plus the SBX-40 index. Working end to end: `/balance`,
+`/portfolio`, `/buy`, `/sell`, `/market`, `/stock`, `/claim`, `/movers`,
+`/sectors`, `/chart`, `/news`, `/calendar`, the shop (`/shop list`,
+`/shop buy`), bounded shorts (`/short`, `/shorts`, `/cover`), true margin
+(`margin_tier` shop item, `/margin`, `/collateral`, `/liquidations`),
+seasons/league (`/league info|join|standings`), limit orders (`/order`),
+admin tools (`/admin`), and the economy simulation harness
+(`python -m stockbot.simulation.harness`).
 
 ## Stack
 
@@ -35,9 +38,9 @@ docker compose up -d postgres
 python -m stockbot.migrate
 ```
 
-`docker compose up` (no service name) will also build and run the `bot` and
-`market` services, which are Phase 0 placeholders (no Discord commands, no
-tick loop yet).
+`docker compose up` (no service name) also builds and runs the `bot` and
+`market` services. `market` is the singleton tick engine (guarded by a
+Postgres advisory lock); `bot` idles until `DISCORD_TOKEN` is set.
 
 ## Tests
 
@@ -72,8 +75,8 @@ src/stockbot/
   migrate.py    # tiny migration runner (python -m stockbot.migrate)
   ledger/       # append-only double-entry ledger
   accounts/     # user + account bootstrap
-  bot/          # Discord gateway process (Phase 1+)
-  market/       # tick engine process (Phase 1+)
+  bot/          # Discord gateway process (slash commands)
+  market/       # singleton tick engine process (advisory-locked)
 migrations/     # numbered .sql files, applied in order
 tests/          # pytest, real Postgres required
 ```

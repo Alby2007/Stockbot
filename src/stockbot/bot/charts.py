@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
+from typing import Any
 
 import matplotlib
 
 matplotlib.use("Agg")
 
-import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.figure import Figure  # noqa: E402
 from psycopg import AsyncConnection  # noqa: E402
 
 
@@ -31,17 +33,26 @@ async def render_candle_chart(
         rows = await cur.fetchall()
     if not rows:
         return None
-    rows.reverse()
+    # The render is ~100ms+ of synchronous CPU -- run it off the event loop
+    # so gateway heartbeats aren't delayed. matplotlib.figure.Figure (not
+    # pyplot) keeps it off pyplot's shared global state, which isn't
+    # thread-safe.
+    return await asyncio.to_thread(_render_png, rows, ticker)
+
+
+def _render_png(rows: list[Any], ticker: str) -> io.BytesIO:
+    rows = list(reversed(rows))
 
     ticks = [r[0] for r in rows]
     highs = [float(r[1]) for r in rows]
     lows = [float(r[2]) for r in rows]
     closes = [float(r[3]) for r in rows]
 
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig = Figure(figsize=(8, 4))
+    ax = fig.add_subplot(111)
     ax.plot(ticks, closes, color="#4C9AFF", linewidth=1.5, label="close")
     ax.fill_between(ticks, lows, highs, color="#4C9AFF", alpha=0.15, label="range")
-    ax.set_title(f"{ticker} \u2014 last {len(ticks)} ticks")
+    ax.set_title(f"{ticker} — last {len(ticks)} ticks")
     ax.set_xlabel("tick")
     ax.set_ylabel("price")
     ax.grid(alpha=0.3)
@@ -49,6 +60,5 @@ async def render_candle_chart(
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=120)
-    plt.close(fig)
     buf.seek(0)
     return buf

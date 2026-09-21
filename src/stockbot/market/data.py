@@ -46,10 +46,12 @@ async def current_tick_index(conn: AsyncConnection) -> int | None:
         return row[0] if row is not None else None
 
 
-async def all_instrument_snapshots(conn: AsyncConnection) -> list[InstrumentSnapshot]:
-    """One row per active instrument, plus its close price from ~1 day ago
-    (or the earliest candle available, if the market hasn't run a full day
-    yet) for computing a 24h % change.
+async def _fetch_snapshots(
+    conn: AsyncConnection, ticker: str | None
+) -> list[InstrumentSnapshot]:
+    """One row per active instrument (or just `ticker`, when given), plus
+    its close price from ~1 day ago (or the earliest candle available, if
+    the market hasn't run a full day yet) for computing a 24h % change.
     """
     current_tick = await current_tick_index(conn)
     day_ago_tick = max((current_tick or 0) - TICKS_PER_DAY, 0)
@@ -67,10 +69,10 @@ async def all_instrument_snapshots(conn: AsyncConnection) -> list[InstrumentSnap
                 ORDER BY candles.tick_index DESC
                 LIMIT 1
             ) c ON TRUE
-            WHERE i.is_active
+            WHERE i.is_active AND (%s::text IS NULL OR i.ticker = %s)
             ORDER BY i.ticker
             """,
-            (day_ago_tick,),
+            (day_ago_tick, ticker, ticker),
         )
         rows = await cur.fetchall()
 
@@ -91,9 +93,10 @@ async def all_instrument_snapshots(conn: AsyncConnection) -> list[InstrumentSnap
     ]
 
 
+async def all_instrument_snapshots(conn: AsyncConnection) -> list[InstrumentSnapshot]:
+    return await _fetch_snapshots(conn, None)
+
+
 async def get_instrument_snapshot(conn: AsyncConnection, ticker: str) -> InstrumentSnapshot | None:
-    ticker = ticker.upper()
-    for snapshot in await all_instrument_snapshots(conn):
-        if snapshot.ticker == ticker:
-            return snapshot
-    return None
+    rows = await _fetch_snapshots(conn, ticker.upper())
+    return rows[0] if rows else None

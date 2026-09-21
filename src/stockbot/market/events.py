@@ -119,10 +119,14 @@ async def resolve_due_events(
     Earnings events are rescheduled ~30 days out once resolved.
     """
     async with conn.cursor(row_factory=dict_row) as cur:
+        # ORDER BY matters: earnings magnitudes and reschedule jitter are
+        # drawn from `rng` in row order, so an unordered scan would assign
+        # different draws to the same events across replays.
         await cur.execute(
             """
             SELECT id, instrument_id, kind, magnitude FROM events
             WHERE resolve_tick <= %s AND NOT resolved
+            ORDER BY id
             FOR UPDATE
             """,
             (current_tick,),

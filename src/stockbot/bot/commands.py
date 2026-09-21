@@ -67,7 +67,7 @@ from stockbot.shorts.service import (
     list_open_shorts,
     open_bounded_short,
 )
-from stockbot.trading.errors import TradingError
+from stockbot.trading.errors import DuplicateInteractionError, TradingError
 from stockbot.trading.service import execute_trade
 
 log = logging.getLogger("stockbot.bot.commands")
@@ -182,24 +182,27 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ticker: str,
         ticks: app_commands.Range[int, 10, 1440] = 240,
     ) -> None:
+        # Defer up front: the render is slow enough to risk blowing the 3s
+        # response window on a cold pool.
+        await interaction.response.defer()
         async with db.connection() as conn:
             snapshot = await get_instrument_snapshot(conn, ticker)
             if snapshot is None:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"No instrument found for `{ticker.upper()}`.", ephemeral=True
                 )
                 return
             buf = await render_candle_chart(conn, snapshot.id, snapshot.ticker, ticks)
 
         if buf is None:
-            await interaction.response.send_message("No price history yet.", ephemeral=True)
+            await interaction.followup.send("No price history yet.", ephemeral=True)
             return
 
         filename = f"{snapshot.ticker}.png"
         file = discord.File(buf, filename=filename)
         embed = discord.Embed(title=f"{snapshot.ticker} \u2014 {snapshot.name}")
         embed.set_image(url=f"attachment://{filename}")
-        await interaction.response.send_message(embed=embed, file=file)
+        await interaction.followup.send(embed=embed, file=file)
 
     @tree.command(name="movers", description="Show today's biggest gainers and losers")
     async def movers(interaction: discord.Interaction) -> None:
@@ -395,7 +398,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def buy(
         interaction: discord.Interaction,
         ticker: str,
-        quantity: app_commands.Range[int, 1, None],
+        # A bounded quantity keeps absurd inputs from overflowing BIGINT
+        # notional_minor into an uncaught NumericValueOutOfRange.
+        quantity: app_commands.Range[int, 1, 1_000_000_000],
         league: bool = False,
     ) -> None:
         await _do_trade(interaction, ticker, "BUY", quantity, league)
@@ -409,7 +414,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def sell(
         interaction: discord.Interaction,
         ticker: str,
-        quantity: app_commands.Range[int, 1, None],
+        quantity: app_commands.Range[int, 1, 1_000_000_000],
         league: bool = False,
     ) -> None:
         await _do_trade(interaction, ticker, "SELL", quantity, league)
@@ -468,7 +473,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def short(
         interaction: discord.Interaction,
         ticker: str,
-        quantity: app_commands.Range[int, 1, None],
+        quantity: app_commands.Range[int, 1, 1_000_000_000],
         league: bool = False,
     ) -> None:
         async with db.connection() as conn:
@@ -713,6 +718,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     expires_in_ticks=(
                         None if hours is None else int(hours * TICKS_PER_DAY / 24)
                     ),
+                    interaction_id=str(interaction.id),
                 )
             except (TradingError, ValueError) as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
@@ -739,9 +745,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def order_buy(
         interaction: discord.Interaction,
         ticker: str,
-        quantity: app_commands.Range[int, 1, None],
-        limit: app_commands.Range[float, 0.0001, None],
-        hours: app_commands.Range[float, 0.02, None] | None = None,
+        quantity: app_commands.Range[int, 1, 1_000_000_000],
+        # NUMERIC(18, 6) tops out just under 1e12; keep the bound inside it.
+        limit: app_commands.Range[float, 0.0001, 999_999_999_999],
+        hours: app_commands.Range[float, 0.02, 8760] | None = None,
         league: bool = False,
     ) -> None:
         await _place_order(interaction, ticker, "BUY", quantity, limit, hours, league)
@@ -760,9 +767,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def order_sell(
         interaction: discord.Interaction,
         ticker: str,
-        quantity: app_commands.Range[int, 1, None],
-        limit: app_commands.Range[float, 0.0001, None],
-        hours: app_commands.Range[float, 0.02, None] | None = None,
+        quantity: app_commands.Range[int, 1, 1_000_000_000],
+        limit: app_commands.Range[float, 0.0001, 999_999_999_999],
+        hours: app_commands.Range[float, 0.02, 8760] | None = None,
         league: bool = False,
     ) -> None:
         await _place_order(interaction, ticker, "SELL", quantity, limit, hours, league)
@@ -860,10 +867,20 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         async with db.connection() as conn:
             await bootstrap_user(conn, interaction.user.id)
             try:
-                price = await buy_item(conn, interaction.user.id, item.lower())
+                price = await buy_item(
+                    conn,
+                    interaction.user.id,
+                    item.lower(),
+                    interaction_id=str(interaction.id),
+                )
             except InsufficientFundsError:
                 await interaction.response.send_message(
                     "Insufficient funds for that purchase.", ephemeral=True
+                )
+                return
+            except DuplicateInteractionError:
+                await interaction.response.send_message(
+                    "That purchase was already processed.", ephemeral=True
                 )
                 return
             except (ShopError, MarginError) as exc:
@@ -1018,6 +1035,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"Status: {status}",
             f"Ledger sum (should be 0): {report.ledger_sum}",
             f"Negative user accounts (should be 0): {report.negative_user_accounts}",
+            "Accounts with balance != ledger sum (should be 0): "
+            f"{len(report.mismatched_accounts)}",
             "",
             "System account balances:",
         ]
@@ -1025,6 +1044,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"  {name:<16} {format_money(balance)}"
             for name, balance in report.system_balances.items()
         ]
+        if report.mismatched_accounts:
+            lines += [
+                "",
+                f"Drifted account ids: {report.mismatched_accounts[:20]}",
+            ]
         await interaction.response.send_message(
             "```\n" + "\n".join(lines) + "\n```", ephemeral=True
         )
@@ -1063,8 +1087,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         name: str,
         days: app_commands.Range[int, 1, 365] = 42,
         start_in_days: app_commands.Range[int, 0, 365] = 0,
-        entry_fee: app_commands.Range[int, 0, None] = 1_000,
-        stake: app_commands.Range[int, 1, None] = 100_000,
+        entry_fee: app_commands.Range[int, 0, 9_000_000_000_000_000] = 1_000,
+        stake: app_commands.Range[int, 1, 9_000_000_000_000_000] = 100_000,
     ) -> None:
         if not _is_admin(interaction):
             await interaction.response.send_message("Not authorized.", ephemeral=True)

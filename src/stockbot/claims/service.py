@@ -7,6 +7,8 @@ what a single good trade nets.
 
 from __future__ import annotations
 
+from datetime import date
+
 from psycopg import AsyncConnection
 
 from stockbot.accounts.service import bootstrap_user
@@ -23,12 +25,18 @@ def claim_amount(streak: int) -> int:
     return BASE_CLAIM_MINOR + bonus_days * STREAK_BONUS_PER_DAY_MINOR
 
 
-async def claim_daily(conn: AsyncConnection, user_id: int) -> tuple[int, int]:
+async def claim_daily(
+    conn: AsyncConnection, user_id: int, *, as_of_date: date | None = None
+) -> tuple[int, int]:
     """Claim today's faucet grant. Returns (amount_minor, streak).
 
     Raises `AlreadyClaimedTodayError` if this user already claimed today
     (server date, UTC). A streak continues if the previous claim was
     yesterday; any bigger gap resets it to 1.
+
+    `as_of_date` overrides "today" -- the simulation harness passes
+    simulated dates so a 90-simulated-day run exercises the real claim path
+    instead of collapsing into the single real date the run happens on.
     """
     async with conn.transaction():
         await bootstrap_user(conn, user_id)
@@ -49,10 +57,13 @@ async def claim_daily(conn: AsyncConnection, user_id: int) -> tuple[int, int]:
             )
             existing = await cur.fetchone()
 
-            await cur.execute("SELECT CURRENT_DATE")
-            today_row = await cur.fetchone()
-            assert today_row is not None
-            today = today_row[0]
+            if as_of_date is None:
+                await cur.execute("SELECT CURRENT_DATE")
+                today_row = await cur.fetchone()
+                assert today_row is not None
+                today = today_row[0]
+            else:
+                today = as_of_date
 
         if existing is not None:
             last_claim_date, previous_streak = existing
