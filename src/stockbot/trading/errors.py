@@ -49,6 +49,16 @@ class DuplicateInteractionError(TradingError):
         super().__init__(f"interaction {interaction_id} was already processed")
 
 
+class FeatureDisabledError(TradingError):
+    """A kill-switch config row is off (trading.enabled etc.). Raised at
+    service entry points so an exploit path can be shut off with one
+    UPDATE instead of an emergency deploy."""
+
+    def __init__(self, feature: str):
+        self.feature = feature
+        super().__init__(f"{feature} is temporarily disabled")
+
+
 class MarketClosedError(TradingError):
     """Trading while the market is in its closed session."""
 

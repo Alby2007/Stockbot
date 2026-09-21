@@ -37,6 +37,7 @@ from stockbot.ledger.service import (
 from stockbot.margin.errors import MarginError
 from stockbot.market import engine
 from stockbot.market.data import (
+    assert_feature_enabled,
     assert_market_open,
     half_spread_for,
     participation_cap,
@@ -119,6 +120,7 @@ async def place_order(
     async with conn.transaction(), conn.cursor() as cur:
         if interaction_id is not None:
             await record_idempotency_key(conn, interaction_id)
+        await assert_feature_enabled(conn, "orders.enabled", "order placement")
         await assert_market_open(conn)
         await cur.execute(
             "SELECT id, is_active FROM instruments WHERE ticker = %s", (ticker,)
@@ -431,13 +433,20 @@ async def _trigger_due_stops(conn: AsyncConnection, tick_index: int) -> int:
         return cur.rowcount
 
 
-async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
+async def match_orders(
+    conn: AsyncConnection,
+    tick_index: int,
+    stats: dict[str, int] | None = None,
+) -> int:
     """Match the book (crosses, then MM fills) for this tick.
 
     Called inside apply_tick's transaction: all instruments are already
     locked, accounts lock afterwards in ascending id order -- consistent
     with the project's lock ordering. Returns the number of fill events
     (a cross counts once, an MM fill counts once).
+
+    `stats`, when given, accumulates tick telemetry: "crosses",
+    "mm_fills", "stops_triggered" (in addition to "fills" = the return).
 
     Stop orders add an outer loop: triggering converts them to marketable
     orders whose fills move the mark, which can trigger more stops on the
@@ -446,6 +455,10 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
     participation budget across iterations so a cascade can't drain more
     depth than one tick allows.
     """
+    if stats is not None:
+        stats.setdefault("crosses", 0)
+        stats.setdefault("mm_fills", 0)
+        stats.setdefault("stops_triggered", 0)
     async with conn.cursor() as cur:
         await cur.execute(
             """
@@ -478,7 +491,9 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
     # re-anchored the next collar check to the print it just made).
     open_marks: dict[int, float] = {}
     fills = 0
-    await _trigger_due_stops(conn, tick_index)
+    triggered = await _trigger_due_stops(conn, tick_index)
+    if stats is not None:
+        stats["stops_triggered"] += triggered
     for _ in range(cascade_max):
         fills += await _match_once(
             conn,
@@ -488,8 +503,12 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
             depth_used=depth_used,
             open_marks=open_marks,
             max_fill_failures=max_fill_failures,
+            stats=stats,
         )
-        if await _trigger_due_stops(conn, tick_index) == 0:
+        triggered = await _trigger_due_stops(conn, tick_index)
+        if stats is not None:
+            stats["stops_triggered"] += triggered
+        if triggered == 0:
             break
     return fills
 
@@ -503,6 +522,7 @@ async def _match_once(
     depth_used: dict[int, int],
     open_marks: dict[int, float],
     max_fill_failures: int,
+    stats: dict[str, int] | None = None,
 ) -> int:
     """One matching pass over the book: crosses, then MM fallback.
     `depth_used` accumulates MM-filled shares per order across cascade
@@ -615,6 +635,8 @@ async def _match_once(
                     i += 1
                 continue
             fills += 1
+            if stats is not None:
+                stats["crosses"] += 1
             remaining[int(bid["id"])] -= quantity
             remaining[int(ask["id"])] -= quantity
             if remaining[int(bid["id"])] == 0:
@@ -754,6 +776,8 @@ async def _match_once(
                     depth_used.get(int(order["id"]), 0) + trade_qty
                 )
                 fills += 1
+                if stats is not None:
+                    stats["mm_fills"] += 1
         except _LimitBreach:
             # Mark-dependent, not deterministic: leave fill_failures alone.
             continue

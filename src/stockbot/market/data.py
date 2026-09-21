@@ -162,6 +162,22 @@ async def current_session(conn: AsyncConnection) -> tuple[str, int | None, dict[
     return engine.session_phase(tick, open_ticks, closed_ticks, offset), tick, cfg
 
 
+async def feature_enabled_flag(conn: AsyncConnection, key: str) -> bool:
+    """Non-raising kill-switch read for tick-internal call sites
+    (match_orders) that silently skip rather than error to a user."""
+    return await _config_float(conn, key, 1.0) != 0.0
+
+
+async def assert_feature_enabled(conn: AsyncConnection, key: str, label: str) -> None:
+    """Kill switch: raise FeatureDisabledError when a `*.enabled` config
+    row is 0. Missing rows default to enabled."""
+    if await _config_float(conn, key, 1.0) == 0.0:
+        # Lazy import for the same trading.errors cycle as below.
+        from stockbot.trading.errors import FeatureDisabledError
+
+        raise FeatureDisabledError(label)
+
+
 async def assert_market_open(conn: AsyncConnection) -> None:
     """Raise MarketClosedError when the last applied tick is a closed tick.
 

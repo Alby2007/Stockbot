@@ -14,6 +14,7 @@ from typing import Any
 
 import discord
 from discord import app_commands
+from psycopg.rows import dict_row
 
 from stockbot import db
 from stockbot.accounts.service import bootstrap_user
@@ -1141,6 +1142,67 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"buyer {f.buyer_id} / seller {f.seller_id}"
             for f in flags
         ]
+        await interaction.response.send_message(
+            "```\n" + "\n".join(lines) + "\n```", ephemeral=True
+        )
+
+    @admin_group.command(
+        name="health",
+        description="Service liveness, last tick, latest invariant audit, pool stats",
+    )
+    async def admin_health(interaction: discord.Interaction) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT service, beat_at, detail FROM service_heartbeats "
+                    "ORDER BY service"
+                )
+                heartbeats = await cur.fetchall()
+                await cur.execute(
+                    "SELECT tick_index, ts, session_state, duration_ms, fills, "
+                    "       crosses, knockouts, liquidations, events_resolved "
+                    "FROM market_ticks ORDER BY tick_index DESC LIMIT 1"
+                )
+                last_tick = await cur.fetchone()
+                await cur.execute(
+                    """
+                    SELECT DISTINCT ON (check_name) check_name, ok, detail, created_at
+                    FROM audit_results ORDER BY check_name, created_at DESC
+                    """
+                )
+                audits = await cur.fetchall()
+
+        lines = ["Heartbeats:"]
+        now = datetime.now(UTC)
+        for hb in heartbeats:
+            age = (now - hb["beat_at"]).total_seconds()
+            lines.append(
+                f"  {hb['service']:<8} {age:>6.0f}s ago  {hb['detail']}"
+            )
+        lines.append("")
+        if last_tick:
+            tick_age = (now - last_tick["ts"]).total_seconds()
+            lines.append(
+                f"Last tick: {last_tick['tick_index']} "
+                f"({last_tick['session_state']}, {tick_age:.0f}s ago) "
+                f"{last_tick['duration_ms']}ms fills={last_tick['fills']} "
+                f"crosses={last_tick['crosses']} kos={last_tick['knockouts']} "
+                f"liqs={last_tick['liquidations']} ev={last_tick['events_resolved']}"
+            )
+        lines.append("")
+        lines.append("Latest invariant audit:")
+        if not audits:
+            lines.append("  (no audit rows yet)")
+        for a in audits:
+            mark = "ok" if a["ok"] else "FAIL"
+            lines.append(f"  [{mark}] {a['check_name']}: {a['detail']}")
+        stats = db.pool_stats()
+        if stats:
+            lines.append("")
+            lines.append(f"Pool: {stats}")
         await interaction.response.send_message(
             "```\n" + "\n".join(lines) + "\n```", ephemeral=True
         )

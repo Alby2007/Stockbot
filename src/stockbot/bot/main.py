@@ -11,9 +11,13 @@ import discord
 from stockbot import db
 from stockbot.bot.commands import register_commands
 from stockbot.config import get_settings
+from stockbot.logging import setup_logging
+from stockbot.observability import write_heartbeat
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s bot %(levelname)s %(message)s")
+setup_logging("bot")
 log = logging.getLogger("stockbot.bot")
+
+HEARTBEAT_INTERVAL_SECONDS = 30
 
 
 class StockBotTree(discord.app_commands.CommandTree["StockBotClient"]):
@@ -51,6 +55,29 @@ class StockBotClient(discord.Client):
     async def setup_hook(self) -> None:
         await self.tree.sync()
 
+    async def _heartbeat_loop(self) -> None:
+        """Liveness signal: 'bot is running' means 'heartbeat younger than
+        ~2 intervals' -- including gateway latency so a dead gateway shows
+        up even while the process looks fine in docker ps."""
+        while True:
+            try:
+                async with db.connection() as conn, conn.transaction():
+                    await write_heartbeat(
+                        conn,
+                        "bot",
+                        {
+                            "gateway_latency_s": round(self.latency, 3),
+                            "guilds": len(self.guilds),
+                        },
+                    )
+            except Exception:
+                log.exception("heartbeat write failed")
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+    async def on_ready(self) -> None:
+        if getattr(self, "_heartbeat_task", None) is None:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
 
 async def run() -> None:
     settings = get_settings()
@@ -59,7 +86,11 @@ async def run() -> None:
         if not settings.discord_token:
             log.warning("DISCORD_TOKEN not set; idling instead of connecting to Discord")
             while True:
-                await asyncio.sleep(3600)
+                # Still heartbeat while idling: the service is up, just
+                # unconfigured -- /admin health should show it alive.
+                async with db.connection() as conn, conn.transaction():
+                    await write_heartbeat(conn, "bot", {"status": "idle_no_token"})
+                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         client = StockBotClient()
         await client.start(settings.discord_token)
     finally:

@@ -38,23 +38,37 @@ order by `(opened_tick, id)` and the cross prints at the maker's price;
 the mark then moves to it (`impact = ln(cross/base)` clamped by
 `max_impact` and `CIRCUIT_BREAKER_CAP`, breach → halt + `last_halt_end_tick`
 like a tick-time breach). Crosses are collared to `cross.collar_pct`
-around the mark (a stale maker is skipped, its taker tries the next
-counterparty — the collar gates book prints only; off-market orders can
-still MM-fill at the mark). Self-matches (same user_id, any scope) are
-banned; settlement failures advance the taker pointer. Pass 2 is the old
-MM fallback on remaining `quantity - filled_quantity`, now recording
-`trades.order_id`. `execute_trade` was refactored: the counterparty-
+around the **tick-open mark** (`open_marks`, anchored once per
+`match_orders` call — NOT the live mark, which each cross moves; a live
+anchor would let colluding pairs ratchet the price collar-width per
+cross). A stale maker is skipped, its taker tries the next counterparty —
+the collar gates book prints only; off-market orders can still MM-fill at
+the mark. Self-matches (same user_id, any scope) are banned; settlement
+failures advance the taker pointer. Both fill paths re-check
+`status = 'OPEN'` on the order UPDATE — a `cancel_order` committed
+between the book snapshot and the fill write rolls the fill back rather
+than overwriting 'CANCELLED'. Pass 2 is the old MM fallback on remaining
+`quantity - filled_quantity`, now recording `trades.order_id`.
+`execute_trade` was refactored: the counterparty-
 agnostic settlement core is `_apply_fill` (position upsert, borrow-fee
 settle, fee leg, trade row, margin gates, season trade counter);
 `execute_trade` = instrument lock + impact/spread + `_apply_fill` vs
 MARKET_MAKER + mark/candle update. Cross legs do NOT call
 `update_candle_with_fill` individually (would double-count volume) — the
-cross prints once.
+cross prints once. Deterministic fill failures (funds, margin, league
+state) increment `orders.fill_failures` and auto-cancel at
+`order.max_fill_failures` — without it a parked unfillable order retries
+every tick forever; the mark-dependent limit breach (`_LimitBreach`)
+deliberately does NOT count.
 
 Participation/impact notes: impact is concave — `Δimpact =
 λ·sign(N)·√(|N|/L)` (N = signed fill notional, L = instrument liquidity);
 migration 0016 rescaled `lambda_impact` to the new units anchored at a
-$500 typical order so typical-size fills are unchanged. User-initiated
+$500 typical order so typical-size fills are unchanged. Known calibration
+consequence: at `participation_cap` notional (~10% of liquidity) the
+concave impact is ~1bp vs ~10–20bp under the old linear model — whales
+move the market nearly for free via the MM, which materially weakens
+impact as the anti-manipulation lever for large trades. User-initiated
 fills are capped at `liquidity.participation_cap`·liquidity notional
 (`InsufficientDepthError`, atomic — no partial market fills); forced
 liquidation (`_liquidate_leg`) and KO closes bypass the cap so positions
@@ -74,34 +88,68 @@ to the counterparty's limit, two marketable orders cross at the mark).
 `order.stop_cascade_max_iters` with `depth_used` carrying the per-tick
 participation budget across cascade iterations — post-0016 lambdas are
 ~0.01, so one fill moves an illiquid mark ≪1%; cascades need several
-orders or several ticks to matter. Dividends: `events.kind='DIVIDEND'`
-(scheduled like earnings for a hash-selected payer subset), funded by
-`drift_offset` — a per-tick drift reduction over the accrual window
-(aggregate `instruments.dividend_drift_offset` recomputed in
-`refresh_next_event_ticks`), so payouts redistribute rather than mint.
-Ex-date: `base_price` and `fundamental_value` both drop by the dividend
-(permanent, not the decaying impact term), MARKET_MAKER pays longs
-(`reason='DIVIDEND'`), and shorts accrue `positions.dividends_accrued`
-(minor units) settled to MARKET_MAKER on cover/liquidation — the cash
-CHECK means shorts can never be debited directly. Bounded shorts are NOT
-charged (collateralized derivative, not borrowed stock).
+orders or several ticks to matter. `depth_used` is keyed by **order id**,
+not instrument: N resting orders on one instrument get N×cap notional per
+tick (consistent with `execute_trade`'s per-fill cap — splitting a big
+order multiplies throughput). Dividends: `events.kind='DIVIDEND'`
+(scheduled like earnings for a hash-selected payer subset). The ex-date
+drop is the *entire* funding mechanism: MARKET_MAKER pays longs
+(`reason='DIVIDEND'`) and is short the aggregate book, so its mark-to-
+market on the drop offsets the payout — self-funding. The old per-tick
+`drift_offset` pre-bleed was retired (0020): it plus the ex-drop
+suppressed ~2×div per cycle — a short-side arb. `drift_offset`/
+`instruments.dividend_drift_offset` remain as vestigial columns that
+always evaluate to NULL/0. `base_price` and `fundamental_value` drop by
+the dividend (permanent, not the decaying impact term), and shorts accrue
+`positions.dividends_accrued` (minor units) settled to MARKET_MAKER on
+cover/liquidation — the cash CHECK means shorts can never be debited
+directly. Bounded shorts are NOT charged (collateralized derivative, not
+borrowed stock). Events on INDEX instruments resolve as no-ops (marked
+resolved, nothing applied) — a hand-inserted index DIVIDEND would
+otherwise pay index longs cash for free.
 
 Sessions notes: `session_phase(tick, open, closed, offset)` in engine.py
 is pure -- session state derives from the tick index, no shared flag.
 Closed ticks still write `market_ticks` (`session_state='CLOSED'`) and
 flat volume-0 candles, accrue borrow fees, and run `seasons.on_tick` --
 everything else (events, steps, KOs, matching, margin sweep) is open-only.
-The first open tick after a close (`cycle_pos == 0`) steps once with
-`dt=closed_ticks` (the overnight gap, breaker-bounded like any move) and
-applies `session.open_impact_reset`. "Now" = phase of `MAX(tick_index)`;
+The first open tick after a close (`cycle_pos == 0` and tick_index > 0)
+steps once with `dt=closed_ticks` (the overnight gap, breaker-bounded
+like any move) and applies `session.open_impact_reset`. Tick 0 is the
+exception: the market never closed, so the first-ever tick steps with
+dt=1 -- otherwise it "reopens" with a closed_ticks gap it never had.
+"Now" = phase of `MAX(tick_index)`;
 `assert_market_open` (market/data.py) gates `execute_trade`,
 `place_order`, and both bounded-short endpoints with `MarketClosedError`
 -- imported lazily there because `market.data -> trading.errors ->
 trading.__init__ -> trading.service -> margin -> market.data` is a real
-import cycle. Dividend drift offsets are divided by `window *
-open_fraction` since only open ticks step. Tests flip `session.*` config
-(open=2, closed=4) to cycle phases in a handful of ticks; the phase
-offset shifts where the cycle lands relative to tick 0.
+import cycle. Tests flip `session.*` config (open=2, closed=4) to cycle
+phases in a handful of ticks; the phase offset shifts where the cycle
+lands relative to tick 0.
+
+Observability notes: every `apply_tick` writes per-tick stats on the
+`market_ticks` row itself (duration_ms, fills, crosses, stops_triggered,
+knockouts, liquidations, events_resolved) plus one structured log line
+(`tick=N phase=… crosses=… ms=…`) — tick 4532 is fully re-describable
+from one row + one log line. `match_orders`/`resolve_due_events` take an
+optional `stats` dict out-param so the tick counts outcomes without
+changing their return types. `_post_tick` runs the periodic invariant
+audit every `audit.every_n_ticks` (default 60) in its own transaction —
+ledger_sum_zero, no_negative_balances, balance_matches_ledger,
+fund_reconciles → `audit_results` rows + log.critical on drift; audit
+failures are swallowed (logged) so a broken audit can never poison a
+tick. `service_heartbeats` is upserted per service per interval (market:
+every tick incl. the CLOSED branch; bot: periodic loop) — "alive but
+wedged" = heartbeat older than ~2 intervals, surfaced by `/admin health`
+alongside `db.pool_stats()`. `market/main.py` tracks consecutive tick
+failures and escalates to log.critical at 3. Kill switches live in
+`config` (`trading.enabled`, `orders.enabled`, `shorts.enabled`):
+service entry points raise `FeatureDisabledError` while
+`match_orders` in the tick just no-ops (checked via
+`data.feature_enabled_flag`, the non-raising variant). Trade rows carry
+fill provenance: `trades.half_spread` and `trades.impact_delta` — "why
+did this fill cost X" is a query. Shared `stockbot/logging.py` owns
+handler setup for both service mains.
 
 Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
 preserved -- short proceeds credit to cash and are spendable; leverage is
@@ -156,6 +204,14 @@ can't be referenced in its own transaction -- that's why the enum lives in
   reuses one connection, do the same audit: every bare statement before the
   first `conn.transaction()` block needs an explicit commit (or just don't
   run bare statements on a connection you intend to reuse across a loop).
+- `bootstrap_user` was the live instance of that trap: a bare
+  `SELECT 1 FROM users` pre-read both opened the poison transaction AND
+  raced as a check-then-act (two concurrent first-uses could both grant).
+  Fix pattern: never pre-read for check-then-insert — derive "was I
+  first?" from `cur.rowcount` on `INSERT ... ON CONFLICT DO NOTHING`
+  itself (concurrent inserts serialize on the unique index; only the
+  winner sees rowcount 1), and run the create + one-time grant inside a
+  single `conn.transaction()`.
 - Short-lived per-command connections (`async with db.connection() as conn:`
   then one or more `service_function(conn, ...)` calls, as in
   `bot/commands.py`) don't have this problem: the pool rolls back any

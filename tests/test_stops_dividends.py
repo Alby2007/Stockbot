@@ -514,3 +514,29 @@ async def test_bounded_shorts_ignore_dividends(conn: AsyncConnection) -> None:
         )
         (count,) = await cur.fetchone()
     assert count == 0
+
+
+async def test_index_dividend_resolves_without_paying(conn: AsyncConnection) -> None:
+    """Hand-inserted events on the index are swallowed at resolve:
+    scheduling already skips INDEX, but a manual DIVIDEND on SBX40 must
+    not pay index longs cash with no real price drop."""
+    await bootstrap_user(conn, 6104)
+    await _fund(conn, 6104, 10_000_000)
+    await execute_trade(conn, user_id=6104, ticker="SBX40", side="BUY", quantity=2)
+    await _insert_dividend(conn, "SBX40", 10.0)
+    account_id = await get_user_account_id(conn, 6104)
+    cash_before = await get_balance(conn, account_id)
+
+    await apply_tick(conn, "div-index-seed")
+
+    assert await get_balance(conn, account_id) == cash_before
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT COUNT(*) FROM ledger_entries WHERE reason = 'DIVIDEND'"
+        )
+        assert (await cur.fetchone())[0] == 0
+        await cur.execute(
+            "SELECT resolved FROM events e JOIN instruments i ON i.id = e.instrument_id "
+            "WHERE i.ticker = 'SBX40' AND e.kind = 'DIVIDEND'"
+        )
+        assert (await cur.fetchone())[0] is True

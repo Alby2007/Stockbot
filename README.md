@@ -5,7 +5,9 @@ shared currency, a factor-model price engine with decaying user price
 impact, and a phased path from long-only trading to true margin shorts with
 liquidation. See the design doc for the full plan.
 
-Current status: **Phase 2 complete**, plus resting limit orders on top.
+Current status: **all phases complete**, including the liquidity plan
+(phases A–E: dynamic spreads, crossing book, participation cap + concave
+impact, stop orders + dividends, trading sessions with overnight gaps).
 The tick engine is live (factor model, impact decay, mean reversion,
 circuit breaker, deterministic replay) over 40 seeded instruments across 8
 sectors plus the SBX-40 index. Working end to end: `/balance`,
@@ -13,7 +15,8 @@ sectors plus the SBX-40 index. Working end to end: `/balance`,
 `/sectors`, `/chart`, `/news`, `/calendar`, the shop (`/shop list`,
 `/shop buy`), bounded shorts (`/short`, `/shorts`, `/cover`), true margin
 (`margin_tier` shop item, `/margin`, `/collateral`, `/liquidations`),
-seasons/league (`/league info|join|standings`), limit orders (`/order`),
+seasons/league (`/league info|join|standings`), resting orders
+(`/order buy|sell|list|cancel` — limit, stop, stop-limit),
 admin tools (`/admin`), and the economy simulation harness
 (`python -m stockbot.simulation.harness`).
 

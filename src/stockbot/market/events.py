@@ -277,6 +277,7 @@ async def resolve_due_events(
     rng: np.random.Generator,
     current_tick: int,
     fundamentals: dict[int, float],
+    stats: dict[str, int] | None = None,
 ) -> tuple[dict[int, float], dict[int, Decimal]]:
     """Apply any events due this tick, mutating and returning
     `fundamentals` (instrument_id -> fundamental value). Earnings/news are
@@ -286,7 +287,9 @@ async def resolve_due_events(
     DIVIDEND events resolved this tick: the caller subtracts it from the
     instrument's base price (the immediate ex-date drop) while this
     function subtracts it from the fundamental (permanent value loss).
+    `stats["events_resolved"]` accumulates the count when given.
     """
+    resolved_count = 0
     async with conn.cursor(row_factory=dict_row) as cur:
         # ORDER BY matters: earnings magnitudes and reschedule jitter are
         # drawn from `rng` in row order, so an unordered scan would assign
@@ -319,6 +322,7 @@ async def resolve_due_events(
                     "UPDATE events SET resolved = TRUE WHERE id = %s",
                     (event["id"],),
                 )
+            resolved_count += 1
             continue
 
         if event["kind"] == "DIVIDEND":
@@ -332,6 +336,7 @@ async def resolve_due_events(
                 await cur.execute(
                     "UPDATE events SET resolved = TRUE WHERE id = %s", (event["id"],)
                 )
+            resolved_count += 1
             continue
 
         if event["kind"] == "EARNINGS":
@@ -347,6 +352,7 @@ async def resolve_due_events(
                 "UPDATE events SET resolved = TRUE, magnitude = %s WHERE id = %s",
                 (magnitude, event["id"]),
             )
+        resolved_count += 1
 
         if event["kind"] == "EARNINGS":
             jitter = int(rng.integers(-EARNINGS_JITTER_TICKS, EARNINGS_JITTER_TICKS + 1))
@@ -360,6 +366,8 @@ async def resolve_due_events(
                     (instrument_id, current_tick, next_resolve),
                 )
 
+    if stats is not None:
+        stats["events_resolved"] = stats.get("events_resolved", 0) + resolved_count
     return fundamentals, dividend_drops
 
 

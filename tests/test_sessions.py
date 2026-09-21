@@ -324,3 +324,36 @@ async def _borrow_fees(conn: AsyncConnection, user_id: int) -> Decimal:
         row = await cur.fetchone()
         assert row is not None
         return Decimal(row[0])
+
+
+async def test_first_tick_does_not_gap(conn: AsyncConnection) -> None:
+    """Tick 0 must not 'reopen' with dt=closed_ticks -- the market never
+    closed. With a large drift and all vol terms zeroed, the first tick's
+    move is ~drift*1, not ~drift*closed_ticks."""
+    await _set_session(conn, 1, 10)
+    ticker = await _first_ticker(conn)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE instruments SET drift = 0.1, sigma = 0, fundamental_sigma = 0,
+                fundamental_value = base_price, beta = 0, gamma = 0, kappa = 0
+            WHERE ticker = %s
+            RETURNING base_price
+            """,
+            (ticker,),
+        )
+        seed_base = float((await cur.fetchone())[0])
+
+    tick = await apply_tick(conn, SEED)
+    assert tick == 0
+
+    quoted = await _quoted(conn, ticker)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT circuit_halted_until_tick FROM instruments WHERE ticker = %s",
+            (ticker,),
+        )
+        assert (await cur.fetchone())[0] is None
+    move = math.log(quoted / seed_base)
+    # dt=1 -> ~0.1; the buggy gap (dt=10) -> ~1.0, clipped by the breaker.
+    assert 0.05 < move < 0.2

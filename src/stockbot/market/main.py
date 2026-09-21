@@ -17,9 +17,11 @@ from psycopg import AsyncConnection
 from stockbot import db
 from stockbot.compliance.wash_trade import scan_for_wash_trades
 from stockbot.config import get_settings
+from stockbot.logging import setup_logging
 from stockbot.market.tick import apply_tick
+from stockbot.observability import write_heartbeat
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s market %(levelname)s %(message)s")
+setup_logging("market")
 log = logging.getLogger("stockbot.market")
 
 # Arbitrary fixed key identifying "the market tick engine" lock, shared by all
@@ -29,6 +31,10 @@ ADVISORY_LOCK_KEY = 0x5350_4B_54  # "stock" (truncated), just needs to be a stab
 TICK_INTERVAL_SECONDS = 60
 WASH_TRADE_SCAN_EVERY_N_TICKS = 10
 RECONNECT_DELAY_SECONDS = 5
+# Consecutive tick failures before we escalate to log.critical and stamp
+# the heartbeat with the streak (a poison-pill row wedging match_orders
+# is invisible to `docker ps` otherwise).
+TICK_FAILURE_ESCALATE_AFTER = 5
 
 
 async def _tick_loop(conn: AsyncConnection, master_seed: str) -> None:
@@ -40,11 +46,12 @@ async def _tick_loop(conn: AsyncConnection, master_seed: str) -> None:
     connection and re-acquires the lock -- rather than letting `apply_tick`
     fail every interval forever on a conn the pool will never heal.
     """
+    consecutive_failures = 0
     while True:
         start = asyncio.get_running_loop().time()
         try:
             tick_index = await apply_tick(conn, master_seed)
-            log.info("applied tick %d", tick_index)
+            consecutive_failures = 0
             if tick_index % WASH_TRADE_SCAN_EVERY_N_TICKS == 0:
                 flags = await scan_for_wash_trades(conn)
                 if flags:
@@ -53,11 +60,33 @@ async def _tick_loop(conn: AsyncConnection, master_seed: str) -> None:
             log.exception("database connection lost; re-acquiring the advisory lock")
             return
         except Exception:
-            log.exception("tick failed; will retry next interval")
+            consecutive_failures += 1
+            log.exception(
+                "tick failed (%d consecutive); will retry next interval",
+                consecutive_failures,
+            )
             if conn.closed or conn.broken:
                 # Driver didn't surface it as OperationalError, but the conn
                 # (and the lock with it) is dead -- bail out the same way.
                 return
+            if consecutive_failures >= TICK_FAILURE_ESCALATE_AFTER:
+                log.critical(
+                    "tick has failed %d times in a row -- the market is "
+                    "wedged on something deterministic; investigate NOW",
+                    consecutive_failures,
+                )
+                try:
+                    # Best-effort: stamps the failure streak where
+                    # /admin health and external checks can see it. The
+                    # failed tick tx rolled back, so this needs its own.
+                    async with conn.transaction():
+                        await write_heartbeat(
+                            conn,
+                            "market",
+                            {"consecutive_failures": consecutive_failures},
+                        )
+                except Exception:
+                    pass
         elapsed = asyncio.get_running_loop().time() - start
         await asyncio.sleep(max(0.0, TICK_INTERVAL_SECONDS - elapsed))
 

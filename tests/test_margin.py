@@ -18,6 +18,7 @@ from stockbot.margin.errors import (
     ShortInterestLimitError,
 )
 from stockbot.margin.service import (
+    accrue_borrow_fees,
     check_and_liquidate,
     compute_health,
     margin_config,
@@ -441,3 +442,24 @@ async def test_adl_absorption_is_not_a_fund_outflow(conn: AsyncConnection) -> No
     # flows - seed == everything the fund actually moved since seeding;
     # the drained balance proves the ADL amount never left the fund.
     assert int(flows) - 50_000_00 == await get_balance(conn, fund_id)
+
+
+async def test_borrow_fees_accrue_with_zero_si_cap(conn: AsyncConnection) -> None:
+    """margin.max_short_interest_pct = 0 must not NULL the utilization
+    divisor -- fees still accrue instead of crashing on Decimal(None)
+    at the next cover."""
+    account_id = await bootstrap_user(conn, 2016)
+    await _give_cash(conn, account_id, 1_000_000)
+    await _grant_tier(conn, 2016)
+    ticker = await _first_ticker(conn)
+    await execute_trade(conn, user_id=2016, ticker=ticker, side="SELL", quantity=2)
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = 0 WHERE key = 'margin.max_short_interest_pct'"
+        )
+    await refresh_short_interest(conn)
+    await accrue_borrow_fees(conn)
+
+    pos = await _position(conn, 2016, ticker)
+    assert pos is not None and pos[2] > 0

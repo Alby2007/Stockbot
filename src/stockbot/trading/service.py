@@ -38,6 +38,7 @@ from stockbot.margin.errors import (
 )
 from stockbot.market import engine
 from stockbot.market.data import (
+    assert_feature_enabled,
     assert_market_open,
     current_tick_index,
     half_spread_for,
@@ -114,6 +115,8 @@ async def _apply_fill(
     maker_taker: str | None = None,
     counterparty_user_id: int | None = None,
     order_id: int | None = None,
+    half_spread: Decimal | None = None,
+    impact_delta: Decimal | None = None,
 ) -> TradeResult:
     """Settle one side of a fill: cash leg, fee leg, position upsert, trade
     row, and post-fill margin gates.
@@ -322,9 +325,10 @@ async def _apply_fill(
             INSERT INTO trades (
                 user_id, instrument_id, side, quantity, fill_price,
                 notional_minor, fee_minor, cash_transfer_id, fee_transfer_id,
-                tick_index, season_id, maker_taker, counterparty_user_id, order_id
+                tick_index, season_id, maker_taker, counterparty_user_id,
+                order_id, half_spread, impact_delta
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -342,6 +346,8 @@ async def _apply_fill(
                 maker_taker,
                 counterparty_user_id,
                 order_id,
+                half_spread,
+                impact_delta,
             ),
         )
         row = await cur.fetchone()
@@ -423,6 +429,7 @@ async def execute_trade(
     async with conn.transaction():
         if interaction_id is not None:
             await record_idempotency_key(conn, interaction_id)
+        await assert_feature_enabled(conn, "trading.enabled", "trading")
         await assert_market_open(conn)
 
         # Lock ordering: instrument before account.
@@ -488,6 +495,7 @@ async def execute_trade(
                     1 + cfg["margin.squeeze_lambda_boost"] * over
                 )
         spread_cfg = await spread_config(conn)
+        half_spread = half_spread_for(instrument, current_tick, spread_cfg)
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=impact_before,
@@ -495,7 +503,7 @@ async def execute_trade(
             liquidity=liquidity,
             lambda_impact=lambda_impact,
             max_impact=max_impact,
-            half_spread=half_spread_for(instrument, current_tick, spread_cfg),
+            half_spread=half_spread,
         )
         fill_price = Decimal(str(round(fill_price_f, 6)))
 
@@ -524,6 +532,8 @@ async def execute_trade(
             cash_leg="pay" if side == "BUY" else "receive",
             counterparty_account_id=market_maker_id,
             order_id=order_id,
+            half_spread=Decimal(str(round(half_spread, 8))),
+            impact_delta=Decimal(str(impact_after - impact_before)),
         )
 
         async with conn.cursor() as cur:

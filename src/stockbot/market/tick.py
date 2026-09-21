@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
+import time
 
 from psycopg import AsyncConnection, sql
 from psycopg.rows import dict_row
 
 from stockbot.margin import service as margin
 from stockbot.market import data, engine, events
+from stockbot.observability import (
+    audit_every_n_ticks,
+    run_periodic_audit,
+    write_heartbeat,
+)
 from stockbot.orders import service as orders
 from stockbot.seasons import service as seasons
 from stockbot.shorts import service as shorts
+
+log = logging.getLogger("stockbot.market.tick")
 
 
 async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
@@ -35,6 +44,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
     -- events due during the close resolve into that gap, and the
     knockout/margin sweeps fire immediately after it.
     """
+    started = time.perf_counter()
     async with conn.transaction():
         async with conn.cursor() as cur:
             await cur.execute("SELECT COALESCE(MAX(tick_index), -1) + 1 FROM market_ticks")
@@ -74,6 +84,22 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             # depends on prices moving does.
             await margin.accrue_borrow_fees(conn)
             await seasons.on_tick(conn, tick_index)
+            duration_ms = (time.perf_counter() - started) * 1000
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE market_ticks SET duration_ms = %s WHERE tick_index = %s",
+                    (round(duration_ms, 3), tick_index),
+                )
+            await write_heartbeat(
+                conn, "market", {"tick": tick_index, "phase": "CLOSED"}
+            )
+            log.info(
+                "tick=%d phase=CLOSED steps=0 events=0 crosses=0 mm_fills=0 "
+                "stops=0 kos=0 liqs=0 ms=%.1f",
+                tick_index,
+                duration_ms,
+            )
+            await _post_tick(conn, tick_index)
             return tick_index
 
         # OPEN tick. Position in the cycle 0 means this is the first tick
@@ -122,9 +148,10 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         events_rng = engine.rng_for_tick(f"{master_seed}|events", tick_index)
         await events.schedule_initial_earnings(conn, events_rng, tick_index)
         await events.schedule_initial_dividends(conn, events_rng, tick_index)
+        stats: dict[str, int] = {}
         fundamentals = {row["id"]: float(row["fundamental_value"]) for row in instrument_rows}
         fundamentals, dividend_drops = await events.resolve_due_events(
-            conn, events_rng, tick_index, fundamentals
+            conn, events_rng, tick_index, fundamentals, stats=stats
         )
         await events.maybe_create_news(conn, events_rng, tick_index, instrument_rows)
         await events.refresh_next_event_ticks(conn)
@@ -313,12 +340,14 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # Bounded shorts: knock out any position whose instrument reached its
         # knockout price this tick. Before season snapshots so closed shorts
         # stop contributing to equity.
-        await shorts.sweep_knockouts(conn, tick_index)
+        kos = await shorts.sweep_knockouts(conn, tick_index)
 
         # Resting limit orders: fill any whose limit the new marks satisfy.
         # Before the margin sweep so a fill's impact and equity change land
-        # in this tick's margin state, not next tick's.
-        await orders.match_orders(conn, tick_index)
+        # in this tick's margin state, not next tick's. Skipped entirely when
+        # the orders.enabled kill switch is off -- resting orders wait.
+        if await data.feature_enabled_flag(conn, "orders.enabled"):
+            await orders.match_orders(conn, tick_index, stats=stats)
 
         # Phase 2 margin maintenance, all inside the tick transaction where
         # every instrument is already locked: refresh published short
@@ -329,10 +358,63 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # benign).
         await margin.refresh_short_interest(conn)
         await margin.accrue_borrow_fees(conn)
-        await margin.sweep_undermargined(conn, tick_index)
+        liqs = await margin.sweep_undermargined(conn, tick_index)
 
         # Season lifecycle: activate due seasons, write day-boundary equity
         # snapshots, close finished seasons (all inside this tick's tx).
         await seasons.on_tick(conn, tick_index)
 
+        duration_ms = (time.perf_counter() - started) * 1000
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE market_ticks SET
+                    duration_ms = %s, fills = %s, crosses = %s,
+                    stops_triggered = %s, knockouts = %s, liquidations = %s,
+                    events_resolved = %s
+                WHERE tick_index = %s
+                """,
+                (
+                    round(duration_ms, 3),
+                    stats.get("crosses", 0) + stats.get("mm_fills", 0),
+                    stats.get("crosses", 0),
+                    stats.get("stops_triggered", 0),
+                    kos,
+                    liqs,
+                    stats.get("events_resolved", 0),
+                    tick_index,
+                ),
+            )
+        await write_heartbeat(
+            conn, "market", {"tick": tick_index, "phase": "OPEN"}
+        )
+
+    log.info(
+        "tick=%d phase=OPEN steps=%d events=%d crosses=%d mm_fills=%d "
+        "stops=%d kos=%d liqs=%d ms=%.1f",
+        tick_index,
+        len(results),
+        stats.get("events_resolved", 0),
+        stats.get("crosses", 0),
+        stats.get("mm_fills", 0),
+        stats.get("stops_triggered", 0),
+        kos,
+        liqs,
+        duration_ms,
+    )
+    await _post_tick(conn, tick_index)
     return tick_index
+
+
+async def _post_tick(conn: AsyncConnection, tick_index: int) -> None:
+    """Post-commit tick work: heartbeat-adjacent, non-price tasks that
+    must not roll back the tick if they fail. Currently the periodic
+    invariant audit (every `audit.every_n_ticks`, own transaction)."""
+    if tick_index > 0 and tick_index % await audit_every_n_ticks(conn) == 0:
+        try:
+            async with conn.transaction():
+                await run_periodic_audit(conn, tick_index)
+        except Exception:
+            # The audit must never poison the tick loop -- a failed audit
+            # *query* is itself the signal.
+            log.exception("periodic audit failed at tick %d", tick_index)

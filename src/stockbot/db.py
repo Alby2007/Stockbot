@@ -34,6 +34,18 @@ def get_pool() -> AsyncConnectionPool:
     return _pool
 
 
+def pool_stats() -> dict[str, int]:
+    """psycopg_pool's own metrics (size/available/waiting), empty before
+    init or if the pool doesn't expose stats. Surfaced by /admin health."""
+    if _pool is None:
+        return {}
+    try:
+        raw = _pool.get_stats()
+    except Exception:
+        return {}
+    return {str(k): int(v) for k, v in raw.items() if isinstance(v, int)}
+
+
 @asynccontextmanager
 async def connection() -> AsyncIterator[AsyncConnection]:
     """Yield a pooled connection. Callers manage their own transactions."""
