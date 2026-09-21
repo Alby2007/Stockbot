@@ -135,12 +135,18 @@ def _check_ledger(cur: psycopg.Cursor) -> Finding:
 
 def _check_config_sanity(cur: psycopg.Cursor) -> Finding:
     cur.execute("SELECT key, value FROM config")
-    rows = {key: float(value) for key, value in cur.fetchall()}
+    raw_rows = cur.fetchall()
+    rows: dict[str, float] = {}
     problems: list[str] = []
+    for key, value in raw_rows:
+        try:
+            rows[key] = float(value)
+        except (TypeError, ValueError):
+            problems.append(f"{key}: non-numeric value {value!r}")
     for key, (lo, hi) in CONFIG_BOUNDS.items():
-        if key not in rows:
+        if key not in rows and not any(p.startswith(f"{key}:") for p in problems):
             problems.append(f"{key}: missing row")
-        elif not lo <= rows[key] <= hi:
+        elif key in rows and not lo <= rows[key] <= hi:
             problems.append(f"{key}: {rows[key]} outside [{lo}, {hi}]")
     unknown = sorted(set(rows) - set(CONFIG_BOUNDS))
     for key in unknown:

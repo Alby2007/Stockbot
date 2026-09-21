@@ -102,6 +102,16 @@ def replay_factors(
     sector_keys = sorted(row[0] for row in cur.fetchall())
 
     for tick_index, stored_mf, stored_sf, phase in rows:
+        # Cross-check the recorded phase: a wrong stored session_state is
+        # itself a bug (a CLOSED row would silently skip factor replay).
+        expected_phase = engine.session_phase(
+            tick_index, open_ticks, closed_ticks, offset
+        )
+        if phase != expected_phase:
+            report.factor_mismatches.append(
+                f"tick {tick_index}: session_state stored={phase} "
+                f"expected={expected_phase} (current session config)"
+            )
         if phase == "CLOSED":
             report.ticks_skipped_closed += 1
             continue

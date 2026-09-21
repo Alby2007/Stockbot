@@ -9,7 +9,7 @@ from psycopg import AsyncConnection
 from stockbot.accounts.service import bootstrap_user
 from stockbot.market.tick import apply_tick
 from stockbot.orders.service import place_order
-from stockbot.shorts.service import open_bounded_short
+from stockbot.shorts.service import cover_bounded_short, open_bounded_short
 from stockbot.trading.errors import FeatureDisabledError
 from stockbot.trading.service import execute_trade
 
@@ -119,6 +119,56 @@ async def test_kill_switches_block_user_paths(conn: AsyncConnection) -> None:
             "SELECT status FROM orders WHERE user_id = 8001", ()
         )
         assert (await cur.fetchone())[0] == "OPEN"
+
+
+async def test_trading_halt_does_not_burn_fill_failures(
+    conn: AsyncConnection,
+) -> None:
+    """FeatureDisabledError is a global transient, not an
+    order-deterministic failure: with trading.enabled off, resting
+    marketable orders just wait -- they must not accumulate strikes
+    toward auto-cancel."""
+    await bootstrap_user(conn, 8003)
+    ticker = await _first_ticker(conn)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT quoted_price FROM instruments WHERE ticker = %s", (ticker,)
+        )
+        mark = float((await cur.fetchone())[0])
+    result = await place_order(
+        conn, user_id=8003, ticker=ticker, side="BUY", quantity=1,
+        limit_price=mark * 2, stop_price=None,
+    )
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = 0 WHERE key = 'trading.enabled'"
+        )
+    for _ in range(6):  # one more than order.max_fill_failures (5)
+        await apply_tick(conn, SEED)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT status, fill_failures FROM orders WHERE id = %s",
+            (result.order_id,),
+        )
+        status, strikes = await cur.fetchone()
+    assert status == "OPEN" and strikes == 0
+
+
+async def test_cover_bounded_short_survives_shorts_kill_switch(
+    conn: AsyncConnection,
+) -> None:
+    """Closes reduce risk, so a shorts halt must not trap users in open
+    positions -- cover stays available while opens are gated."""
+    await bootstrap_user(conn, 8004)
+    ticker = await _first_ticker(conn)
+    result = await open_bounded_short(conn, user_id=8004, ticker=ticker, quantity=1)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = 0 WHERE key = 'shorts.enabled'"
+        )
+    # Must NOT raise FeatureDisabledError.
+    covered = await cover_bounded_short(conn, user_id=8004, short_id=result.short_id)
+    assert covered is not None
 
 
 async def test_fill_provenance_on_trade_row(conn: AsyncConnection) -> None:

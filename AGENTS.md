@@ -307,8 +307,24 @@ can't be referenced in its own transaction -- that's why the enum lives in
   off against the KO + capped-risk payoff. SBX40 has float_shares=0 so
   its short-interest cap is vacuous (the one instrument with unbounded
   shorting; margin gates still bound it).
-- Backlog: `idempotency_keys` and resolved `events` grow forever -- add a
-  retention cleanup when they get big.
+- Backlog: `idempotency_keys`, resolved `events`, `command_stats`,
+  `audit_results`, and `market_ticks` grow forever -- add a retention
+  cleanup when they get big.
+- `_post_tick`'s config read lives inside its `conn.transaction()` on
+  purpose: the first version ran `audit_every_n_ticks(conn)` as a bare
+  SELECT on the market's long-lived connection, opening the never-
+  committed implicit transaction from the bootstrap_user trap -- every
+  subsequent apply_tick nested as a savepoint and committed nothing
+  from tick 2 onward. Rule: on a reused long-lived connection, EVERY
+  statement goes inside `conn.transaction()`; tests can't see this
+  because the fixture's outer rollback makes nesting normal (the
+  regression tests in test_concurrency.py use plain/scratch conns).
+- Kill-switch semantics: `trading.enabled`/`orders.enabled`/
+  `shorts.enabled` halt NEW exposure only. `FeatureDisabledError` is a
+  global transient -- match_orders exempts it from fill_failures strikes
+  (a trading halt must not auto-cancel the book), and
+  `cover_bounded_short` is intentionally ungated so a shorts halt can't
+  trap users in open positions (same reason `cancel_order` is ungated).
 
 ## Environment
 

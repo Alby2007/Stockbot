@@ -410,11 +410,17 @@ async def _post_tick(conn: AsyncConnection, tick_index: int) -> None:
     """Post-commit tick work: heartbeat-adjacent, non-price tasks that
     must not roll back the tick if they fail. Currently the periodic
     invariant audit (every `audit.every_n_ticks`, own transaction)."""
-    if tick_index > 0 and tick_index % await audit_every_n_ticks(conn) == 0:
-        try:
-            async with conn.transaction():
+    try:
+        async with conn.transaction():
+            # The config read must live INSIDE this transaction: a bare
+            # SELECT on this long-lived connection would open an implicit
+            # transaction that never commits, silently demoting every
+            # subsequent apply_tick's conn.transaction() to a savepoint --
+            # ticks would "succeed" while writing nothing (the
+            # bootstrap_user trap from AGENTS.md, but for the market).
+            if tick_index > 0 and tick_index % await audit_every_n_ticks(conn) == 0:
                 await run_periodic_audit(conn, tick_index)
-        except Exception:
-            # The audit must never poison the tick loop -- a failed audit
-            # *query* is itself the signal.
-            log.exception("periodic audit failed at tick %d", tick_index)
+    except Exception:
+        # The audit must never poison the tick loop -- a failed audit
+        # *query* is itself the signal.
+        log.exception("periodic audit failed at tick %d", tick_index)

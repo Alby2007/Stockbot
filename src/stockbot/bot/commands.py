@@ -1189,11 +1189,15 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
         lines = ["Heartbeats:"]
         now = datetime.now(UTC)
+        seen = {hb["service"] for hb in heartbeats}
         for hb in heartbeats:
             age = (now - hb["beat_at"]).total_seconds()
             lines.append(
                 f"  {hb['service']:<8} {age:>6.0f}s ago  {hb['detail']}"
             )
+        for service in ("market", "bot"):
+            if service not in seen:
+                lines.append(f"  {service:<8} never reported")
         lines.append("")
         if last_tick:
             tick_age = (now - last_tick["ts"]).total_seconds()

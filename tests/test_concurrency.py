@@ -12,29 +12,35 @@ re-verify the rows the first run committed.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
 
+import pytest
 import pytest_asyncio
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, conninfo, pq
 
 from stockbot.accounts.service import STARTING_GRANT, bootstrap_user
 from stockbot.config import get_settings
+from stockbot.market.tick import _post_tick, apply_tick
+from stockbot.migrate import run_migrations
 
 _CROSS_CONN_USER = 987_654_321
 _RACE_USER = 987_654_322
 
 
-async def _real_conn() -> AsyncConnection:
-    """A committed-mode connection: mirrors production, where every
-    service-level transaction commits immediately."""
+async def _real_conn(*, autocommit: bool = True) -> AsyncConnection:
+    """A committed-mode connection. `autocommit=True` mirrors production
+    service behavior; `autocommit=False` is the sharper test mode -- a
+    bare-statement regression (the implicit-transaction poison) only
+    fails there, since self-committing statements mask it."""
     return await AsyncConnection.connect(
-        get_settings().test_database_url, autocommit=True
+        get_settings().test_database_url, autocommit=autocommit
     )
 
 
 @pytest_asyncio.fixture
 async def real_conn() -> AsyncIterator[AsyncConnection]:
-    connection = await _real_conn()
+    connection = await _real_conn(autocommit=False)
     try:
         yield connection
     finally:
@@ -91,3 +97,70 @@ async def test_concurrent_bootstrap_grants_once(real_conn: AsyncConnection) -> N
             (account_a,),
         )
         assert (await cur.fetchone())[0] == 1
+
+
+async def test_post_tick_leaves_connection_idle() -> None:
+    """Regression for the _post_tick poison: a bare SELECT on the market's
+    long-lived connection opened an implicit transaction that never
+    committed, silently demoting every later apply_tick's transaction to
+    a savepoint -- ticks 'succeeded' while writing nothing. The bug's
+    signature is the connection being left INTRANS after post-tick work."""
+    conn = await _real_conn(autocommit=False)
+    try:
+        await _post_tick(conn, 1)
+        assert conn.pgconn.transaction_status == pq.TransactionStatus.IDLE
+    finally:
+        await conn.close()  # rolls back any leftover implicit tx
+
+
+async def test_ticks_actually_commit_on_a_plain_connection() -> None:
+    """End-to-end version of the same regression: two apply_tick calls on
+    a plain (non-autocommit, no outer tx -- exactly the market service's)
+    connection must be visible to a second connection. Runs on a
+    disposable database because the ticks commit real state (instrument
+    prices, candles) that can't be rolled back."""
+    base = conninfo.conninfo_to_dict(get_settings().test_database_url)
+    admin_url = conninfo.make_conninfo(**{**base, "dbname": "postgres"})
+    scratch = f"stockbot_tickreg_{os.getpid()}"
+    scratch_url = conninfo.make_conninfo(**{**base, "dbname": scratch})
+
+    admin = await AsyncConnection.connect(admin_url, autocommit=True)
+    try:
+        try:
+            await admin.execute(f'CREATE DATABASE "{scratch}"')
+        except Exception as exc:
+            pytest.skip(f"cannot create scratch DB ({exc}); needs CREATE privilege")
+    finally:
+        await admin.close()
+
+    try:
+        run_migrations(scratch_url)
+        market_conn = await AsyncConnection.connect(scratch_url, autocommit=False)
+        try:
+            # Three ticks: a fresh DB starts at tick_index 0, and the poison
+            # only opens on the first _post_tick (tick 1) -- under the bug,
+            # tick 2 is the first one that silently fails to commit.
+            for _ in range(3):
+                await apply_tick(market_conn, "regression-seed")
+        finally:
+            await market_conn.close()
+
+        reader = await AsyncConnection.connect(scratch_url, autocommit=True)
+        try:
+            async with reader.cursor() as cur:
+                await cur.execute("SELECT MAX(tick_index) FROM market_ticks")
+                row = await cur.fetchone()
+        finally:
+            await reader.close()
+        assert row is not None and int(row[0]) >= 2, (
+            "tick 2 did not commit -- a bare statement between ticks left "
+            "the connection in a poisoned implicit transaction"
+        )
+    finally:
+        admin = await AsyncConnection.connect(admin_url, autocommit=True)
+        try:
+            await admin.execute(
+                f'DROP DATABASE IF EXISTS "{scratch}" WITH (FORCE)'
+            )
+        finally:
+            await admin.close()

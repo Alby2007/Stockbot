@@ -272,7 +272,9 @@ async def cover_bounded_short(
     (buy-side) fill. Pays out collateral + payoff floored at 0.
     """
     async with conn.transaction():
-        await assert_feature_enabled(conn, "shorts.enabled", "bounded shorts")
+        # Closes are NOT gated on shorts.enabled: kill switches halt new
+        # exposure, they must never trap users in open positions (same
+        # reason cancel_order isn't gated). Market session still applies.
         await assert_market_open(conn)
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(

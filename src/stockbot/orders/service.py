@@ -43,7 +43,13 @@ from stockbot.market.data import (
     participation_cap,
     spread_config,
 )
-from stockbot.trading.errors import NotInLeagueError, TradingError, UnknownInstrumentError
+from stockbot.trading.errors import (
+    FeatureDisabledError,
+    MarketClosedError,
+    NotInLeagueError,
+    TradingError,
+    UnknownInstrumentError,
+)
 from stockbot.trading.service import (
     _apply_fill,
     _to_minor_units,
@@ -780,6 +786,11 @@ async def _match_once(
                     stats["mm_fills"] += 1
         except _LimitBreach:
             # Mark-dependent, not deterministic: leave fill_failures alone.
+            continue
+        except (FeatureDisabledError, MarketClosedError):
+            # Global transient, not an order-deterministic failure: a kill
+            # switch or closed session must not burn strikes toward
+            # auto-cancel -- the order just waits it out.
             continue
         except (TradingError, MarginError, LedgerError, ValueError):
             # Not fillable right now (funds, margin gates, slot limits) --
