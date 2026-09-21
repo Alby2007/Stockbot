@@ -125,7 +125,12 @@ dt=1 -- otherwise it "reopens" with a closed_ticks gap it never had.
 trading.__init__ -> trading.service -> margin -> market.data` is a real
 import cycle. Tests flip `session.*` config (open=2, closed=4) to cycle
 phases in a handful of ticks; the phase offset shifts where the cycle
-lands relative to tick 0.
+lands relative to tick 0. Sim-harness gotcha: `ticks_per_day` (1440) ==
+one session cycle, so agents must act right after the day's FIRST tick
+(the session-open gap tick, cycle_pos 0) — acting after the last tick
+lands in the closed phase and every trade/quote is silently swallowed
+by `_run_agent_day`'s broad TradingError catch (the sim "ran" with zero
+orders for weeks before this was noticed).
 
 Observability notes: every `apply_tick` writes per-tick stats on the
 `market_ticks` row itself (duration_ms, fills, crosses, stops_triggered,
@@ -206,6 +211,30 @@ amend `close` intra-tick, so replay can't recover r_model from OHLC;
 guarantee narrowed: vol_state is flow-fed and can't be re-derived from
 the seed — `replay` verifies internal consistency against stored
 model_ret/flow_ret, NOT seed-determinism.
+
+Microstructure notes (Phase G): fills print on a price grid —
+`engine.tick_size(price)` is a 1-2-5 multiple of 10^n at or above
+`price*spread.tick_pct`, floored at `spread.tick_min` ($100 → $0.10,
+$5 → $0.01). `round_to_tick` ties away from zero, same as
+`place_order`'s ROUND_HALF_UP snap of resting limit/stop prices — a
+resting price is always on the grid fills print on. Crosses print at
+the maker's (snapped) limit; the two-marketable-orders case prints at
+the mark snapped to the grid. `quote_ticks(mark, half, tick)` rounds
+the displayed bid DOWN and ask UP so the quote is the worst case a
+market fill can land at. U-shaped intraday spread: `half_spread_fraction`
+adds `spread.open_coeff·exp(−t/open_decay)` +
+`close_coeff·exp(−(T−t)/close_decay)` terms when the caller merges
+`session.*` keys into the spread cfg (all fill paths and the `/stock`
+snapshot do); `half_spread_for` derives ticks_since_open/to_close from
+the tick index + session geometry. New cfg keys are `.get()`-defaulted
+in `half_spread_fraction` so hand-built cfg dicts in tests stay valid.
+Gotcha: `execute_trade` computes session position from the *real*
+MAX(tick_index) while `match_orders(tick_index)` uses the caller's
+index — tests calling match_orders with a synthetic tick must
+neutralize the U-shape (`session.open_ticks` huge) or the est/actual
+fills diverge. Fill-side tick rounding quantizes `impact` deltas to
+~tick/price — tests asserting small impact deltas must flatten the
+grid (`spread.tick_pct=0`, `tick_min=1e-7`) or the quantum swamps them.
 
 Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
 preserved -- short proceeds credit to cash and are spendable; leverage is

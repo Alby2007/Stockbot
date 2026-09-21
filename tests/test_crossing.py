@@ -17,6 +17,7 @@ from stockbot.ledger.service import (
     get_user_account_id,
     post_transfer,
 )
+from stockbot.market import engine
 from stockbot.orders.service import match_orders, place_order
 from stockbot.trading.service import execute_trade
 
@@ -113,6 +114,18 @@ def _minor(dollars: Decimal) -> int:
     return int((dollars * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
+def _grid(price: Decimal) -> Decimal:
+    """Snap a price to the tick grid `place_order` applies at placement."""
+    tick = Decimal(
+        str(
+            engine.tick_size(
+                float(price), {"spread.tick_pct": 0.001, "spread.tick_min": 0.01}
+            )
+        )
+    )
+    return (price / tick).to_integral_value() * tick
+
+
 async def test_cross_at_maker_price_and_mark_print(conn: AsyncConnection) -> None:
     """An ask resting first is the maker: the pair trades at the ask's
     price and the mark moves to it."""
@@ -121,7 +134,8 @@ async def test_cross_at_maker_price_and_mark_print(conn: AsyncConnection) -> Non
     ticker = await _liquid_ticker(conn)
     mark = await _give_shares(conn, 4001, ticker, 2)
     await _fund(conn, 4002, 10_000_000)
-    cross = (mark * Decimal("1.01")).quantize(Decimal("0.000001"))
+    # Placement snaps limits to the tick grid -- use an on-grid price.
+    cross = _grid(mark * Decimal("1.01"))
 
     ask = await place_order(
         conn, user_id=4001, ticker=ticker, side="SELL", quantity=2,
@@ -164,7 +178,7 @@ async def test_taker_gets_price_improvement(conn: AsyncConnection) -> None:
     ticker = await _liquid_ticker(conn)
     mark = await _give_shares(conn, 4004, ticker, 1)
     await _fund(conn, 4003, 10_000_000)
-    bid_px = (mark * Decimal("1.015")).quantize(Decimal("0.000001"))
+    bid_px = _grid(mark * Decimal("1.015"))
 
     bid = await place_order(
         conn, user_id=4003, ticker=ticker, side="BUY", quantity=1,
@@ -243,7 +257,7 @@ async def test_collar_skips_stale_maker_but_book_still_crosses(
     mark = await _give_shares(conn, 4009, ticker, 1)
     await _fund(conn, 4008, 10_000_000)
     await _fund(conn, 4010, 10_000_000)
-    sane = (mark * Decimal("1.01")).quantize(Decimal("0.000001"))
+    sane = _grid(mark * Decimal("1.01"))
 
     stale_bid = await place_order(
         conn, user_id=4008, ticker=ticker, side="BUY", quantity=1,
@@ -266,10 +280,11 @@ async def test_collar_skips_stale_maker_but_book_still_crosses(
     stale_row = await _order_row(conn, stale_bid.order_id)
     assert stale_row["status"] == "FILLED"
     assert Decimal(stale_row["fill_price"]) < mark * Decimal("1.05")
-    # The ask rested before good_bid -> maker -> cross at the ask's price.
+    # The ask rested before good_bid -> maker -> cross at the ask's price
+    # (snapped to the tick grid at placement).
     ask_row = await _order_row(conn, ask.order_id)
     assert ask_row["status"] == "FILLED"
-    assert Decimal(ask_row["fill_price"]) == mark
+    assert Decimal(ask_row["fill_price"]) == _grid(mark)
     assert (await _order_row(conn, good_bid.order_id))["status"] == "FILLED"
 
 
@@ -283,7 +298,7 @@ async def test_cross_moves_cash_and_fees_without_market_maker(
     ticker = await _liquid_ticker(conn)
     mark = await _give_shares(conn, 4011, ticker, 2)
     await _fund(conn, 4012, 10_000_000)
-    cross = (mark * Decimal("1.005")).quantize(Decimal("0.000001"))
+    cross = _grid(mark * Decimal("1.005"))
 
     mm_id = await get_system_account_id(conn, "MARKET_MAKER")
     sink_id = await get_system_account_id(conn, "SINK")

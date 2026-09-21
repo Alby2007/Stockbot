@@ -297,6 +297,14 @@ async def test_squeeze_boosts_buy_impact(conn: AsyncConnection) -> None:
     account_id = await bootstrap_user(conn, 2010)
     await _give_cash(conn, account_id, 1_000_000)
     ticker = await _first_ticker(conn)
+    # Tick rounding quantizes the impact delta to ~tick/price, which at a
+    # 1-share fill swamps the boost ratio. Flatten the grid -- this test
+    # targets the squeeze boost, not the grid.
+    async with conn.cursor() as cur:
+        await cur.execute("UPDATE config SET value = 0 WHERE key = 'spread.tick_pct'")
+        await cur.execute(
+            "UPDATE config SET value = 0.0000001 WHERE key = 'spread.tick_min'"
+        )
 
     async with conn.cursor() as cur:
         await cur.execute(

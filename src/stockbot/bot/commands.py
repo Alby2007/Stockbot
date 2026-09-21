@@ -187,7 +187,12 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
         embed = discord.Embed(title=f"{snapshot.ticker} \u2014 {snapshot.name}")
         embed.add_field(name="Sector", value=snapshot.sector_name)
-        embed.add_field(name="Price", value=format_price(snapshot.quoted_price))
+        embed.add_field(name="Mark", value=format_price(snapshot.quoted_price))
+        if snapshot.bid is not None and snapshot.ask is not None:
+            embed.add_field(
+                name="Bid / Ask",
+                value=f"{format_price(snapshot.bid)} / {format_price(snapshot.ask)}",
+            )
         if snapshot.day_change_pct is not None:
             embed.add_field(name="24h change", value=format_pct(snapshot.day_change_pct))
         embed.add_field(name="Impact", value=format_pct(float(snapshot.impact)))

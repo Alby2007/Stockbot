@@ -240,6 +240,22 @@ async def test_mm_fill_that_breaches_limit_stays_open(conn: AsyncConnection) -> 
     boosted_lam = float(inst["lambda_impact"]) * float(
         1 + cfg["margin.squeeze_lambda_boost"] * over
     )
+    # Tick rounding would collapse the engineered est..act window to a
+    # single grid point, and the U-shape term makes the fill depend on the
+    # *real* current tick (execute_trade uses MAX(tick_index)) rather than
+    # the synthetic index match_orders is called with. Flatten both for
+    # the duration of this test -- it targets the post-fill re-check.
+    async with conn.cursor() as cur:
+        await cur.execute("UPDATE config SET value = 0 WHERE key = 'spread.tick_pct'")
+        await cur.execute(
+            "UPDATE config SET value = 0.0000001 WHERE key = 'spread.tick_min'"
+        )
+        await cur.execute(
+            "UPDATE config SET value = 1000000000 WHERE key = 'session.open_ticks'"
+        )
+        await cur.execute(
+            "UPDATE config SET value = 0 WHERE key = 'session.closed_ticks'"
+        )
     spread_cfg = await spread_config(conn)
     base = float(inst["base_price"])
     imp = float(inst["impact"])

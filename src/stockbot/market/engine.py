@@ -240,6 +240,7 @@ def apply_trade_impact(
     lambda_impact: float,
     max_impact: float,
     half_spread: float,
+    tick_size: float = 0.0,
 ) -> tuple[float, float]:
     """Compute a trade's fill price and the resulting post-trade impact.
 
@@ -265,8 +266,39 @@ def apply_trade_impact(
     fill_price = base_price * float(np.exp(midpoint_impact))
     spread_sign = 1.0 if signed_notional >= 0 else -1.0
     fill_price *= 1.0 + spread_sign * half_spread
+    if tick_size > 0:
+        fill_price = round_to_tick(fill_price, tick_size)
 
     return fill_price, impact_after
+
+
+def tick_size(price: float, cfg: dict[str, float]) -> float:
+    """The price grid for quotes/fills: a 1-2-5 multiple of 10^n at or
+    above `price * spread.tick_pct`, floored at `spread.tick_min`. Keeps
+    ticks human-scale at any price level ($100 -> $0.10, $5 -> $0.01)."""
+    tick_min = cfg.get("spread.tick_min", 0.01)
+    raw = price * cfg.get("spread.tick_pct", 0.001)
+    if raw <= tick_min or price <= 0:
+        return tick_min
+    base = 10.0 ** math.floor(math.log10(raw))
+    for m in (1.0, 2.0, 5.0, 10.0):
+        if m * base >= raw:
+            return m * base
+    return 10.0 * base
+
+
+def round_to_tick(price: float, tick: float) -> float:
+    """Nearest grid point, ties away from zero -- same rule place_order
+    uses to snap resting prices (ROUND_HALF_UP)."""
+    return math.floor(price / tick + 0.5) * tick
+
+
+def quote_ticks(mark: float, half_spread: float, tick: float) -> tuple[float, float]:
+    """Displayed (bid, ask) on the tick grid, rounded OUTWARD so the
+    shown quote is the worst case a market fill can land at."""
+    bid = math.floor(mark * (1.0 - half_spread) / tick) * tick
+    ask = math.ceil(mark * (1.0 + half_spread) / tick) * tick
+    return bid, ask
 
 
 def half_spread_fraction(
@@ -276,13 +308,18 @@ def half_spread_fraction(
     liquidity: float,
     ticks_since_halt: float | None,
     ticks_to_event: float | None,
+    ticks_since_open: float | None = None,
+    ticks_to_close: float | None = None,
 ) -> float:
     """Dynamic half-spread as a fraction of price (0.0005 = 5bps).
 
     Wider for high-sigma and illiquid names (that's where adverse selection
     lives), elevated right after a circuit halt ends and into a pending
     event's resolution -- the two moments a taker is most likely to know
-    something the mark doesn't. `cfg` is the `spread.*` config namespace.
+    something the mark doesn't. The open/close terms give the classic
+    U-shaped intraday pattern: widest just after the overnight gap lands,
+    decaying through the session, widening again into the close.
+    `cfg` is the `spread.*` config namespace.
     """
     halt_term = (
         0.0
@@ -294,6 +331,20 @@ def half_spread_fraction(
         if ticks_to_event is None
         else np.exp(-max(ticks_to_event, 0.0) / cfg["spread.event_window_ticks"])
     )
+    open_term = (
+        0.0
+        if ticks_since_open is None
+        else np.exp(
+            -max(ticks_since_open, 0.0) / cfg.get("spread.open_decay_ticks", 90.0)
+        )
+    )
+    close_term = (
+        0.0
+        if ticks_to_close is None
+        else np.exp(
+            -max(ticks_to_close, 0.0) / cfg.get("spread.close_decay_ticks", 60.0)
+        )
+    )
     bps = (
         cfg["spread.base_bps"]
         * (1 + cfg["spread.sigma_coeff"] * sigma / cfg["spread.sigma_ref"])
@@ -303,5 +354,10 @@ def half_spread_fraction(
         )
         * (1 + cfg["spread.halt_coeff"] * halt_term)
         * (1 + cfg["spread.event_coeff"] * event_term)
+        * (
+            1
+            + cfg.get("spread.open_coeff", 0.0) * open_term
+            + cfg.get("spread.close_coeff", 0.0) * close_term
+        )
     )
     return bps / 10_000

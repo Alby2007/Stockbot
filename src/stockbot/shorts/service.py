@@ -40,6 +40,7 @@ from stockbot.market.data import (
     half_spread_for,
     participation_cap,
     record_flow,
+    session_config,
     spread_config,
 )
 from stockbot.seasons.service import get_active_entry
@@ -174,7 +175,7 @@ async def open_bounded_short(
 
         base_price = float(instrument["base_price"])
         tick = await _current_tick(conn)
-        spread_cfg = await spread_config(conn)
+        spread_cfg = {**await spread_config(conn), **await session_config(conn)}
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=float(instrument["impact"]),
@@ -183,6 +184,7 @@ async def open_bounded_short(
             lambda_impact=float(instrument["lambda_impact"]),
             max_impact=float(instrument["max_impact"]),
             half_spread=half_spread_for(instrument, tick, spread_cfg),
+            tick_size=engine.tick_size(base_price, spread_cfg),
         )
         fill_price = Decimal(str(round(fill_price_f, 6)))
         await _assert_depth(
@@ -307,7 +309,7 @@ async def cover_bounded_short(
         base_price = float(short["base_price"])
         quantity = int(short["quantity"])
         tick = await _current_tick(conn)
-        spread_cfg = await spread_config(conn)
+        spread_cfg = {**await spread_config(conn), **await session_config(conn)}
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=float(short["impact"]),
@@ -316,6 +318,7 @@ async def cover_bounded_short(
             lambda_impact=float(short["lambda_impact"]),
             max_impact=float(short["max_impact"]),
             half_spread=half_spread_for(short, tick, spread_cfg),
+            tick_size=engine.tick_size(base_price, spread_cfg),
         )
         close_price = Decimal(str(round(fill_price_f, 6)))
         await _assert_depth(

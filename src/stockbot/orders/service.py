@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Literal
 
 from psycopg import AsyncConnection
@@ -42,6 +42,7 @@ from stockbot.market.data import (
     half_spread_for,
     participation_cap,
     record_flow,
+    session_config,
     spread_config,
 )
 from stockbot.trading.errors import (
@@ -130,12 +131,26 @@ async def place_order(
         await assert_feature_enabled(conn, "orders.enabled", "order placement")
         await assert_market_open(conn)
         await cur.execute(
-            "SELECT id, is_active FROM instruments WHERE ticker = %s", (ticker,)
+            "SELECT id, is_active, quoted_price FROM instruments WHERE ticker = %s",
+            (ticker,),
         )
         row = await cur.fetchone()
         if row is None or not row[1]:
             raise UnknownInstrumentError(ticker)
         instrument_id = int(row[0])
+
+        # Tick-size rounding (G3): resting prices snap to the same grid
+        # fills print on, so a displayed quote is always attainable.
+        tick_cfg = await spread_config(conn)
+        tick_grid = Decimal(str(engine.tick_size(float(row[2]), tick_cfg)))
+        if limit_price is not None:
+            limit_price = (
+                Decimal(str(limit_price)) / tick_grid
+            ).to_integral_value(rounding=ROUND_HALF_UP) * tick_grid
+        if stop_price is not None:
+            stop_price = (
+                Decimal(str(stop_price)) / tick_grid
+            ).to_integral_value(rounding=ROUND_HALF_UP) * tick_grid
         if season_id is not None:
             # Placement-time league check (the same rule execute_trade
             # enforces at fill): an order on a season the user isn't
@@ -573,6 +588,8 @@ async def _match_once(
         )
         open_orders = await cur.fetchall()
 
+    spread_cfg = {**await spread_config(conn), **await session_config(conn)}
+
     # --- Pass 1: crossing book -------------------------------------------
     # Per (instrument, season scope): bids and asks walk price-time
     # priority; a pair crosses at the maker's price if it's within the
@@ -627,7 +644,10 @@ async def _match_once(
             elif (ask if bid_maker else bid)["limit_price"] is not None:
                 cross_price = Decimal((ask if bid_maker else bid)["limit_price"])
             else:
-                cross_price = Decimal(str(mark))
+                # Two marketable orders have no maker price -- print at the
+                # mark, snapped to the grid like every other fill.
+                tick = engine.tick_size(mark, spread_cfg)
+                cross_price = Decimal(str(engine.round_to_tick(mark, tick)))
             if abs(cross_price - Decimal(str(open_mark))) / Decimal(
                 str(open_mark)
             ) > collar:
@@ -702,11 +722,11 @@ async def _match_once(
         )
         candidates = await cur.fetchall()
 
-    spread_cfg = await spread_config(conn)
     cap = await participation_cap(conn)
     for order in candidates:
         remaining_qty = int(order["quantity"]) - int(order["filled_quantity"])
         sign = 1 if order["side"] == "BUY" else -1
+        tick = engine.tick_size(float(order["base_price"]), spread_cfg)
         # Participation cap: a resting order works over multiple ticks --
         # fill up to cap*liquidity in notional this tick, the rest next
         # tick. Estimated on the full-size fill price (conservative). The
@@ -720,6 +740,7 @@ async def _match_once(
             lambda_impact=float(order["lambda_impact"]),
             max_impact=float(order["max_impact"]),
             half_spread=half_spread_for(order, tick_index, spread_cfg),
+            tick_size=tick,
         )
         cap_qty = int(cap * float(order["liquidity"]) / fill_full)
         budget = cap_qty - depth_used.get(int(order["id"]), 0)
@@ -737,6 +758,7 @@ async def _match_once(
             lambda_impact=float(order["lambda_impact"]),
             max_impact=float(order["max_impact"]),
             half_spread=half_spread_for(order, tick_index, spread_cfg),
+            tick_size=tick,
         )
         if order["limit_price"] is not None:
             limit = Decimal(order["limit_price"])

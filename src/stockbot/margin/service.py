@@ -37,7 +37,12 @@ from psycopg.rows import dict_row
 from stockbot.ledger.service import get_system_account_id, post_transfer
 from stockbot.margin.errors import MarginSpendBlockedError
 from stockbot.market import engine
-from stockbot.market.data import half_spread_for, record_flow, spread_config
+from stockbot.market.data import (
+    half_spread_for,
+    record_flow,
+    session_config,
+    spread_config,
+)
 
 MAX_LIQUIDATION_LEGS = 64
 
@@ -294,7 +299,7 @@ async def _liquidate_leg(
     # A capped leg would leave an oversized position un-liquidatable and
     # wedge the account below maintenance forever -- depth protection is
     # for user-initiated fills (execute_trade, shorts), not the safety net.
-    spread_cfg = await spread_config(conn)
+    spread_cfg = {**await spread_config(conn), **await session_config(conn)}
     fill_f, impact_after = engine.apply_trade_impact(
         base_price=base_price,
         impact_before=float(position["impact"]),
@@ -303,6 +308,7 @@ async def _liquidate_leg(
         lambda_impact=float(position["lambda_impact"]),
         max_impact=float(position["max_impact"]),
         half_spread=half_spread_for(position, tick_index, spread_cfg),
+        tick_size=engine.tick_size(base_price, spread_cfg),
     )
     fill = Decimal(str(round(fill_f, 6)))
     notional_minor = int((fill * close_qty * 100).quantize(Decimal("1"), ROUND_HALF_UP))

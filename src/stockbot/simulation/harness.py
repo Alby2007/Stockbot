@@ -578,11 +578,16 @@ async def run_simulation(
     last_tick = -1
 
     for day in range(num_days):
-        for _ in range(ticks_per_day):
-            last_tick = await apply_tick(conn, master_seed)
+        # Agents act right after the day's first tick -- the session-open
+        # gap tick. With ticks_per_day == one session cycle, acting after
+        # the LAST tick lands in the closed phase and every trade/quote
+        # is silently swallowed by the broad TradingError catch.
+        last_tick = await apply_tick(conn, master_seed)
         sim_today = SIM_CLAIM_EPOCH + timedelta(days=day)
         for agent in agents:
             await _run_agent_day(conn, agent, rng, sim_today)
+        for _ in range(ticks_per_day - 1):
+            last_tick = await apply_tick(conn, master_seed)
 
         if day % snapshot_every_days == 0 or day == num_days - 1:
             net_worth = await net_worth_by_user(conn, user_ids)

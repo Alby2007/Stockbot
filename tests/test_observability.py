@@ -57,8 +57,11 @@ async def test_periodic_audit_writes_results(conn: AsyncConnection) -> None:
         await cur.execute(
             "UPDATE config SET value = 2 WHERE key = 'audit.every_n_ticks'"
         )
+    # Three ticks guarantee an index >0 with index % 2 == 0 regardless of
+    # where MAX(tick_index) started (a fresh DB begins at 0).
     await apply_tick(conn, SEED)
-    await apply_tick(conn, SEED)  # tick 2 % 2 == 0 -> audit runs
+    await apply_tick(conn, SEED)
+    await apply_tick(conn, SEED)
 
     async with conn.cursor() as cur:
         await cur.execute(

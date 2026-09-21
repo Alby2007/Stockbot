@@ -30,6 +30,8 @@ class InstrumentSnapshot:
     day_ago_close: Decimal | None
     short_interest_pct: Decimal = Decimal(0)
     day_volume: int = 0
+    bid: Decimal | None = None
+    ask: Decimal | None = None
 
     @property
     def day_change_pct(self) -> float | None:
@@ -58,13 +60,16 @@ async def _fetch_snapshots(
     """
     current_tick = await current_tick_index(conn)
     day_ago_tick = max((current_tick or 0) - TICKS_PER_DAY, 0)
+    spread_cfg = {**await spread_config(conn), **await session_config(conn)}
 
     async with conn.cursor() as cur:
         await cur.execute(
             """
             SELECT i.id, i.ticker, i.name, s.key, s.name, i.quoted_price, i.impact,
                    i.circuit_halted_until_tick, c.close, i.short_interest_pct,
-                   COALESCE(v.volume, 0)
+                   COALESCE(v.volume, 0),
+                   COALESCE(i.sigma_eff, i.sigma) AS sigma, i.liquidity,
+                   i.next_event_tick, i.last_halt_end_tick
             FROM instruments i
             JOIN sectors s ON s.id = i.sector_id
             LEFT JOIN LATERAL (
@@ -84,22 +89,38 @@ async def _fetch_snapshots(
         )
         rows = await cur.fetchall()
 
-    return [
-        InstrumentSnapshot(
-            id=r[0],
-            ticker=r[1],
-            name=r[2],
-            sector_key=r[3],
-            sector_name=r[4],
-            quoted_price=r[5],
-            impact=r[6],
-            halted_until_tick=r[7],
-            day_ago_close=r[8],
-            short_interest_pct=r[9],
-            day_volume=int(r[10]),
+    snapshots: list[InstrumentSnapshot] = []
+    for r in rows:
+        # Bid/ask on the tick grid, outward-rounded so the display is the
+        # worst case a market fill can land at (G1/G3).
+        mark = float(r[5])
+        row = {
+            "sigma": float(r[11]),
+            "liquidity": float(r[12]),
+            "next_event_tick": r[13],
+            "last_halt_end_tick": r[14],
+        }
+        half = half_spread_for(row, current_tick, spread_cfg)
+        tick = engine.tick_size(mark, spread_cfg)
+        bid_f, ask_f = engine.quote_ticks(mark, half, tick)
+        snapshots.append(
+            InstrumentSnapshot(
+                id=r[0],
+                ticker=r[1],
+                name=r[2],
+                sector_key=r[3],
+                sector_name=r[4],
+                quoted_price=r[5],
+                impact=r[6],
+                halted_until_tick=r[7],
+                day_ago_close=r[8],
+                short_interest_pct=r[9],
+                day_volume=int(r[10]),
+                bid=Decimal(str(round(bid_f, 6))),
+                ask=Decimal(str(round(ask_f, 6))),
+            )
         )
-        for r in rows
-    ]
+    return snapshots
 
 
 async def spread_config(conn: AsyncConnection) -> dict[str, float]:
@@ -266,7 +287,9 @@ def half_spread_for(
 ) -> float:
     """Dynamic half-spread fraction for an instrument row carrying `sigma`,
     `liquidity`, `last_halt_end_tick`, and `next_event_tick`. Shared by all
-    fill paths (trades, bounded shorts, liquidation legs, order fills)."""
+    fill paths (trades, bounded shorts, liquidation legs, order fills).
+    When `cfg` also carries the `session.*` keys (merged in by the
+    caller), the U-shaped intraday open/close terms engage."""
     since_halt = (
         None
         if row["last_halt_end_tick"] is None or current_tick is None
@@ -277,12 +300,24 @@ def half_spread_for(
         if row["next_event_tick"] is None or current_tick is None
         else float(int(row["next_event_tick"]) - current_tick)
     )
+    since_open = to_close = None
+    open_ticks = int(cfg.get("session.open_ticks", 0))
+    closed_ticks = int(cfg.get("session.closed_ticks", 0))
+    cycle = open_ticks + closed_ticks
+    if cycle > 0 and current_tick is not None:
+        offset = int(cfg.get("session.phase_offset_ticks", 0))
+        cycle_pos = (current_tick - offset) % cycle
+        if cycle_pos < open_ticks:
+            since_open = float(cycle_pos)
+            to_close = float(open_ticks - cycle_pos)
     return engine.half_spread_fraction(
         cfg=cfg,
         sigma=float(row["sigma"]),
         liquidity=float(row["liquidity"]),
         ticks_since_halt=since_halt,
         ticks_to_event=to_event,
+        ticks_since_open=since_open,
+        ticks_to_close=to_close,
     )
 
 

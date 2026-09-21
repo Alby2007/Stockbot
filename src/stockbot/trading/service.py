@@ -44,6 +44,7 @@ from stockbot.market.data import (
     half_spread_for,
     participation_cap,
     record_flow,
+    session_config,
     spread_config,
 )
 from stockbot.shop.service import BASE_SLOTS, get_slot_count
@@ -522,7 +523,7 @@ async def execute_trade(
                 lambda_impact *= float(
                     1 + cfg["margin.squeeze_lambda_boost"] * over
                 )
-        spread_cfg = await spread_config(conn)
+        spread_cfg = {**await spread_config(conn), **await session_config(conn)}
         half_spread = half_spread_for(instrument, current_tick, spread_cfg)
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
@@ -532,6 +533,7 @@ async def execute_trade(
             lambda_impact=lambda_impact,
             max_impact=max_impact,
             half_spread=half_spread,
+            tick_size=engine.tick_size(base_price, spread_cfg),
         )
         fill_price = Decimal(str(round(fill_price_f, 6)))
 
