@@ -61,20 +61,26 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             # them as non-trading ticks. No instrument writes at all, so no
             # FOR UPDATE is needed (trades are gated on assert_market_open).
             async with conn.cursor() as cur:
+                # Vol state is frozen across the close (no returns, no
+                # information): carry forward the previous tick's value.
                 await cur.execute(
                     """
                     INSERT INTO market_ticks
-                        (tick_index, market_factor, sector_factors, session_state)
-                    VALUES (%s, 0, '{}', 'CLOSED')
+                        (tick_index, market_factor, sector_factors,
+                         session_state, vol_state)
+                    VALUES (%s, 0, '{}', 'CLOSED',
+                            (SELECT vol_state FROM market_ticks
+                             ORDER BY tick_index DESC LIMIT 1))
                     """,
                     (tick_index,),
                 )
                 await cur.execute(
                     """
                     INSERT INTO candles
-                        (instrument_id, tick_index, open, high, low, close, volume)
+                        (instrument_id, tick_index, open, high, low, close,
+                         volume, vol_state, flow_ret, model_ret, halt_kind)
                     SELECT id, %s, quoted_price, quoted_price, quoted_price,
-                           quoted_price, 0
+                           quoted_price, 0, vol_state, NULL, NULL, NULL
                     FROM instruments WHERE is_active
                     ORDER BY id
                     """,
@@ -128,7 +134,8 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                        i.beta, i.gamma,
                        i.kappa, i.fundamental_sigma, i.tau_ticks, i.base_price,
                        i.fundamental_value, i.impact, i.circuit_halted_until_tick,
-                       i.float_shares, i.index_divisor, i.dividend_drift_offset
+                       i.float_shares, i.index_divisor, i.dividend_drift_offset,
+                       i.vol_state, i.sigma_eff
                 FROM instruments i
                 JOIN sectors s ON s.id = i.sector_id
                 WHERE i.is_active
@@ -138,10 +145,54 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             )
             instrument_rows = await cur.fetchall()
 
+        # Vol-state inputs (Phase F): last tick's candle closes are the
+        # pre-trade marks the interval's flow is measured against; the
+        # previous market vol state seeds the shared EWMA; pending_flow
+        # holds every impact-moving write since the last step. Every flow
+        # writer locks its instrument row first, so the table is quiescent
+        # while this tick holds all of them.
+        prev_closes: dict[int, float] = {}
+        v_mkt_prev = 1.0
+        if tick_index > 0:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT instrument_id, close FROM candles WHERE tick_index = %s",
+                    (tick_index - 1,),
+                )
+                prev_closes = {int(r[0]): float(r[1]) for r in await cur.fetchall()}
+                await cur.execute(
+                    "SELECT vol_state FROM market_ticks WHERE tick_index = %s",
+                    (tick_index - 1,),
+                )
+                vol_row = await cur.fetchone()
+                if vol_row and vol_row[0] is not None:
+                    v_mkt_prev = float(vol_row[0])
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM pending_flow "
+                "RETURNING instrument_id, user_id, delta_impact"
+            )
+            flow_rows = await cur.fetchall()
+        flow_delta: dict[int, dict[int, float]] = {}
+        for fr in flow_rows:
+            flow_delta.setdefault(int(fr[0]), {})[int(fr[1])] = float(fr[2])
+        vol_cfg = await data.vol_config(conn)
+
         sector_keys = sorted({row["sector_key"] for row in instrument_rows})
         rng = engine.rng_for_tick(master_seed, tick_index)
         market_factor = engine.draw_market_factor(rng, dt=gap_dt)
         sector_factors = engine.draw_sector_factors(rng, sector_keys, dt=gap_dt)
+
+        # Shared market vol state: EWMA of the normalized market factor.
+        # draw_market_factor already folds in sqrt(dt), so dividing it back
+        # out leaves |z|/sqrt(2/pi) -- stationary mean ~1.
+        rho = float(vol_cfg.get("vol.rho", 0.94))
+        v_mkt = engine.ewma_vol_update(
+            v_mkt_prev,
+            abs(market_factor)
+            / (engine.MARKET_SIGMA * math.sqrt(gap_dt) * engine.SQRT_2_OVER_PI),
+            rho,
+        )
 
         # Events (earnings + news) use their own deterministic RNG stream so
         # they can't perturb the price engine's own draw sequence.
@@ -169,11 +220,18 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             # the *entire* funding mechanism -- dividend_drift_offset is
             # always 0 now (a pre-bleed would double-suppress the payout).
             div_drop = float(dividend_drops.get(row["id"], 0))
+            # sigma_eff is last tick's regime-scaled sigma; NULL before the
+            # first vol update means "use raw sigma" (v=1 -> multiplier 1).
+            sigma_eff = (
+                float(row["sigma_eff"])
+                if row["sigma_eff"] is not None
+                else float(row["sigma"])
+            )
             state = engine.InstrumentState(
                 id=row["id"],
                 sector_key=row["sector_key"],
                 drift=float(row["drift"]) - float(row["dividend_drift_offset"]),
-                sigma=float(row["sigma"]),
+                sigma=sigma_eff,
                 beta=float(row["beta"]),
                 gamma=float(row["gamma"]),
                 kappa=float(row["kappa"]),
@@ -250,6 +308,67 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             )
             halts[row["id"]] = None
 
+        # Vol-state update (F1) + flow-bounded breaker extension (F5). The
+        # tick's return decomposes into the model move r_model = ln(close /
+        # open) and the flow move carried in from this interval's trades.
+        # Flow enters the EWMA numerator only after the F5 bounds: each
+        # account's contribution clips at vol.account_flow_cap, the total
+        # at vol.flow_ret_cap. The breaker checks r_model + bounded flow --
+        # a lone account is capped below any sane cap, so a whale alone can
+        # never manufacture a halt, while crowd-scale flow still can (and
+        # gets the shorter flow_halt_ticks instead of CIRCUIT_HALT_TICKS).
+        clip_lo = float(vol_cfg.get("vol.clip_min", 0.5))
+        clip_hi = float(vol_cfg.get("vol.clip_max", 4.0))
+        mkt_w = float(vol_cfg.get("vol.market_weight", 0.5))
+        flow_cap = float(vol_cfg.get("vol.flow_ret_cap", 0.05))
+        acct_cap = float(vol_cfg.get("vol.account_flow_cap", 0.02))
+        flow_halt = int(vol_cfg.get("vol.flow_halt_ticks", 2))
+        sqrt_dt = math.sqrt(gap_dt)
+        rows_by_id = {int(r["id"]): r for r in instrument_rows}
+        vol_new: dict[int, float] = {}
+        sigma_eff_new: dict[int, float] = {}
+        flow_ret: dict[int, float] = {}
+        model_ret: dict[int, float] = {}
+        flow_breached: set[int] = set()
+        for result in results:
+            row = rows_by_id[result.id]
+            sigma_i = float(row["sigma"])
+            v_prev = (
+                float(row["vol_state"]) if row["vol_state"] is not None else 1.0
+            )
+            open_mark = opens[result.id]
+            prev_close = prev_closes.get(result.id)
+            bounded_flow, _raw_flow = data.bound_flow(
+                flow_delta.get(result.id, {}), acct_cap, flow_cap
+            )
+            # model_ret is the pure step return (post-step, pre-fill): fills
+            # amend the candle close later, so it must be persisted now or
+            # the replay vol check can't reconstruct it.
+            r_model = (
+                math.log(result.quoted_price / open_mark) if open_mark > 0 else 0.0
+            )
+            model_ret[result.id] = r_model
+            v_i = v_prev
+            if prev_close is not None and prev_close > 0 and open_mark > 0:
+                if sigma_i > 0:
+                    numerator = (abs(r_model) / sqrt_dt + abs(bounded_flow)) / (
+                        sigma_i * engine.SQRT_2_OVER_PI
+                    )
+                    v_i = engine.ewma_vol_update(v_prev, numerator, rho)
+                if (
+                    halts[result.id] is None
+                    and abs(r_model + bounded_flow) > engine.CIRCUIT_BREAKER_CAP
+                ):
+                    # Reached only when the model alone did NOT breach --
+                    # by construction this is a flow-attributed breach.
+                    halts[result.id] = tick_index + flow_halt
+                    flow_breached.add(result.id)
+            vol_new[result.id] = v_i
+            sigma_eff_new[result.id] = sigma_i * engine.vol_multiplier(
+                v_mkt, v_i, mkt_w, clip_lo, clip_hi
+            )
+            flow_ret[result.id] = bounded_flow
+
         # Single-statement writes: executemany still round-trips per row,
         # which dominates tick latency (~100ms -> ~15ms measured on a local
         # Docker Postgres). One UPDATE ... FROM (VALUES ...) and one
@@ -258,7 +377,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             if results:
                 update_rows = sql.SQL(", ").join(
                     sql.SQL("({})").format(
-                        sql.SQL(", ").join(sql.Placeholder() for _ in range(7))
+                        sql.SQL(", ").join(sql.Placeholder() for _ in range(9))
                     )
                     for _ in results
                 )
@@ -272,10 +391,13 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                             quoted_price = v.quoted_price::numeric,
                             circuit_halted_until_tick = v.circuit_halted_until_tick::bigint,
                             last_halt_end_tick = COALESCE(
-                                v.new_halt_end::bigint, i.last_halt_end_tick)
+                                v.new_halt_end::bigint, i.last_halt_end_tick),
+                            vol_state = v.vol_state::numeric,
+                            sigma_eff = v.sigma_eff::numeric
                         FROM (VALUES {}) AS v(
                             base_price, fundamental_value, impact, quoted_price,
-                            circuit_halted_until_tick, new_halt_end, id
+                            circuit_halted_until_tick, new_halt_end,
+                            vol_state, sigma_eff, id
                         )
                         WHERE i.id = v.id::int
                         """
@@ -292,8 +414,11 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                             (
                                 halts[result.id]
                                 if result.circuit_breached
+                                or result.id in flow_breached
                                 else None
                             ),
+                            vol_new[result.id],
+                            sigma_eff_new[result.id],
                             result.id,
                         )
                     ],
@@ -302,16 +427,18 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             await cur.execute(
                 """
                 INSERT INTO market_ticks
-                    (tick_index, market_factor, sector_factors, session_state)
-                VALUES (%s, %s, %s, 'OPEN')
+                    (tick_index, market_factor, sector_factors, session_state,
+                     vol_state)
+                VALUES (%s, %s, %s, 'OPEN', %s)
                 """,
-                (tick_index, market_factor, json.dumps(sector_factors)),
+                (tick_index, market_factor, json.dumps(sector_factors), v_mkt),
             )
 
             if results:
                 candle_rows = sql.SQL(", ").join(
-                    sql.SQL("({}, 0)").format(
-                        sql.SQL(", ").join(sql.Placeholder() for _ in range(6))
+                    sql.SQL("({}, 0, {})").format(
+                        sql.SQL(", ").join(sql.Placeholder() for _ in range(6)),
+                        sql.SQL(", ").join(sql.Placeholder() for _ in range(4)),
                     )
                     for _ in results
                 )
@@ -319,7 +446,8 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                     sql.SQL(
                         """
                         INSERT INTO candles
-                            (instrument_id, tick_index, open, high, low, close, volume)
+                            (instrument_id, tick_index, open, high, low, close,
+                             volume, vol_state, flow_ret, model_ret, halt_kind)
                         VALUES {}
                         """
                     ).format(candle_rows),
@@ -333,6 +461,14 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                             max(opens[result.id], result.quoted_price),
                             min(opens[result.id], result.quoted_price),
                             result.quoted_price,
+                            vol_new[result.id],
+                            flow_ret[result.id],
+                            model_ret[result.id],
+                            (
+                                "FLOW"
+                                if result.id in flow_breached
+                                else "MODEL" if result.circuit_breached else None
+                            ),
                         )
                     ],
                 )

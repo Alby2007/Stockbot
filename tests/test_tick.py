@@ -53,12 +53,15 @@ async def test_apply_tick_is_deterministic_given_the_same_seed_and_starting_stat
         (quoted_after_first_run,) = await cur.fetchone()
 
     # Reset that instrument back to its pre-tick state and the tick ledger,
-    # then replay the same tick index with the same seed.
+    # then replay the same tick index with the same seed. vol_state/sigma_eff
+    # are engine inputs now too -- the reset must restore them or the replay
+    # steps with the regime-scaled sigma the first run left behind.
     async with conn.cursor() as cur:
         await cur.execute(
             """
             UPDATE instruments
-            SET base_price = %s, fundamental_value = %s, impact = 0, quoted_price = %s
+            SET base_price = %s, fundamental_value = %s, impact = 0, quoted_price = %s,
+                vol_state = 1.0, sigma_eff = NULL
             WHERE id = %s
             """,
             (base_price_before, fundamental_before, base_price_before, instrument_id),

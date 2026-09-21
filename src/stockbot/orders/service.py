@@ -41,6 +41,7 @@ from stockbot.market.data import (
     assert_market_open,
     half_spread_for,
     participation_cap,
+    record_flow,
     spread_config,
 )
 from stockbot.trading.errors import (
@@ -264,6 +265,7 @@ async def _settle_cross(
     mark: float,
     max_impact: float,
     tick_index: int,
+    flow_halt_ticks: int,
 ) -> tuple[float, float, bool]:
     """Settle one book cross inside the caller's savepoint: one buyer ->
     seller cash transfer, both position/margin legs via `_apply_fill`, the
@@ -336,7 +338,9 @@ async def _settle_cross(
     )
 
     # Mark print: quoted moves to the cross price, clamped by max_impact
-    # and the per-tick circuit-breaker cap. A breach halts the book.
+    # and the per-tick circuit-breaker cap. A breach halts the book --
+    # a cross print is flow by definition, so it gets the shorter
+    # flow-attributed halt (vol.flow_halt_ticks), not the model one.
     desired_impact = math.log(float(cross_price) / base_price)
     new_impact = max(-max_impact, min(max_impact, desired_impact))
     new_mark = base_price * math.exp(new_impact)
@@ -359,9 +363,9 @@ async def _settle_cross(
                 new_impact,
                 Decimal(str(round(new_mark, 6))),
                 halted,
-                tick_index + engine.CIRCUIT_HALT_TICKS,
+                tick_index + flow_halt_ticks,
                 halted,
-                tick_index + engine.CIRCUIT_HALT_TICKS,
+                tick_index + flow_halt_ticks,
                 instrument_id,
             ),
         )
@@ -388,6 +392,17 @@ async def _settle_cross(
                 raise ValueError(f"order {order['id']} is no longer open")
 
     await update_candle_with_fill(conn, instrument_id, cross_price, quantity)
+    # Flow attribution: the cross's mark move charges to the taker (the
+    # aggressor who lifted the print) for the per-account vol cap.
+    await record_flow(
+        conn,
+        instrument_id=instrument_id,
+        user_id=int(ask["user_id"]) if bid_maker else int(bid["user_id"]),
+        delta_impact=new_impact - math.log(mark / base_price),
+        signed_notional_minor=(
+            -notional_minor if bid_maker else notional_minor
+        ),
+    )
     return new_mark, new_impact, halted
 
 
@@ -478,13 +493,15 @@ async def match_orders(
         await cur.execute(
             "SELECT key, value FROM config WHERE key IN "
             "('cross.collar_pct', 'cross.trade_through_epsilon', "
-            " 'order.stop_cascade_max_iters', 'order.max_fill_failures')"
+            " 'order.stop_cascade_max_iters', 'order.max_fill_failures', "
+            " 'vol.flow_halt_ticks')"
         )
         cfg_rows = {str(r["key"]): float(r["value"]) for r in await cur.fetchall()}
     collar = Decimal(str(cfg_rows.get("cross.collar_pct", 0.02)))
     epsilon = float(cfg_rows.get("cross.trade_through_epsilon", 0.0005))
     cascade_max = int(cfg_rows.get("order.stop_cascade_max_iters", 8))
     max_fill_failures = int(cfg_rows.get("order.max_fill_failures", 5))
+    flow_halt_ticks = int(cfg_rows.get("vol.flow_halt_ticks", 2))
 
     # Per-order, not per-instrument: the participation budget is keyed by
     # order id, so N resting orders on one instrument get N*cap notional
@@ -509,6 +526,7 @@ async def match_orders(
             depth_used=depth_used,
             open_marks=open_marks,
             max_fill_failures=max_fill_failures,
+            flow_halt_ticks=flow_halt_ticks,
             stats=stats,
         )
         triggered = await _trigger_due_stops(conn, tick_index)
@@ -528,6 +546,7 @@ async def _match_once(
     depth_used: dict[int, int],
     open_marks: dict[int, float],
     max_fill_failures: int,
+    flow_halt_ticks: int,
     stats: dict[str, int] | None = None,
 ) -> int:
     """One matching pass over the book: crosses, then MM fallback.
@@ -542,7 +561,8 @@ async def _match_once(
                    o.opened_tick,
                    o.instrument_id, i.ticker, i.base_price, i.impact,
                    i.quoted_price, i.liquidity, i.lambda_impact, i.max_impact,
-                   i.sigma, i.next_event_tick, i.last_halt_end_tick,
+                   COALESCE(i.sigma_eff, i.sigma) AS sigma,
+                   i.next_event_tick, i.last_halt_end_tick,
                    i.circuit_halted_until_tick
             FROM orders o
             JOIN instruments i ON i.id = o.instrument_id
@@ -631,6 +651,7 @@ async def _match_once(
                         mark=mark,
                         max_impact=max_impact,
                         tick_index=tick_index,
+                        flow_halt_ticks=flow_halt_ticks,
                     )
             except (TradingError, MarginError, LedgerError, ValueError):
                 # A side can't settle (funds, margin, slots): the taker
@@ -665,7 +686,8 @@ async def _match_once(
                    o.filled_quantity, o.limit_price, o.order_type, i.ticker,
                    i.base_price,
                    i.impact, i.liquidity, i.lambda_impact, i.max_impact,
-                   i.sigma, i.next_event_tick, i.last_halt_end_tick
+                   COALESCE(i.sigma_eff, i.sigma) AS sigma,
+                   i.next_event_tick, i.last_halt_end_tick
             FROM orders o
             JOIN instruments i ON i.id = o.instrument_id
             WHERE o.status = 'OPEN'

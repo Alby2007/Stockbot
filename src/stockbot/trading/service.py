@@ -43,6 +43,7 @@ from stockbot.market.data import (
     current_tick_index,
     half_spread_for,
     participation_cap,
+    record_flow,
     spread_config,
 )
 from stockbot.shop.service import BASE_SLOTS, get_slot_count
@@ -438,7 +439,8 @@ async def execute_trade(
                 """
                 SELECT id, base_price, impact, liquidity, lambda_impact, max_impact,
                        is_active, circuit_halted_until_tick, short_interest_pct,
-                       sigma, next_event_tick, last_halt_end_tick
+                       COALESCE(sigma_eff, sigma) AS sigma,
+                       next_event_tick, last_halt_end_tick
                 FROM instruments
                 WHERE ticker = %s
                 FOR UPDATE
@@ -449,7 +451,33 @@ async def execute_trade(
         if instrument is None or not instrument["is_active"]:
             raise UnknownInstrumentError(ticker)
         if instrument["circuit_halted_until_tick"] is not None:
-            raise InstrumentHaltedError(ticker)
+            # F5.3: a halt blocks exposure-INCREASING trades only. Closing
+            # or shrinking an existing position stays legal -- otherwise a
+            # halt is a freeze-out DoS on holders, asymmetric with the
+            # liquidation sweep that keeps running during halts. Same
+            # direction, strictly smaller gross: no adds, no flips. The
+            # position row lock here is re-taken by _apply_fill inside the
+            # same transaction, which is a no-op.
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT quantity FROM positions
+                    WHERE user_id = %s AND instrument_id = %s
+                      AND season_id IS NOT DISTINCT FROM %s
+                    FOR UPDATE
+                    """,
+                    (user_id, instrument["id"], season_id),
+                )
+                pos_row = await cur.fetchone()
+            held = int(pos_row[0]) if pos_row else 0
+            new_qty = held + quantity if side == "BUY" else held - quantity
+            risk_reducing = (
+                held != 0
+                and abs(new_qty) < abs(held)
+                and (new_qty == 0 or (new_qty > 0) == (held > 0))
+            )
+            if not risk_reducing:
+                raise InstrumentHaltedError(ticker)
         current_tick = await current_tick_index(conn)
 
         if season_id is None:
@@ -544,5 +572,16 @@ async def execute_trade(
             )
 
         await update_candle_with_fill(conn, instrument_id, fill_price, quantity)
+        # Vol-state flow attribution: the tick reads this interval's
+        # impact deltas to bound flow's contribution (F5.1/F5.2).
+        await record_flow(
+            conn,
+            instrument_id=instrument_id,
+            user_id=user_id,
+            delta_impact=impact_after - impact_before,
+            signed_notional_minor=(
+                result.notional_minor if side == "BUY" else -result.notional_minor
+            ),
+        )
 
     return result

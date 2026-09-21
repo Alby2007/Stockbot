@@ -37,7 +37,7 @@ from psycopg.rows import dict_row
 from stockbot.ledger.service import get_system_account_id, post_transfer
 from stockbot.margin.errors import MarginSpendBlockedError
 from stockbot.market import engine
-from stockbot.market.data import half_spread_for, spread_config
+from stockbot.market.data import half_spread_for, record_flow, spread_config
 
 MAX_LIQUIDATION_LEGS = 64
 
@@ -441,6 +441,17 @@ async def _liquidate_leg(
         )
 
         await update_candle_with_fill(conn, instrument_id, fill, close_qty)
+        # Forced flow: recorded under the reserved system user_id 0 -- it
+        # counts toward the tick's flow cap but no single account's cap.
+        await record_flow(
+            conn,
+            instrument_id=instrument_id,
+            user_id=0,
+            delta_impact=impact_after - float(position["impact"]),
+            signed_notional_minor=(
+                notional_minor if qty < 0 else -notional_minor
+            ),
+        )
 
         await cur.execute(
             """
@@ -529,7 +540,8 @@ async def _liquidate_account(
                        p.dividends_accrued,
                        i.ticker, i.base_price, i.impact, i.liquidity,
                        i.lambda_impact, i.max_impact, i.quoted_price, i.maint_margin_pct,
-                       i.sigma, i.next_event_tick, i.last_halt_end_tick
+                       COALESCE(i.sigma_eff, i.sigma) AS sigma,
+                       i.next_event_tick, i.last_halt_end_tick
                 FROM positions p
                 JOIN instruments i ON i.id = p.instrument_id
                 WHERE p.user_id = %s
@@ -580,8 +592,9 @@ async def _liquidate_account(
                            p.dividends_accrued,
                            i.ticker, i.base_price, i.impact, i.liquidity,
                            i.lambda_impact, i.max_impact, i.quoted_price,
-                           i.maint_margin_pct, i.sigma, i.next_event_tick,
-                           i.last_halt_end_tick
+                           i.maint_margin_pct,
+                           COALESCE(i.sigma_eff, i.sigma) AS sigma,
+                           i.next_event_tick, i.last_halt_end_tick
                     FROM positions p
                     JOIN instruments i ON i.id = p.instrument_id
                     WHERE p.user_id = %s

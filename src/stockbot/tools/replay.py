@@ -16,6 +16,15 @@ historically; sector keys and session config are read from their current
 rows, so a deactivated sector or a mid-range session-config change shows
 as factor divergence starting at the change tick.
 
+Narrowed guarantee since Phase F (vol regimes): vol_state is flow-fed --
+order flow moves it, and order flow is not re-derivable from the seed.
+The vol check therefore verifies *internal consistency* only: it
+recomputes each tick's EWMA from the stored candle open/close and the
+stored bounded flow_ret column, not from a re-derived model return. A
+clean vol replay means "the recorded state obeys the EWMA update rule",
+NOT "the flow that produced it was correct". Treat it as weaker evidence
+than the factor replay.
+
 Usage:
     python -m stockbot.tools.replay --from 4000 --to 5000 \
         --database-url postgresql://... --master-seed <seed>
@@ -41,6 +50,7 @@ class Report:
     factor_mismatches: list[str] = field(default_factory=list)
     mark_inconsistencies: list[str] = field(default_factory=list)
     candle_inconsistencies: list[str] = field(default_factory=list)
+    vol_mismatches: list[str] = field(default_factory=list)
     ticks_checked: int = 0
     ticks_skipped_closed: int = 0
 
@@ -50,6 +60,7 @@ class Report:
             self.factor_mismatches
             or self.mark_inconsistencies
             or self.candle_inconsistencies
+            or self.vol_mismatches
         )
 
 
@@ -189,6 +200,106 @@ def check_candles(
             )
 
 
+def check_vol_state(
+    cur: psycopg.Cursor, tick_from: int, tick_to: int, report: Report
+) -> None:
+    """Recompute the vol-state EWMAs from stored candle opens/closes and
+    the stored flow_ret column, and diff against the stored vol_state.
+
+    This is an internal-consistency check, NOT seed-determinism: flow_ret
+    is consumed-and-gone once apply_tick uses it, so it must be trusted
+    from the record (see the module docstring's narrowed guarantee). The
+    first stored candle per instrument in the range self-seeds the EWMA,
+    so transitions are verified, not absolute levels.
+    """
+    cur.execute(
+        "SELECT key, value FROM config WHERE key LIKE 'vol.%' OR key LIKE 'session.%'"
+    )
+    cfg = {str(k): float(v) for k, v in cur.fetchall()}
+    rho = cfg.get("vol.rho", 0.94)
+    open_ticks, closed_ticks, offset = _session_parts(cfg)
+
+    cur.execute(
+        """
+        SELECT c.instrument_id, c.tick_index, c.open, c.close,
+               c.vol_state, c.flow_ret, c.model_ret, i.sigma, t.session_state
+        FROM candles c
+        JOIN instruments i ON i.id = c.instrument_id
+        JOIN market_ticks t ON t.tick_index = c.tick_index
+        WHERE c.tick_index BETWEEN %s AND %s
+        ORDER BY c.instrument_id, c.tick_index
+        """,
+        (tick_from, tick_to),
+    )
+    v_prev: dict[int, float] = {}
+    for iid, tick, o, c, vs, fr, mr, sigma, phase in cur.fetchall():
+        if vs is None:
+            continue  # pre-0022 candle: nothing stored to verify
+        iid = int(iid)
+        stored = float(vs)
+        if phase == "CLOSED" or iid not in v_prev:
+            # Closed ticks freeze vol state; the first sighting seeds.
+            if iid in v_prev and stored != v_prev[iid]:
+                report.vol_mismatches.append(
+                    f"instrument {iid}@{tick}: CLOSED-tick vol_state "
+                    f"{stored:.6f} != carried {v_prev[iid]:.6f}"
+                )
+            v_prev[iid] = stored
+            continue
+        dt = _gap_dt(int(tick), open_ticks, closed_ticks, offset)
+        # model_ret is the pre-fill step return; the candle close already
+        # contains this tick's fills, so ln(close/open) would double-count
+        # flow. Fall back to it only for rows predating the column.
+        r_model = float(mr) if mr is not None else math.log(float(c) / float(o))
+        flow = float(fr) if fr is not None else 0.0
+        if float(sigma) <= 0:
+            # e.g. the index basket: the tick leaves vol_state untouched.
+            expected = v_prev[iid]
+        else:
+            numerator = (abs(r_model) / math.sqrt(dt) + abs(flow)) / (
+                float(sigma) * engine.SQRT_2_OVER_PI
+            )
+            expected = engine.ewma_vol_update(v_prev[iid], numerator, rho)
+        if not math.isclose(expected, stored, rel_tol=1e-4, abs_tol=1e-4):
+            report.vol_mismatches.append(
+                f"instrument {iid}@{tick}: vol_state stored={stored:.6f} "
+                f"expected={expected:.6f} (r_model={r_model:.6f} flow={flow:.6f})"
+            )
+        v_prev[iid] = stored
+
+    # Same check for the shared market-wide EWMA on market_ticks.
+    cur.execute(
+        "SELECT tick_index, market_factor, session_state, vol_state "
+        "FROM market_ticks WHERE tick_index BETWEEN %s AND %s "
+        "ORDER BY tick_index",
+        (tick_from, tick_to),
+    )
+    v_mkt: float | None = None
+    for tick, mf, phase, vs in cur.fetchall():
+        if vs is None:
+            continue
+        stored = float(vs)
+        if phase == "CLOSED" or v_mkt is None:
+            if v_mkt is not None and stored != v_mkt:
+                report.vol_mismatches.append(
+                    f"market@{tick}: CLOSED-tick vol_state {stored:.6f} "
+                    f"!= carried {v_mkt:.6f}"
+                )
+            v_mkt = stored
+            continue
+        dt = _gap_dt(int(tick), open_ticks, closed_ticks, offset)
+        numerator = abs(float(mf)) / (
+            engine.MARKET_SIGMA * math.sqrt(dt) * engine.SQRT_2_OVER_PI
+        )
+        expected = engine.ewma_vol_update(v_mkt, numerator, rho)
+        if not math.isclose(expected, stored, rel_tol=1e-4, abs_tol=1e-4):
+            report.vol_mismatches.append(
+                f"market@{tick}: vol_state stored={stored:.6f} "
+                f"expected={expected:.6f}"
+            )
+        v_mkt = stored
+
+
 def run(
     database_url: str,
     master_seed: str,
@@ -206,6 +317,7 @@ def run(
         )
         check_mark_consistency(cur, report)
         check_candles(cur, tick_from, tick_to, report)
+        check_vol_state(cur, tick_from, tick_to, report)
     return report
 
 
@@ -234,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
         ("factor mismatches", report.factor_mismatches),
         ("mark inconsistencies", report.mark_inconsistencies),
         ("candle inconsistencies", report.candle_inconsistencies),
+        ("vol mismatches", report.vol_mismatches),
     ):
         if items:
             print(f"\n{len(items)} {label}:")

@@ -173,6 +173,40 @@ collation puts 'index' before 'INDUSTRIAL', ASCII sort puts it last,
 and that shifts every sector draw by one. A `backup` compose service
 pg_dumps daily into the `stockbot-backups` volume (14-day retention).
 
+Volatility-regimes notes (Phase F): `instruments.vol_state` is an EWMA of
+|r| normalized by sigma_i (idiosyncratic sigma, rho `vol.rho`) -- for
+factor-dominated names total vol >> sigma_i so the state equilibrates
+well above 1 (avg ~3 observed in harness runs; the index basket's sigma=0
+skips the EWMA entirely). What is bounded is the multiplier:
+`sigma_eff = sigma * clip(vol.market_weight*v_mkt + (1-w)*v_i,
+clip_min..clip_max)`, persisted per tick and read by every fill path via
+`COALESCE(sigma_eff, sigma)` — spread, impact and margin queries must all
+use the COALESCE'd value, never raw `sigma`. The EWMA numerator is
+(|r_model|/sqrt(dt) + |bounded_flow|) / (sigma_i * sqrt(2/pi)) — total
+returns including trade impact, with the sqrt(2/pi) normalization because
+E|r|/sigma = sqrt(2/pi) for Gaussian returns, and gap returns normalized
+by sqrt(dt) so a reopen doesn't pin vol at clip_max. Idiosyncratic noise
+is Student-t(5) rescaled to unit variance; draw counts are unconditional —
+never add branch-dependent RNG draws (replay determinism depends on draw
+order). sigma=0 instruments (the index basket) skip the EWMA entirely.
+Flow enters through `pending_flow` (instrument_id, user_id; user_id 0 =
+system/liquidation): every impact-moving path upserts its delta_impact
+inside the per-trade instrument lock, apply_tick consumes the whole table
+while holding all instrument locks — lock-free by deferral, no new locks.
+F5 guards: per-account flow clips at `vol.account_flow_cap`, the bounded
+total at `vol.flow_ret_cap`, and the breaker evaluates
+|r_model + bounded_flow| — a lone account is capped below the cap so a
+whale alone can never manufacture a halt, while crowd-scale flow still
+can (halt_kind 'FLOW' on the candle) and gets the shorter
+`vol.flow_halt_ticks` instead of CIRCUIT_HALT_TICKS. Halts gate
+risk-increasing trades only: closing/covering/liquidating proceeds during
+a halt. `candles.model_ret` is the post-step pre-fill return — fills
+amend `close` intra-tick, so replay can't recover r_model from OHLC;
+`candles.flow_ret` is the bounded flow the EWMA consumed. Replay
+guarantee narrowed: vol_state is flow-fed and can't be re-derived from
+the seed — `replay` verifies internal consistency against stored
+model_ret/flow_ret, NOT seed-determinism.
+
 Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
 preserved -- short proceeds credit to cash and are spendable; leverage is
 bounded by post-trade margin gates, not negative cash). Maintenance applies

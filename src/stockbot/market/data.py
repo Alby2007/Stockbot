@@ -127,6 +127,71 @@ async def trade_through_epsilon(conn: AsyncConnection) -> float:
     return await _config_float(conn, "cross.trade_through_epsilon", 0.0005)
 
 
+async def vol_config(conn: AsyncConnection) -> dict[str, float]:
+    """The `vol.*` config namespace (EWMA rho, regime clip bounds, market
+    weight, and the F5 flow caps), read fresh like `spread_config`."""
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT key, value FROM config WHERE key LIKE 'vol.%'")
+        return {str(k): float(v) for k, v in await cur.fetchall()}
+
+
+async def record_flow(
+    conn: AsyncConnection,
+    *,
+    instrument_id: int,
+    user_id: int,
+    delta_impact: float,
+    signed_notional_minor: int,
+) -> None:
+    """Accumulate one fill's mark move in `pending_flow` for the next
+    tick's vol-state update (and Phase H flow effects).
+
+    `user_id` 0 is reserved for system flow (forced liquidation legs);
+    real users carry their Discord id so the per-account contribution cap
+    (vol.account_flow_cap) can bind. The caller MUST already hold the
+    instrument row lock -- apply_tick holds every instrument lock while it
+    consumes the table, which is what makes the accumulation race-free
+    without any locking of its own.
+    """
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            INSERT INTO pending_flow
+                (instrument_id, user_id, tick_index,
+                 delta_impact, signed_notional_minor)
+            VALUES (%s, %s,
+                    (SELECT COALESCE(MAX(tick_index), 0) FROM market_ticks),
+                    %s, %s)
+            ON CONFLICT (instrument_id, user_id) DO UPDATE SET
+                tick_index = EXCLUDED.tick_index,
+                delta_impact = pending_flow.delta_impact + EXCLUDED.delta_impact,
+                signed_notional_minor = pending_flow.signed_notional_minor
+                                   + EXCLUDED.signed_notional_minor
+            """,
+            (instrument_id, user_id, delta_impact, signed_notional_minor),
+        )
+
+
+def bound_flow(
+    deltas_by_user: dict[int, float],
+    account_cap: float,
+    total_cap: float,
+) -> tuple[float, float]:
+    """Apply the F5 flow bounds to one instrument's tick-interval deltas.
+
+    Returns (bounded_flow, raw_flow): each real account's contribution is
+    clipped to +/-account_cap, system flow (user_id 0) passes through, and
+    the sum is clipped to +/-total_cap. `raw_flow` is the unbounded sum --
+    kept for breaker attribution, never fed to the EWMA uncapped.
+    """
+    bounded = 0.0
+    raw = 0.0
+    for user_id, delta in deltas_by_user.items():
+        raw += delta
+        bounded += delta if user_id == 0 else max(-account_cap, min(account_cap, delta))
+    return max(-total_cap, min(total_cap, bounded)), raw
+
+
 async def session_config(conn: AsyncConnection) -> dict[str, float]:
     """The `session.*` config namespace (open/closed ticks, phase offset,
     open impact reset), read fresh like `spread_config`."""

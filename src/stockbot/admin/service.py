@@ -170,6 +170,13 @@ CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "spread.sigma_coeff": (0.0, 1e6),
     "spread.sigma_ref": (1e-9, 1e6),
     "trading.enabled": (0, 1),
+    "vol.account_flow_cap": (0.0, 1.0),
+    "vol.clip_max": (0.01, 100.0),
+    "vol.clip_min": (0.01, 10.0),
+    "vol.flow_halt_ticks": (0, 1e4),
+    "vol.flow_ret_cap": (0.0, 1.0),
+    "vol.market_weight": (0.0, 1.0),
+    "vol.rho": (0.0, 0.9999),
 }
 
 TUNABLE_CONFIG_KEYS = tuple(CONFIG_BOUNDS)

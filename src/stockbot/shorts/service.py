@@ -39,6 +39,7 @@ from stockbot.market.data import (
     assert_market_open,
     half_spread_for,
     participation_cap,
+    record_flow,
     spread_config,
 )
 from stockbot.seasons.service import get_active_entry
@@ -111,7 +112,8 @@ async def _lock_instrument(conn: AsyncConnection, ticker: str) -> dict[str, Any]
             """
             SELECT id, base_price, impact, liquidity, lambda_impact, max_impact,
                    is_active, circuit_halted_until_tick, short_knockout_pct,
-                   sigma, next_event_tick, last_halt_end_tick
+                   COALESCE(sigma_eff, sigma) AS sigma,
+                   next_event_tick, last_halt_end_tick
             FROM instruments
             WHERE ticker = %s
             FOR UPDATE
@@ -225,6 +227,13 @@ async def open_bounded_short(
 
         await _set_impact(conn, int(instrument["id"]), base_price, impact_after)
         await update_candle_with_fill(conn, int(instrument["id"]), fill_price, quantity)
+        await record_flow(
+            conn,
+            instrument_id=int(instrument["id"]),
+            user_id=user_id,
+            delta_impact=impact_after - float(instrument["impact"]),
+            signed_notional_minor=-_to_minor_units(fill_price * quantity),
+        )
 
         async with conn.cursor() as cur:
             await cur.execute(
@@ -282,7 +291,8 @@ async def cover_bounded_short(
                 SELECT bs.id, bs.user_id, bs.instrument_id, bs.quantity, bs.entry_price,
                        bs.collateral_minor, i.ticker, i.base_price, i.impact, i.liquidity,
                        i.lambda_impact, i.max_impact, i.is_active, bs.season_id,
-                       i.sigma, i.next_event_tick, i.last_halt_end_tick
+                       COALESCE(i.sigma_eff, i.sigma) AS sigma,
+                       i.next_event_tick, i.last_halt_end_tick
                 FROM bounded_shorts bs
                 JOIN instruments i ON i.id = bs.instrument_id
                 WHERE bs.id = %s AND bs.status = 'OPEN'
@@ -337,6 +347,13 @@ async def cover_bounded_short(
 
         await _set_impact(conn, int(short["instrument_id"]), base_price, impact_after)
         await update_candle_with_fill(conn, int(short["instrument_id"]), close_price, quantity)
+        await record_flow(
+            conn,
+            instrument_id=int(short["instrument_id"]),
+            user_id=user_id,
+            delta_impact=impact_after - float(short["impact"]),
+            signed_notional_minor=_to_minor_units(close_price * quantity),
+        )
 
         async with conn.cursor() as cur:
             await cur.execute(

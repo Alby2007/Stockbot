@@ -9,7 +9,7 @@ Model, one tick at a time (dt is in ticks; Phase 1 always calls with dt=1):
     Δlog P_i = drift_i·dt
              + β_i · M_t              # shared market factor, one draw per tick
              + γ_i · S_{sector(i),t}  # sector factor, one draw per sector per tick
-             + σ_i · √dt · ε_i        # idiosyncratic
+             + σ_eff_i · √dt · ε_i    # idiosyncratic, unit-variance Student-t(5)
              + κ_i · ln(F_i / P_i)·dt # mean reversion toward the fundamental
 
 clamped by a per-tick circuit breaker. Impact (`impact`, a separate log-offset
@@ -40,8 +40,42 @@ SECTOR_DRIFT = 0.0
 SECTOR_DAILY_VOL = 0.012
 SECTOR_SIGMA = SECTOR_DAILY_VOL / TICKS_PER_DAY**0.5
 
-CIRCUIT_BREAKER_CAP = 0.15  # max |Δlog P| allowed in a single tick
+# F6 calibration: the realized |r_model + bounded_flow| distribution from a
+# 21-day harness run is bimodal -- intraday moves essentially never reach
+# 2% even with t(5) tails and 4x vol regimes, while dt=480 overnight gaps
+# breach at ~37% per reopen at cap 0.03. A 14-day validation run at this
+# cap measured 2.43 halts/instrument/sim-week (target: a few per week,
+# ~2-5). The cap is absolute (not dt-normalized) so the breaker mostly
+# guards gap reopens -- the real-world analogue of limit-halts at the
+# open. Lowering it further mostly raises gap-halt frequency; raising it
+# removes halts entirely.
+CIRCUIT_BREAKER_CAP = 0.03  # max |Δlog P| allowed in a single tick
 CIRCUIT_HALT_TICKS = 5  # ticks an instrument stays halted after a breach
+
+# Fat tails: the idiosyncratic draw is Student-t(5) rescaled to unit
+# variance (t_df has variance df/(df-2)). One draw either way, so the
+# "consumes exactly two draws" contract below is unchanged -- branching
+# jump terms would break draw-count determinism, which is why tails come
+# from the distribution shape instead.
+STUDENT_T_DF = 5.0
+STUDENT_T_SCALE = math.sqrt((STUDENT_T_DF - 2.0) / STUDENT_T_DF)
+
+# E|N(0,1)| -- the EWMA vol-state normalizer, so v_t has stationary mean
+# ~1 under Gaussian input rather than settling ~20% low.
+SQRT_2_OVER_PI = math.sqrt(2.0 / math.pi)
+
+
+def ewma_vol_update(prev: float, normalized_abs_ret: float, rho: float) -> float:
+    """One EWMA step on a |return|/sigma observation. `normalized_abs_ret`
+    should already be divided by the tick's sigma scale (sigma_i * sqrt(dt)
+    for model moves) and by SQRT_2_OVER_PI so the state mean-reverts to 1."""
+    return rho * prev + (1.0 - rho) * normalized_abs_ret
+
+
+def vol_multiplier(v_market: float, v_inst: float, w: float, lo: float, hi: float) -> float:
+    """The regime multiplier applied to sigma_i: blends the shared
+    market-wide vol state with the instrument's own, clipped to [lo, hi]."""
+    return min(hi, max(lo, w * v_market + (1.0 - w) * v_inst))
 
 
 def session_phase(
@@ -139,11 +173,19 @@ def step_instrument(
     sector_factor: float,
     dt: float = 1.0,
 ) -> InstrumentTickResult:
-    """Advance one instrument by one tick. Consumes exactly two draws from `rng`
-    (idiosyncratic return, then fundamental shock) -- instruments must be
-    processed in a stable order for the tick to be reproducible.
+    """Advance one instrument by one tick. Makes exactly two sampler calls
+    on `rng` (idiosyncratic Student-t, then fundamental normal) --
+    unconditional and in a fixed instrument order so the tick is
+    reproducible. (standard_t's internal gamma rejection sampling may
+    consume a variable number of uniforms, but that count is itself a
+    deterministic function of the seed -- what must never vary is the
+    *call pattern*.)
+
+    `inst.sigma` is the *effective* per-tick sigma: `market/tick.py` passes
+    sigma_eff (sigma_i scaled by the vol-regime multiplier), so regime state
+    enters the model through this input alone.
     """
-    idiosyncratic = float(rng.standard_normal())
+    idiosyncratic = float(rng.standard_t(STUDENT_T_DF)) * STUDENT_T_SCALE
     mean_reversion = inst.kappa * float(np.log(inst.fundamental_value / inst.base_price)) * dt
     delta_log_price = (
         inst.drift * dt
