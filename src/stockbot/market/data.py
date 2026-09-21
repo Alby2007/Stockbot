@@ -12,6 +12,7 @@ from decimal import Decimal
 from typing import Any
 
 from psycopg import AsyncConnection
+from psycopg.rows import dict_row
 
 from stockbot.market import engine
 from stockbot.market.engine import TICKS_PER_DAY
@@ -213,6 +214,14 @@ def bound_flow(
     return max(-total_cap, min(total_cap, bounded)), raw
 
 
+async def mom_config(conn: AsyncConnection) -> dict[str, float]:
+    """The `mom.*` config namespace (AR(1) momentum persistence, innovation
+    fraction, drift-state clip), read fresh like `spread_config`."""
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT key, value FROM config WHERE key LIKE 'mom.%'")
+        return {str(k): float(v) for k, v in await cur.fetchall()}
+
+
 async def flow_config(conn: AsyncConnection) -> dict[str, float]:
     """The `flow.*` config namespace (cross-impact coefficient, permanent-
     impact fraction + cap, ADV window/multiplier bounds), read fresh like
@@ -337,3 +346,102 @@ async def all_instrument_snapshots(conn: AsyncConnection) -> list[InstrumentSnap
 async def get_instrument_snapshot(conn: AsyncConnection, ticker: str) -> InstrumentSnapshot | None:
     rows = await _fetch_snapshots(conn, ticker.upper())
     return rows[0] if rows else None
+
+
+@dataclass(frozen=True)
+class DepthLevel:
+    price: Decimal
+    quantity: int
+    synthetic: bool  # True = MM padding, False = real resting orders
+
+
+async def book_depth(
+    conn: AsyncConnection, instrument_id: int, levels: int = 5
+) -> tuple[list[DepthLevel], list[DepthLevel]]:
+    """Top-of-book view for /stock (I2): real resting limit levels in
+    price-time-priority order (best first), padded with synthetic MM depth
+    beyond the deepest real level out to `levels` rungs per side.
+
+    Only the main book is shown -- league orders cross only inside their
+    season, so they're a different book entirely. Untriggered stops are
+    invisible to the matcher and so to this view; triggered STOP_LIMITs
+    keep their limit price and count, marketable triggered STOPs don't
+    rest at a level. Synthetic rungs are sized at the per-tick MM
+    participation budget spread evenly across `levels` ticks of grid --
+    the honest claim is "the MM absorbs ~cap per tick", nothing more.
+    """
+    current_tick = await current_tick_index(conn)
+    cfg = {
+        **await spread_config(conn),
+        **await session_config(conn),
+        **await flow_config(conn),
+    }
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT quoted_price, liquidity,
+                   COALESCE(sigma_eff, sigma) AS sigma,
+                   next_event_tick, last_halt_end_tick
+            FROM instruments WHERE id = %s
+            """,
+            (instrument_id,),
+        )
+        inst = await cur.fetchone()
+        if inst is None:
+            return [], []
+        mark = float(inst["quoted_price"])
+        tick = engine.tick_size(mark, cfg)
+        half = half_spread_for(inst, current_tick, cfg)
+        bid0, ask0 = engine.quote_ticks(mark, half, tick)
+        cap_notional = (await participation_cap(conn)) * float(inst["liquidity"])
+        mm_qty = max(1, int(cap_notional / mark / levels)) if mark > 0 else 0
+
+        await cur.execute(
+            """
+            SELECT side, limit_price,
+                   SUM(quantity - filled_quantity) AS qty
+            FROM orders
+            WHERE instrument_id = %s AND status = 'OPEN'
+              AND limit_price IS NOT NULL AND season_id IS NULL
+              AND (order_type = 'LIMIT' OR triggered_tick IS NOT NULL)
+            GROUP BY side, limit_price
+            """,
+            (instrument_id,),
+        )
+        rows = await cur.fetchall()
+
+    real_bids = sorted(
+        ((r["limit_price"], int(r["qty"])) for r in rows if r["side"] == "BUY"),
+        key=lambda t: -t[0],
+    )
+    real_asks = sorted(
+        ((r["limit_price"], int(r["qty"])) for r in rows if r["side"] == "SELL"),
+        key=lambda t: t[0],
+    )
+
+    def _pad(
+        real: list[tuple[Decimal, int]], start: float, step: float
+    ) -> list[DepthLevel]:
+        out = [DepthLevel(price=p, quantity=q, synthetic=False) for p, q in real[:levels]]
+        edges = [start] + [float(p) for p, _ in real[:levels]]
+        edge = min(edges) if step < 0 else max(edges)
+        price = edge
+        while len(out) < levels:
+            price += step
+            if price <= 0:
+                break
+            out.append(
+                DepthLevel(
+                    price=Decimal(str(engine.round_to_tick(price, tick))),
+                    quantity=mm_qty,
+                    synthetic=True,
+                )
+            )
+        return out
+
+    # Bids pad downward from the deeper of (deepest real bid, MM bid);
+    # asks symmetrically upward. Real levels marketable across the spread
+    # still display -- they'll execute next tick.
+    bids = _pad(real_bids, bid0, -tick)
+    asks = _pad(real_asks, ask0, tick)
+    return bids, asks

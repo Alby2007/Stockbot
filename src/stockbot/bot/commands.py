@@ -49,6 +49,7 @@ from stockbot.margin.service import (
 from stockbot.market.data import (
     InstrumentSnapshot,
     all_instrument_snapshots,
+    book_depth,
     current_session,
     current_tick_index,
     get_instrument_snapshot,
@@ -179,6 +180,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def stock(interaction: discord.Interaction, ticker: str) -> None:
         async with db.connection() as conn:
             snapshot = await get_instrument_snapshot(conn, ticker)
+            depth = (
+                await book_depth(conn, snapshot.id)
+                if snapshot is not None
+                else ([], [])
+            )
         if snapshot is None:
             await interaction.response.send_message(
                 f"No instrument found for `{ticker.upper()}`.", ephemeral=True
@@ -196,6 +202,26 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         if snapshot.day_change_pct is not None:
             embed.add_field(name="24h change", value=format_pct(snapshot.day_change_pct))
         embed.add_field(name="Impact", value=format_pct(float(snapshot.impact)))
+        bids, asks = depth
+        if bids or asks:
+            lines = ["`   BID      | ASK     `"]
+            for i in range(max(len(bids), len(asks))):
+                b = (
+                    f"{bids[i].quantity:>7,} {float(bids[i].price):>8.2f}"
+                    + ("~" if bids[i].synthetic else " ")
+                    if i < len(bids)
+                    else " " * 17
+                )
+                a = (
+                    f"{float(asks[i].price):>8.2f} {asks[i].quantity:<7,}"
+                    + ("~" if asks[i].synthetic else "")
+                    if i < len(asks)
+                    else ""
+                )
+                lines.append(f"`{b}|{a}`")
+            embed.add_field(
+                name="Book depth (~ = MM)", value="\n".join(lines), inline=False
+            )
         embed.add_field(name="24h volume", value=f"{snapshot.day_volume:,} shares")
         embed.add_field(
             name="Short interest",

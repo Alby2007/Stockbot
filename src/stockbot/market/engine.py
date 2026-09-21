@@ -154,6 +154,7 @@ class InstrumentState:
     base_price: float
     fundamental_value: float
     impact: float
+    drift_state: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -164,6 +165,7 @@ class InstrumentTickResult:
     impact: float
     quoted_price: float
     circuit_breached: bool
+    drift_state: float = 0.0
 
 
 def step_instrument(
@@ -172,23 +174,40 @@ def step_instrument(
     market_factor: float,
     sector_factor: float,
     dt: float = 1.0,
+    *,
+    mom_rho: float = 1.0,
+    mom_innov_frac: float = 0.0,
+    mom_max_frac: float = 0.0,
 ) -> InstrumentTickResult:
-    """Advance one instrument by one tick. Makes exactly two sampler calls
-    on `rng` (idiosyncratic Student-t, then fundamental normal) --
-    unconditional and in a fixed instrument order so the tick is
-    reproducible. (standard_t's internal gamma rejection sampling may
-    consume a variable number of uniforms, but that count is itself a
-    deterministic function of the seed -- what must never vary is the
-    *call pattern*.)
+    """Advance one instrument by one tick. Makes exactly three sampler calls
+    on `rng` (momentum-regime normal, idiosyncratic Student-t, then
+    fundamental normal) -- unconditional and in a fixed instrument order so
+    the tick is reproducible. (standard_t's internal gamma rejection
+    sampling may consume a variable number of uniforms, but that count is
+    itself a deterministic function of the seed -- what must never vary is
+    the *call pattern*.)
 
     `inst.sigma` is the *effective* per-tick sigma: `market/tick.py` passes
     sigma_eff (sigma_i scaled by the vol-regime multiplier), so regime state
-    enters the model through this input alone.
+    enters the model through this input alone. The momentum regime
+    `drift_state` is an additive per-tick drift in the same units, evolved
+    AR(1) with persistence `mom_rho` and innovation scale
+    `mom_innov_frac * sigma` per sqrt-tick, clipped to
+    `mom_max_frac * sigma` (sigma_eff == 0 names keep drift_state pinned at
+    0). Defaults disable the regime entirely.
     """
+    drift_innov = (
+        mom_innov_frac * inst.sigma * dt**0.5 * float(rng.standard_normal())
+    )
+    drift_cap = mom_max_frac * inst.sigma
+    drift_state = float(
+        np.clip(mom_rho * inst.drift_state + drift_innov, -drift_cap, drift_cap)
+    )
+
     idiosyncratic = float(rng.standard_t(STUDENT_T_DF)) * STUDENT_T_SCALE
     mean_reversion = inst.kappa * float(np.log(inst.fundamental_value / inst.base_price)) * dt
     delta_log_price = (
-        inst.drift * dt
+        (inst.drift + drift_state) * dt
         + inst.beta * market_factor
         + inst.gamma * sector_factor
         + inst.sigma * dt**0.5 * idiosyncratic
@@ -214,11 +233,15 @@ def step_instrument(
         impact=new_impact,
         quoted_price=quoted_price,
         circuit_breached=circuit_breached,
+        drift_state=drift_state,
     )
 
 
 def freeze_instrument(inst: InstrumentState, dt: float = 1.0) -> InstrumentTickResult:
-    """A halted instrument: price and fundamental stay put, impact still decays."""
+    """A halted instrument: price and fundamental stay put, impact still
+    decays. The momentum regime freezes too -- no draw, drift_state carried
+    through unchanged (consistent with the no-draw contract for frozen
+    names)."""
     new_impact = inst.impact * float(np.exp(-dt / inst.tau_ticks))
     quoted_price = inst.base_price * float(np.exp(new_impact))
     return InstrumentTickResult(
@@ -228,6 +251,7 @@ def freeze_instrument(inst: InstrumentState, dt: float = 1.0) -> InstrumentTickR
         impact=new_impact,
         quoted_price=quoted_price,
         circuit_breached=False,
+        drift_state=inst.drift_state,
     )
 
 

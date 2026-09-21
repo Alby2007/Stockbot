@@ -136,7 +136,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                        i.kappa, i.fundamental_sigma, i.tau_ticks, i.base_price,
                        i.fundamental_value, i.impact, i.circuit_halted_until_tick,
                        i.float_shares, i.index_divisor, i.dividend_drift_offset,
-                       i.vol_state, i.sigma_eff
+                       i.vol_state, i.sigma_eff, i.drift_state
                 FROM instruments i
                 JOIN sectors s ON s.id = i.sector_id
                 WHERE i.is_active
@@ -179,6 +179,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             flow_delta.setdefault(int(fr[0]), {})[int(fr[1])] = float(fr[2])
         vol_cfg = await data.vol_config(conn)
         flow_cfg = await data.flow_config(conn)
+        mom_cfg = await data.mom_config(conn)
 
         # Phase H flow decomposition, computed up front because H2's
         # cross-impact needs every instrument's bounded flow before any
@@ -273,6 +274,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                 ),
                 fundamental_value=fundamentals[row["id"]],
                 impact=float(row["impact"]),
+                drift_state=float(row["drift_state"]),
             )
             opens[state.id] = state.base_price * math.exp(state.impact)
 
@@ -288,7 +290,14 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                 halts[state.id] = row["circuit_halted_until_tick"]
             else:
                 result = engine.step_instrument(
-                    rng, state, market_factor, sector_factors[state.sector_key], dt=gap_dt
+                    rng,
+                    state,
+                    market_factor,
+                    sector_factors[state.sector_key],
+                    dt=gap_dt,
+                    mom_rho=float(mom_cfg.get("mom.rho", 1.0)),
+                    mom_innov_frac=float(mom_cfg.get("mom.innov_frac", 0.0)),
+                    mom_max_frac=float(mom_cfg.get("mom.max_frac", 0.0)),
                 )
                 halts[state.id] = (
                     tick_index + engine.CIRCUIT_HALT_TICKS if result.circuit_breached else None
@@ -304,6 +313,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                     impact=new_impact,
                     quoted_price=result.base_price * math.exp(new_impact),
                     circuit_breached=result.circuit_breached,
+                    drift_state=result.drift_state,
                 )
             results.append(result)
 
@@ -441,7 +451,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             if results:
                 update_rows = sql.SQL(", ").join(
                     sql.SQL("({})").format(
-                        sql.SQL(", ").join(sql.Placeholder() for _ in range(9))
+                        sql.SQL(", ").join(sql.Placeholder() for _ in range(10))
                     )
                     for _ in results
                 )
@@ -457,11 +467,12 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                             last_halt_end_tick = COALESCE(
                                 v.new_halt_end::bigint, i.last_halt_end_tick),
                             vol_state = v.vol_state::numeric,
-                            sigma_eff = v.sigma_eff::numeric
+                            sigma_eff = v.sigma_eff::numeric,
+                            drift_state = v.drift_state::numeric
                         FROM (VALUES {}) AS v(
                             base_price, fundamental_value, impact, quoted_price,
                             circuit_halted_until_tick, new_halt_end,
-                            vol_state, sigma_eff, id
+                            vol_state, sigma_eff, drift_state, id
                         )
                         WHERE i.id = v.id::int
                         """
@@ -483,6 +494,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                             ),
                             vol_new[result.id],
                             sigma_eff_new[result.id],
+                            result.drift_state,
                             result.id,
                         )
                     ],

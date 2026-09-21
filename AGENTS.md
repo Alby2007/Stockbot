@@ -265,6 +265,27 @@ _assert_depth stay on static liquidity (finding 7's death-spiral
 guard). adv_ref_frac ≈ 2.5e-8 was measured as the sim's mean
 ADV/liquidity ratio so the multiplier centers near 1.
 
+Momentum/book notes (Phase I): `instruments.drift_state` is an AR(1)
+additive drift regime (I1) -- `step_instrument` now makes THREE sampler
+calls per tick (momentum normal, idiosyncratic Student-t, fundamental
+normal), all unconditional. The regime update `d = clip(rho*d +
+innov_frac*sigma_eff*sqrt(dt)*eps, +-max_frac*sigma_eff)` lands BEFORE
+this tick's step, so the innovation applies immediately; scales with
+sigma_eff so momentum and vol clustering compound. rho=0.995 (half-life
+~138 ticks) is deliberately a few times the seeded kappa half-lives
+(25-75): much faster and the regime overwhelms the fundamental anchor,
+much slower and it washes out. Frozen/halted names carry drift_state
+unchanged (no draw); INDEX names have sigma=0 so theirs stays 0. With
+mom.* absent the max_frac=0 default wipes drift_state -- "disabled" is
+a reset, not a freeze. Tests resetting instrument state for re-tick
+comparisons must restore drift_state too (same trap as vol_state in
+test_tick.py). I2: `book_depth()` in market/data.py renders the /stock
+book -- real LIMIT + triggered levels (season_id IS NULL only; league
+books are a separate book entirely), best-first, padded outward with
+synthetic MM rungs sized at participation_cap*liquidity/mark/levels per
+rung. Untriggered stops are invisible to the matcher and so to the
+book.
+
 Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
 preserved -- short proceeds credit to cash and are spendable; leverage is
 bounded by post-trade margin gates, not negative cash). Maintenance applies
