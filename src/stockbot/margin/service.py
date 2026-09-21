@@ -236,14 +236,21 @@ async def _record_fund_flow(
     reason: str,
     liquidation_id: int | None,
     tick_index: int | None,
+    *,
+    mm_absorbed_minor: int = 0,
 ) -> None:
+    """Audit row for a fund movement. `amount_minor` is strictly the fund's
+    balance delta (so `fund_balance == SUM(amount_minor)` holds); a loss
+    MARKET_MAKER absorbed instead goes on `mm_absorbed_minor` -- the fund
+    never paid it, so it must not enter the sum."""
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            INSERT INTO insurance_fund_flows (amount_minor, reason, liquidation_id, tick_index)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO insurance_fund_flows
+                (amount_minor, reason, liquidation_id, tick_index, mm_absorbed_minor)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            (amount_minor, reason, liquidation_id, tick_index),
+            (amount_minor, reason, liquidation_id, tick_index, mm_absorbed_minor),
         )
 
 
@@ -474,7 +481,16 @@ async def _liquidate_leg(
                 conn, -fund_pays, "COVER_SHORTFALL", liquidation_id, tick_index
             )
         if shortfall > 0 and residual > 0:
-            await _record_fund_flow(conn, -residual, "ADL", liquidation_id, tick_index)
+            # amount_minor stays 0: the fund paid nothing here -- the
+            # residual is MARKET_MAKER's loss, tracked on its own column.
+            await _record_fund_flow(
+                conn,
+                0,
+                "ADL",
+                liquidation_id,
+                tick_index,
+                mm_absorbed_minor=residual,
+            )
 
 
 async def _liquidate_account(
@@ -673,7 +689,9 @@ async def _liquidate_account(
                     amount=residual,
                     reason="ADL_BACKSTOP",
                 )
-                await _record_fund_flow(conn, -residual, "ADL", None, tick_index)
+                await _record_fund_flow(
+                    conn, 0, "ADL", None, tick_index, mm_absorbed_minor=residual
+                )
 
     return legs
 
@@ -767,7 +785,7 @@ async def accrue_borrow_fees(conn: AsyncConnection) -> None:
             SET borrow_fees_accrued = borrow_fees_accrued
                   + (-p.quantity * i.quoted_price * 100 * %s
                      * (1 + %s * POWER(
-                           i.short_interest_pct / NULLIF(%s, 0), 2)) / 10000)
+                           i.short_interest_pct / GREATEST(%s, 0.0001), 2)) / 10000)
             FROM instruments i
             WHERE i.id = p.instrument_id AND p.quantity < 0
             """,

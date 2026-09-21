@@ -14,14 +14,6 @@ class InstrumentHaltedError(TradingError):
         super().__init__(f"{ticker} is halted by the circuit breaker")
 
 
-class InsufficientSharesError(TradingError):
-    def __init__(self, ticker: str, requested: int, held: int):
-        self.ticker = ticker
-        self.requested = requested
-        self.held = held
-        super().__init__(f"cannot sell {requested} shares of {ticker}; only {held} held")
-
-
 class InsufficientDepthError(TradingError):
     """A single marketable fill exceeds the participation cap -- the
     instrument's liquidity can't absorb that much notional at once."""

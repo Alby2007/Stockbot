@@ -204,6 +204,31 @@ can't be referenced in its own transaction -- that's why the enum lives in
   per-real-day. Don't "fix" it back to CURRENT_DATE only.
 - Circuit halt semantics: `circuit_halted_until_tick` is the *last* frozen
   tick (compared with `>=`), so a breach at T freezes T+1..T+CIRCUIT_HALT_TICKS.
+- `close_season` claims the ACTIVE/SCHEDULED -> CLOSED flip atomically
+  (`UPDATE ... WHERE status <> 'CLOSED' RETURNING`) inside its own
+  transaction -- a bare-statement version committed nothing outside the
+  tick path, and an unguarded version could double-pay prizes on a racing
+  close. `join_season` re-checks status under `FOR SHARE` for the
+  join-vs-close race and maps the league-account UniqueViolation to
+  AlreadyEnteredError (check-then-insert can't win a concurrent join).
+- Insurance-fund reconciliation: `fund_balance == SUM(flows.amount_minor)`
+  holds because ADL rows write `amount_minor = 0` -- the absorbed residual
+  is MARKET_MAKER's loss and lives on `mm_absorbed_minor`. Never record an
+  MM absorption as a negative amount_minor.
+- `match_orders` MM fills re-check `result.fill_price` against the limit
+  inside the savepoint: the candidate pre-check sees a stale instrument
+  snapshot (earlier fills moved `impact`) and doesn't model the squeeze
+  boost execute_trade adds on BUYs. A breaching fill rolls back and the
+  order stays OPEN.
+- `place_order` validates `season_id` at placement (ACTIVE + entered,
+  same rule execute_trade enforces at fill); a league order placed
+  against a dead/unjoined season would rest OPEN forever otherwise.
+- Squeeze-boost SI is one tick stale for order fills by design
+  (refresh_short_interest runs after match_orders). Bounded shorts accrue
+  no borrow fees -- strictly cheaper carry than margin shorts, trading it
+  off against the KO + capped-risk payoff. SBX40 has float_shares=0 so
+  its short-interest cap is vacuous (the one instrument with unbounded
+  shorting; margin gates still bound it).
 - Backlog: `idempotency_keys` and resolved `events` grow forever -- add a
   retention cleanup when they get big.
 

@@ -65,6 +65,12 @@ async def scan_for_wash_trades(
                   AND b.tick_index IS NOT NULL
                   AND b.tick_index >= %s
                   AND i.liquidity <= threshold.liq_cutoff
+                  -- Book crosses look exactly like this pair (opposite
+                  -- sides, same tick, two users) but are legitimate
+                  -- matching: they carry counterparty_user_id. Only
+                  -- MM-mediated fills (NULL counterparty) are suspicious.
+                  AND b.counterparty_user_id IS NULL
+                  AND s.counterparty_user_id IS NULL
                   AND NOT EXISTS (
                       SELECT 1 FROM wash_trade_flags f
                       WHERE f.buy_trade_id = b.id AND f.sell_trade_id = s.id

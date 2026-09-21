@@ -20,7 +20,6 @@ perturb the price engine's own draw sequence).
 
 from __future__ import annotations
 
-import math
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
@@ -29,7 +28,6 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from stockbot.ledger.service import get_system_account_id, post_transfer
-from stockbot.market import data
 from stockbot.market.engine import TICKS_PER_DAY
 
 EARNINGS_INTERVAL_TICKS = 30 * TICKS_PER_DAY
@@ -104,25 +102,21 @@ def _pays_dividends(instrument_id: int, payer_pct: float) -> bool:
     return (instrument_id * 2654435761) % 100 < payer_pct
 
 
-def _dividend_fields(
+def _dividend_per_share(
     rng: np.random.Generator,
     cfg: dict[str, float],
     quoted: float,
-    window: int,
-    open_fraction: float = 1.0,
-) -> tuple[Decimal, Decimal]:
-    """Per-share dividend and the per-tick drift offset that funds it:
-    cumulatively -ln(1-yield) over the window, so the expected price path
-    is lower by exactly the payout fraction (redistribute, don't mint).
+) -> Decimal:
+    """Per-share dividend for a new ex-date.
 
-    Only open ticks step the factor model, so the offset is spread over
-    the *open* ticks in the window (window * open_fraction), not all of
-    them -- otherwise payouts would be underfunded by the closed share."""
+    No drift pre-bleed: the ex-date drop is self-funding under the
+    MM-as-counterparty model (MARKET_MAKER pays the cash and is short the
+    aggregate book, so its mark-to-market on the drop offsets the payout).
+    A drift offset would double-suppress ~2x the dividend per cycle --
+    shorts would pocket the second drop while owing only one.
+    """
     yield_frac = float(rng.uniform(cfg["dividend.min_yield"], cfg["dividend.max_yield"]))
-    div_per_share = Decimal(str(round(quoted * yield_frac, 6)))
-    open_ticks_in_window = max(1, round(window * open_fraction))
-    drift_offset = Decimal(str(-math.log(1.0 - yield_frac) / open_ticks_in_window))
-    return div_per_share, drift_offset
+    return Decimal(str(round(quoted * yield_frac, 6)))
 
 
 async def schedule_initial_dividends(
@@ -147,23 +141,20 @@ async def schedule_initial_dividends(
 
     interval = int(cfg.get("dividend.interval_ticks", 86400))
     jitter = int(cfg.get("dividend.jitter_ticks", 20160))
-    open_fraction = data.session_open_fraction(await data.session_config(conn))
     for row in rows:
         if not _pays_dividends(int(row["id"]), payer_pct):
             continue
         window = max(1, interval + int(rng.integers(-jitter, jitter + 1)))
-        div, offset = _dividend_fields(
-            rng, cfg, float(row["quoted_price"]), window, open_fraction
-        )
+        div = _dividend_per_share(rng, cfg, float(row["quoted_price"]))
         async with conn.cursor() as cur:
             await cur.execute(
                 """
                 INSERT INTO events
                     (instrument_id, kind, scheduled_tick, resolve_tick,
-                     dividend_per_share, drift_offset)
-                VALUES (%s, 'DIVIDEND', %s, %s, %s, %s)
+                     dividend_per_share)
+                VALUES (%s, 'DIVIDEND', %s, %s, %s)
                 """,
-                (row["id"], current_tick, current_tick + window, div, offset),
+                (row["id"], current_tick, current_tick + window, div),
             )
 
 
@@ -266,18 +257,17 @@ async def _resolve_dividend(
     quoted = float(row[0]) if row else float(div)
     interval = int(cfg.get("dividend.interval_ticks", 86400))
     jitter = int(cfg.get("dividend.jitter_ticks", 20160))
-    open_fraction = data.session_open_fraction(await data.session_config(conn))
     window = max(1, interval + int(rng.integers(-jitter, jitter + 1)))
-    next_div, next_offset = _dividend_fields(rng, cfg, quoted, window, open_fraction)
+    next_div = _dividend_per_share(rng, cfg, quoted)
     async with conn.cursor() as cur:
         await cur.execute(
             """
             INSERT INTO events
                 (instrument_id, kind, scheduled_tick, resolve_tick,
-                 dividend_per_share, drift_offset)
-            VALUES (%s, 'DIVIDEND', %s, %s, %s, %s)
+                 dividend_per_share)
+            VALUES (%s, 'DIVIDEND', %s, %s, %s)
             """,
-            (instrument_id, current_tick, current_tick + window, next_div, next_offset),
+            (instrument_id, current_tick, current_tick + window, next_div),
         )
     return div
 
@@ -303,11 +293,13 @@ async def resolve_due_events(
         # different draws to the same events across replays.
         await cur.execute(
             """
-            SELECT id, instrument_id, kind, magnitude, dividend_per_share
-            FROM events
-            WHERE resolve_tick <= %s AND NOT resolved
-            ORDER BY id
-            FOR UPDATE
+            SELECT e.id, e.instrument_id, e.kind, e.magnitude,
+                   e.dividend_per_share, i.kind AS instrument_kind
+            FROM events e
+            JOIN instruments i ON i.id = e.instrument_id
+            WHERE e.resolve_tick <= %s AND NOT e.resolved
+            ORDER BY e.id
+            FOR UPDATE OF e
             """,
             (current_tick,),
         )
@@ -316,6 +308,18 @@ async def resolve_due_events(
     dividend_drops: dict[int, Decimal] = {}
     for event in due:
         instrument_id = event["instrument_id"]
+
+        if event["instrument_kind"] == "INDEX":
+            # Scheduling never creates events on the index, but a
+            # hand-inserted row would resolve here -- a DIVIDEND on SBX40
+            # would pay index longs cash with no real price drop. Swallow
+            # it: mark resolved, apply nothing.
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE events SET resolved = TRUE WHERE id = %s",
+                    (event["id"],),
+                )
+            continue
 
         if event["kind"] == "DIVIDEND":
             div = await _resolve_dividend(conn, rng, event, current_tick)
@@ -364,9 +368,10 @@ async def refresh_next_event_ticks(conn: AsyncConnection) -> None:
 
     One aggregate UPDATE per tick, called after all event creation/resolution
     in apply_tick, so it's self-healing: no per-insert bookkeeping and it can
-    never drift. `next_event_tick` feeds the spread's event-proximity term;
-    `dividend_drift_offset` is the sum of pending dividends' per-tick drift
-    reductions, subtracted from the instrument's drift while accruing.
+    never drift. `next_event_tick` feeds the spread's event-proximity term.
+    `dividend_drift_offset` is vestigial -- the ex-date drop alone funds the
+    payout now (a pre-bleed would double-suppress it), so new DIVIDEND
+    events carry a NULL offset and this aggregate stays 0.
     """
     async with conn.cursor() as cur:
         await cur.execute(

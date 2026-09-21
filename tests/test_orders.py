@@ -6,6 +6,7 @@ from decimal import Decimal
 
 import pytest
 from psycopg import AsyncConnection
+from psycopg.rows import dict_row
 
 from stockbot.accounts.service import bootstrap_user
 from stockbot.ledger.service import (
@@ -14,6 +15,9 @@ from stockbot.ledger.service import (
     get_user_account_id,
     post_transfer,
 )
+from stockbot.margin.service import margin_config
+from stockbot.market import engine
+from stockbot.market.data import half_spread_for, spread_config
 from stockbot.market.tick import apply_tick
 from stockbot.orders.service import (
     cancel_order,
@@ -21,7 +25,7 @@ from stockbot.orders.service import (
     match_orders,
     place_order,
 )
-from stockbot.trading.errors import UnknownInstrumentError
+from stockbot.trading.errors import NotInLeagueError, UnknownInstrumentError
 from stockbot.trading.service import execute_trade
 
 SEED = "orders-test-seed"
@@ -166,14 +170,38 @@ async def test_order_unfillable_stays_open(conn: AsyncConnection) -> None:
     assert await _order_status(conn, order.order_id) == "OPEN"
 
 
-async def test_list_open_orders_scopes_by_season(conn: AsyncConnection) -> None:
+async def test_place_order_rejects_unjoined_season(conn: AsyncConnection) -> None:
+    """A league order on a season the user isn't actively entered in is
+    rejected at placement, not left to fail NotInLeagueError every tick."""
     from stockbot.seasons.service import create_season
+
+    await bootstrap_user(conn, 3010)
+    ticker = await _first_ticker(conn)
+    season_id = await create_season(
+        conn, name="orders-nope", start_tick=0, end_tick=10_000
+    )
+    with pytest.raises(NotInLeagueError):
+        await place_order(
+            conn,
+            user_id=3010,
+            ticker=ticker,
+            side="BUY",
+            quantity=1,
+            limit_price=Decimal("0.01"),
+            season_id=season_id,
+        )
+
+
+async def test_list_open_orders_scopes_by_season(conn: AsyncConnection) -> None:
+    from stockbot.seasons.service import create_season, join_season, on_tick
 
     await bootstrap_user(conn, 3007)
     ticker = await _first_ticker(conn)
     season_id = await create_season(
         conn, name="orders-test", start_tick=0, end_tick=10_000
     )
+    await on_tick(conn, 0)  # activate so league orders are accepted
+    await join_season(conn, 3007, season_id)
     await place_order(
         conn, user_id=3007, ticker=ticker, side="BUY", quantity=1,
         limit_price=Decimal("0.01"),
@@ -186,3 +214,103 @@ async def test_list_open_orders_scopes_by_season(conn: AsyncConnection) -> None:
     league = await list_open_orders(conn, 3007, season_id=season_id)
     assert len(main) == 1 and len(league) == 1
     assert league[0]["limit_price"] == Decimal("0.02")
+
+
+async def test_mm_fill_that_breaches_limit_stays_open(conn: AsyncConnection) -> None:
+    """execute_trade re-reads the instrument and adds the squeeze boost on
+    BUYs -- the candidate pre-check can't see it, so a fill can land above
+    its limit even though the estimate passed. The post-fill check rolls it
+    back and the order stays OPEN."""
+    await bootstrap_user(conn, 3008)
+    ticker = await _first_ticker(conn)
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute("SELECT * FROM instruments WHERE ticker = %s", (ticker,))
+        inst = await cur.fetchone()
+        # Crowded short: execute_trade boosts buy-side impact over the
+        # squeeze threshold.
+        await cur.execute(
+            "UPDATE instruments SET short_interest_pct = 0.95 WHERE id = %s",
+            (inst["id"],),
+        )
+
+    cfg = await margin_config(conn)
+    over = Decimal("0.95") - cfg["margin.squeeze_si_threshold"]
+    assert over > 0
+    boosted_lam = float(inst["lambda_impact"]) * float(
+        1 + cfg["margin.squeeze_lambda_boost"] * over
+    )
+    spread_cfg = await spread_config(conn)
+    base = float(inst["base_price"])
+    imp = float(inst["impact"])
+    liq = float(inst["liquidity"])
+    lam = float(inst["lambda_impact"])
+    mi = float(inst["max_impact"])
+    mark = Decimal(inst["quoted_price"])
+    hs = half_spread_for(inst, None, spread_cfg)
+
+    # Find a quantity where the pre-check estimate passes its limit while
+    # the squeezed actual fill breaches it. The limit sits at the midpoint
+    # of the est..act window -- the exact gap the candidate scan can't see.
+    qty: int | None = None
+    limit: Decimal | None = None
+    for q in (1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500):
+        est, _ = engine.apply_trade_impact(
+            base_price=base, impact_before=imp, signed_notional=base * q,
+            liquidity=liq, lambda_impact=lam, max_impact=mi, half_spread=hs,
+        )
+        act, _ = engine.apply_trade_impact(
+            base_price=base, impact_before=imp, signed_notional=base * q,
+            liquidity=liq, lambda_impact=boosted_lam, max_impact=mi, half_spread=hs,
+        )
+        cand = Decimal(str((est + act) / 2))
+        # Candidate filter needs quoted <= limit*(1 - epsilon=0.0005).
+        if mark <= cand * Decimal("0.9995"):
+            qty, limit = q, cand
+            break
+    assert qty is not None and limit is not None
+
+    order = await place_order(
+        conn, user_id=3008, ticker=ticker, side="BUY", quantity=qty,
+        limit_price=limit,
+    )
+    assert await match_orders(conn, 999999) == 0
+    assert await _order_status(conn, order.order_id) == "OPEN"
+
+    # The order was genuinely fillable: with normal short interest the
+    # same fill lands under the limit and completes.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE instruments SET short_interest_pct = 0 WHERE id = %s",
+            (inst["id"],),
+        )
+    assert await match_orders(conn, 999999) == 1
+    assert await _order_status(conn, order.order_id) == "FILLED"
+
+
+async def test_deterministic_fill_failures_auto_cancel(conn: AsyncConnection) -> None:
+    """An order that can never settle retries every tick; after
+    order.max_fill_failures strikes the matcher auto-cancels it."""
+    await bootstrap_user(conn, 3015)  # starting grant only: fills always fail
+    ticker = await _first_ticker(conn)
+    mark = await _quoted(conn, ticker)
+    order = await place_order(
+        conn, user_id=3015, ticker=ticker, side="BUY", quantity=50,
+        limit_price=mark * 2,
+    )
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = 3 WHERE key = 'order.max_fill_failures'"
+        )
+
+    for _ in range(2):
+        await match_orders(conn, 999999)
+        assert await _order_status(conn, order.order_id) == "OPEN"
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT fill_failures FROM orders WHERE id = %s", (order.order_id,)
+            )
+            assert (await cur.fetchone())[0] < 3
+
+    await match_orders(conn, 999999)
+    assert await _order_status(conn, order.order_id) == "CANCELLED"

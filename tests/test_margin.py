@@ -404,3 +404,40 @@ async def test_refresh_short_interest(conn: AsyncConnection) -> None:
         )
         si, float_shares = await cur.fetchone()
     assert float(si) == pytest.approx(2 / float(float_shares), abs=1e-6)
+
+
+async def test_adl_absorption_is_not_a_fund_outflow(conn: AsyncConnection) -> None:
+    """ADL is MARKET_MAKER's loss: flows must keep
+    `fund_balance == SUM(amount_minor)` with the absorbed amount on
+    `mm_absorbed_minor`, not as a phantom fund payment."""
+    await bootstrap_user(conn, 2015)
+    await _grant_tier(conn, 2015)
+    ticker = await _first_ticker(conn)
+    await _levered_short(conn, 2015, ticker)
+
+    async with conn.cursor() as cur:
+        # Bankrupt the fund so the entire shortfall lands on MARKET_MAKER.
+        await cur.execute(
+            "UPDATE accounts SET balance = 0 WHERE system_name = 'INSURANCE_FUND'"
+        )
+        await cur.execute(
+            "UPDATE instruments SET base_price = base_price * 10, "
+            "quoted_price = quoted_price * 10 WHERE ticker = %s",
+            (ticker,),
+        )
+    await check_and_liquidate(conn, 2015)
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT COALESCE(SUM(amount_minor), 0), "
+            "COALESCE(SUM(mm_absorbed_minor), 0) FROM insurance_fund_flows"
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        flows, absorbed = int(row[0]), int(row[1])
+    assert absorbed > 0
+
+    fund_id = await get_system_account_id(conn, "INSURANCE_FUND")
+    # flows - seed == everything the fund actually moved since seeding;
+    # the drained balance proves the ADL amount never left the fund.
+    assert int(flows) - 50_000_00 == await get_balance(conn, fund_id)

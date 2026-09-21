@@ -349,13 +349,15 @@ async def test_uncrossed_remainder_falls_through_to_market_maker(
 
 async def test_cross_scoped_by_season(conn: AsyncConnection) -> None:
     """Main-portfolio and league orders never cross each other."""
-    from stockbot.seasons.service import create_season
+    from stockbot.seasons.service import create_season, join_season, on_tick
 
     await bootstrap_user(conn, 4015)
     await bootstrap_user(conn, 4016)
     ticker = await _liquid_ticker(conn)
     mark = await _quoted(conn, ticker)
     season_id = await create_season(conn, name="x-scope", start_tick=0, end_tick=100)
+    await on_tick(conn, 0)  # activate so league orders are accepted
+    await join_season(conn, 4015, season_id)
 
     ask = await place_order(
         conn, user_id=4015, ticker=ticker, side="SELL", quantity=1,
@@ -370,3 +372,46 @@ async def test_cross_scoped_by_season(conn: AsyncConnection) -> None:
     assert fills == 0
     assert (await _order_row(conn, ask.order_id))["status"] == "OPEN"
     assert (await _order_row(conn, bid.order_id))["status"] == "OPEN"
+
+
+async def test_cross_collar_anchors_to_tick_open_mark(conn: AsyncConnection) -> None:
+    """Anti-ratchet: the cross collar compares to the tick-open mark, not
+    the live mark -- a chain of colluding pairs can't step the price
+    collar-width at a time within one tick."""
+    for uid in (4017, 4018, 4019, 4020):
+        await bootstrap_user(conn, uid)
+    ticker = await _liquid_ticker(conn)
+    await _give_shares(conn, 4017, ticker, 1)
+    mark = await _give_shares(conn, 4019, ticker, 1)
+    for uid in (4018, 4020):
+        await _fund(conn, uid, 10_000_000)
+
+    step1 = (mark * Decimal("1.019")).quantize(Decimal("0.000001"))
+    step2 = (mark * Decimal("1.039")).quantize(Decimal("0.000001"))
+    # Pair 1 crosses inside the collar and prints the mark at step1.
+    await place_order(
+        conn, user_id=4017, ticker=ticker, side="SELL", quantity=1,
+        limit_price=step1,
+    )
+    # Pair 2's maker price is one more collar-width above the *live* mark
+    # after pair 1 (|step2-step1|/step1 < 2%) but far outside the collar of
+    # the tick-open mark -- it must not print.
+    ask2 = await place_order(
+        conn, user_id=4019, ticker=ticker, side="SELL", quantity=1,
+        limit_price=step2,
+    )
+    await place_order(
+        conn, user_id=4018, ticker=ticker, side="BUY", quantity=1,
+        limit_price=mark * Decimal("1.05"),
+    )
+    await place_order(
+        conn, user_id=4020, ticker=ticker, side="BUY", quantity=1,
+        limit_price=mark * Decimal("1.06"),
+    )
+
+    await match_orders(conn, 1)
+
+    # The mark printed at step1 and could not ratchet to step2.
+    new_mark = await _quoted(conn, ticker)
+    assert new_mark < mark * Decimal("1.035")
+    assert (await _order_row(conn, ask2.order_id))["status"] == "OPEN"

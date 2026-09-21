@@ -79,8 +79,14 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # OPEN tick. Position in the cycle 0 means this is the first tick
         # after the close: step with dt = closed_ticks so the overnight
         # drift/vol lands as one gap (breaker-bounded like any move).
+        # tick_index 0 is the exception: the market never closed, so the
+        # first-ever tick must not "reopen" with a closed_ticks gap.
         cycle_pos = (tick_index - offset) % (open_ticks + closed_ticks)
-        gap_dt = float(closed_ticks) if cycle_pos == 0 and closed_ticks > 0 else 1.0
+        gap_dt = (
+            float(closed_ticks)
+            if cycle_pos == 0 and closed_ticks > 0 and tick_index > 0
+            else 1.0
+        )
         impact_reset = (
             float(session_cfg.get("session.open_impact_reset", 1.0))
             if gap_dt > 1.0
@@ -132,8 +138,9 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             if row["kind"] == "INDEX":
                 continue  # priced from components below
             # Ex-date drop: the dividend subtracts from the base (immediate,
-            # permanent) rather than the decaying impact term, and the
-            # accrual-window drift offset already lowered the expected path.
+            # permanent) rather than the decaying impact term. This drop is
+            # the *entire* funding mechanism -- dividend_drift_offset is
+            # always 0 now (a pre-bleed would double-suppress the payout).
             div_drop = float(dividend_drops.get(row["id"], 0))
             state = engine.InstrumentState(
                 id=row["id"],
@@ -316,7 +323,10 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # Phase 2 margin maintenance, all inside the tick transaction where
         # every instrument is already locked: refresh published short
         # interest, accrue borrow fees on shorts, then liquidate any account
-        # that fell below maintenance margin at the new marks.
+        # that fell below maintenance margin at the new marks. Note the SI
+        # refresh runs AFTER match_orders -- order fills this tick see last
+        # tick's short_interest_pct (one-tick lag on the squeeze boost,
+        # benign).
         await margin.refresh_short_interest(conn)
         await margin.accrue_borrow_fees(conn)
         await margin.sweep_undermargined(conn, tick_index)

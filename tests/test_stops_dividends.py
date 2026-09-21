@@ -324,8 +324,8 @@ async def _insert_dividend(
         await cur.execute(
             """
             INSERT INTO events (instrument_id, kind, scheduled_tick, resolve_tick,
-                                dividend_per_share, drift_offset)
-            SELECT id, 'DIVIDEND', 0, %s, %s, 0.000001
+                                dividend_per_share)
+            SELECT id, 'DIVIDEND', 0, %s, %s
             FROM instruments WHERE ticker = %s
             """,
             (resolve_tick, div_per_share, ticker),
@@ -396,10 +396,12 @@ async def test_dividend_pays_longs_drops_price_and_reschedules(
         assert pending >= 1
 
     # Ex-date drop: quoted is ~div lower than it would have been. The step
-    # adds ordinary noise, so allow generous bounds.
+    # adds ordinary noise, so allow generous bounds -- but well under 2x:
+    # a pre-bleed drift offset would double-suppress the drop (the old
+    # dividend double-drag bug, a per-cycle short arb).
     new_mark = await _quoted(conn, ticker)
     drop = mark - new_mark
-    assert Decimal(str(div)) * Decimal("0.4") < drop < Decimal(str(div)) * Decimal("2.0")
+    assert Decimal(str(div)) * Decimal("0.4") < drop < Decimal(str(div)) * Decimal("1.5")
 
     assert await _ledger_sum(conn) == 0
 
@@ -444,10 +446,11 @@ async def test_dividend_accrues_on_short_then_settles_on_cover(
     assert await _ledger_sum(conn) == 0
 
 
-async def test_dividend_drift_offset_tracks_pending_events(conn: AsyncConnection) -> None:
-    """While an ex-date is pending, instruments.dividend_drift_offset
-    carries its per-tick drift reduction; resolution swaps it for the next
-    event's (self-healing aggregate)."""
+async def test_dividend_drift_offset_stays_zero(conn: AsyncConnection) -> None:
+    """Regression guard for the retired drift-offset model: pending and
+    resolved dividends must leave instruments.dividend_drift_offset at 0
+    and new events must not schedule an offset -- the ex-date drop alone
+    funds the payout (a pre-bleed would double-suppress ~2x/cycle)."""
     ticker = await _liquid_ticker(conn)
     mark = await _quoted(conn, ticker)
     await _insert_dividend(conn, ticker, float(mark) * 0.05, resolve_tick=10**9)
@@ -458,12 +461,10 @@ async def test_dividend_drift_offset_tracks_pending_events(conn: AsyncConnection
             "SELECT dividend_drift_offset FROM instruments WHERE ticker = %s",
             (ticker,),
         )
-        row = await cur.fetchone()
-        offset = Decimal(row[0])
-    assert offset == Decimal("0.000001")
+        assert Decimal((await cur.fetchone())[0]) == 0
 
-    # Force the ex-date: after resolution the offset becomes the next
-    # event's, which the reschedule just created.
+    # Force the ex-date: resolution must also keep the aggregate at zero
+    # and the rescheduled event carries no offset.
     async with conn.cursor() as cur:
         await cur.execute(
             "UPDATE events SET resolve_tick = 0 WHERE kind = 'DIVIDEND' "
@@ -477,15 +478,14 @@ async def test_dividend_drift_offset_tracks_pending_events(conn: AsyncConnection
             "SELECT dividend_drift_offset FROM instruments WHERE ticker = %s",
             (ticker,),
         )
-        new_offset = Decimal((await cur.fetchone())[0])
+        assert Decimal((await cur.fetchone())[0]) == 0
         await cur.execute(
             "SELECT e.drift_offset FROM events e "
             "JOIN instruments i ON i.id = e.instrument_id "
             "WHERE i.ticker = %s AND e.kind = 'DIVIDEND' AND NOT e.resolved",
             (ticker,),
         )
-        pending_offset = Decimal((await cur.fetchone())[0])
-    assert new_offset == pending_offset
+        assert (await cur.fetchone())[0] in (None, Decimal(0))
 
 
 async def test_bounded_shorts_ignore_dividends(conn: AsyncConnection) -> None:

@@ -54,6 +54,15 @@ Side = Literal["BUY", "SELL"]
 OrderType = Literal["LIMIT", "STOP", "STOP_LIMIT"]
 
 
+class _LimitBreach(Exception):
+    """An actual fill landed worse than the order's limit.
+
+    Deliberately distinct from the deterministic failure classes: a breach
+    is mark-dependent (the order may fill next tick), so it must not count
+    toward `orders.fill_failures` auto-cancellation.
+    """
+
+
 @dataclass(frozen=True)
 class OrderResult:
     order_id: int
@@ -118,6 +127,21 @@ async def place_order(
         if row is None or not row[1]:
             raise UnknownInstrumentError(ticker)
         instrument_id = int(row[0])
+        if season_id is not None:
+            # Placement-time league check (the same rule execute_trade
+            # enforces at fill): an order on a season the user isn't
+            # actively entered in would rest OPEN forever, raising
+            # NotInLeagueError on every match pass.
+            await cur.execute(
+                """
+                SELECT 1 FROM season_entries e
+                JOIN seasons s ON s.id = e.season_id
+                WHERE e.user_id = %s AND e.season_id = %s AND s.status = 'ACTIVE'
+                """,
+                (user_id, season_id),
+            )
+            if await cur.fetchone() is None:
+                raise NotInLeagueError(user_id, season_id)
         tick = await _current_tick(conn)
         expires_tick = (
             None if expires_in_ticks is None else (tick or 0) + expires_in_ticks
@@ -345,10 +369,15 @@ async def _settle_cross(
                         WHEN filled_quantity + %s >= quantity THEN %s
                         ELSE filled_tick END,
                     fill_price = %s
-                WHERE id = %s
+                WHERE id = %s AND status = 'OPEN'
                 """,
                 (quantity, quantity, quantity, tick_index, cross_price, order["id"]),
             )
+            if cur.rowcount == 0:
+                # A cancel committed between the book snapshot and this
+                # write: without the re-check the fill would overwrite
+                # 'CANCELLED'. Roll back the whole cross via the savepoint.
+                raise ValueError(f"order {order['id']} is no longer open")
 
     await update_candle_with_fill(conn, instrument_id, cross_price, quantity)
     return new_mark, new_impact, halted
@@ -430,19 +459,35 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
         await cur.execute(
             "SELECT key, value FROM config WHERE key IN "
             "('cross.collar_pct', 'cross.trade_through_epsilon', "
-            " 'order.stop_cascade_max_iters')"
+            " 'order.stop_cascade_max_iters', 'order.max_fill_failures')"
         )
         cfg_rows = {str(r["key"]): float(r["value"]) for r in await cur.fetchall()}
     collar = Decimal(str(cfg_rows.get("cross.collar_pct", 0.02)))
     epsilon = float(cfg_rows.get("cross.trade_through_epsilon", 0.0005))
     cascade_max = int(cfg_rows.get("order.stop_cascade_max_iters", 8))
+    max_fill_failures = int(cfg_rows.get("order.max_fill_failures", 5))
 
+    # Per-order, not per-instrument: the participation budget is keyed by
+    # order id, so N resting orders on one instrument get N*cap notional
+    # per tick (consistent with execute_trade's per-fill cap -- splitting a
+    # big order multiplies throughput).
     depth_used: dict[int, int] = {}
+    # Tick-open mark per instrument, anchored on first sight. The cross
+    # collar compares against this -- not the live mark -- so a chain of
+    # colluding pairs can't ratchet the mark 2% per cross (each cross
+    # re-anchored the next collar check to the print it just made).
+    open_marks: dict[int, float] = {}
     fills = 0
     await _trigger_due_stops(conn, tick_index)
     for _ in range(cascade_max):
         fills += await _match_once(
-            conn, tick_index, collar=collar, epsilon=epsilon, depth_used=depth_used
+            conn,
+            tick_index,
+            collar=collar,
+            epsilon=epsilon,
+            depth_used=depth_used,
+            open_marks=open_marks,
+            max_fill_failures=max_fill_failures,
         )
         if await _trigger_due_stops(conn, tick_index) == 0:
             break
@@ -456,6 +501,8 @@ async def _match_once(
     collar: Decimal,
     epsilon: float,
     depth_used: dict[int, int],
+    open_marks: dict[int, float],
+    max_fill_failures: int,
 ) -> int:
     """One matching pass over the book: crosses, then MM fallback.
     `depth_used` accumulates MM-filled shares per order across cascade
@@ -505,6 +552,11 @@ async def _match_once(
             for o in bids + asks
         }
         i = j = 0
+        # Tick-open anchor for the collar: `mark` drifts as crosses print,
+        # so comparing each new cross to the live mark lets pairs ratchet
+        # the price collar-width at a time. Anchor to the mark this
+        # instrument opened the tick with instead.
+        open_mark = open_marks.setdefault(_iid, mark)
         while i < len(bids) and j < len(asks):
             bid, ask = bids[i], asks[j]
             bid_eff = Decimal("Infinity") if _marketable(bid) else bid["limit_price"]
@@ -530,7 +582,9 @@ async def _match_once(
                 cross_price = Decimal((ask if bid_maker else bid)["limit_price"])
             else:
                 cross_price = Decimal(str(mark))
-            if abs(cross_price - Decimal(str(mark))) / Decimal(str(mark)) > collar:
+            if abs(cross_price - Decimal(str(open_mark))) / Decimal(
+                str(open_mark)
+            ) > collar:
                 # The maker's price is too far off the mark to print --
                 # it rests; try the pair without it.
                 if bid_maker:
@@ -656,6 +710,22 @@ async def _match_once(
                     ),
                     order_id=int(order["id"]),
                 )
+                if order["limit_price"] is not None:
+                    # Authoritative limit check on the *actual* fill: the
+                    # candidate pre-check ran on a snapshot that's stale by
+                    # now (an earlier fill in this pass moved `impact`) and
+                    # never modeled the squeeze boost execute_trade adds on
+                    # BUYs. Roll back on breach -- the order stays OPEN.
+                    limit = Decimal(order["limit_price"])
+                    if (
+                        order["side"] == "BUY" and result.fill_price > limit
+                    ) or (
+                        order["side"] == "SELL" and result.fill_price < limit
+                    ):
+                        raise _LimitBreach(
+                            f"order {order['id']} fill {result.fill_price} "
+                            f"breached limit {limit}"
+                        )
                 async with conn.cursor() as cur:
                     await cur.execute(
                         """
@@ -668,18 +738,43 @@ async def _match_once(
                                 WHEN filled_quantity + %s >= quantity THEN %s
                                 ELSE filled_tick END,
                             fill_price = %s
-                        WHERE id = %s
+                        WHERE id = %s AND status = 'OPEN'
                         """,
                         (trade_qty, trade_qty, trade_qty, tick_index,
                          result.fill_price, order["id"]),
                     )
+                    if cur.rowcount == 0:
+                        # Cancelled between the candidate snapshot and this
+                        # write -- roll the fill back rather than overwrite
+                        # 'CANCELLED'.
+                        raise ValueError(
+                            f"order {order['id']} is no longer open"
+                        )
                 depth_used[int(order["id"])] = (
                     depth_used.get(int(order["id"]), 0) + trade_qty
                 )
                 fills += 1
+        except _LimitBreach:
+            # Mark-dependent, not deterministic: leave fill_failures alone.
+            continue
         except (TradingError, MarginError, LedgerError, ValueError):
             # Not fillable right now (funds, margin gates, slot limits) --
             # the savepoint rolls the attempt back and the order stays OPEN.
+            # A deterministic failure would retry identically every tick
+            # forever, so count strikes and auto-cancel after a few -- a
+            # parked zombie order inflates tick latency linearly.
+            async with conn.transaction(), conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE orders
+                    SET fill_failures = fill_failures + 1,
+                        status = CASE
+                            WHEN fill_failures + 1 >= %s THEN 'CANCELLED'
+                            ELSE status END
+                    WHERE id = %s
+                    """,
+                    (max_fill_failures, order["id"]),
+                )
             continue
 
     return fills

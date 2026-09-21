@@ -217,3 +217,44 @@ async def test_trading_error_subclassing_keeps_bot_handlers_simple(conn: AsyncCo
     """Season errors subclass TradingError so /buy league:true reuses the
     same error path as ordinary trades."""
     assert issubclass(NotInLeagueError, TradingError)
+
+
+async def test_join_race_maps_unique_violation_to_already_entered(
+    conn: AsyncConnection,
+) -> None:
+    """A league account row with no season_entries row is what a lost join
+    race leaves behind; the second join must surface AlreadyEnteredError,
+    not a raw UniqueViolation."""
+    season_id = await _open_season(conn)
+    await bootstrap_user(conn, 1008)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO accounts (kind, user_id, season_id, balance) "
+            "VALUES ('LEAGUE', %s, %s, 0)",
+            (1008, season_id),
+        )
+    with pytest.raises(AlreadyEnteredError):
+        await join_season(conn, 1008, season_id)
+
+
+async def test_close_season_twice_is_idempotent(conn: AsyncConnection) -> None:
+    """The second close must no-op: no re-sweep, no double prize transfers."""
+    season_id = await _open_season(conn, end_tick=5)
+    await bootstrap_user(conn, 2005)
+    league_account = await join_season(conn, 2005, season_id)
+
+    await close_season(conn, season_id)
+    await close_season(conn, season_id)  # must not raise or re-run
+
+    assert await get_balance(conn, league_account) == 0
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT status FROM seasons WHERE id = %s", (season_id,))
+        row = await cur.fetchone()
+        assert row is not None and row[0] == "CLOSED"
+        await cur.execute(
+            "SELECT COUNT(*) FROM ledger_entries "
+            "WHERE account_id = %s AND reason = 'LEAGUE_RETURN'",
+            (league_account,),
+        )
+        row = await cur.fetchone()
+        assert row is not None and row[0] == 1

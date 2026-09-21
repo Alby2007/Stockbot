@@ -207,7 +207,11 @@ async def _apply_fill(
         if held_quantity < 0:
             # Covering a short settles its accrued borrow fees to SINK and
             # its accrued dividend obligations to MARKET_MAKER (who fronts
-            # the payouts to longs at the ex-date).
+            # the payouts to longs at the ex-date). Deliberately settles the
+            # FULL accrual even on a partial cover (settle_accrued zeroes the
+            # columns) -- unlike the liquidation path, which settles
+            # proportionally to the closed quantity. Consistent enough: fees
+            # restart from zero on the remaining short either way.
             accrued_minor = int(accrued.quantize(Decimal("1"), ROUND_HALF_UP))
             if accrued_minor > 0:
                 await post_transfer(

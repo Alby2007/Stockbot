@@ -369,7 +369,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
-                    SELECT i.ticker, p.quantity, p.avg_cost, i.quoted_price
+                    SELECT i.ticker, p.quantity, p.avg_cost, i.quoted_price,
+                           p.borrow_fees_accrued, p.dividends_accrued
                     FROM positions p
                     JOIN instruments i ON i.id = p.instrument_id
                     WHERE p.user_id = %s AND p.quantity <> 0
@@ -382,9 +383,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
         lines = [f"Cash: {format_money(cash)}"]
         holdings_value = Decimal(0)
-        for ticker, quantity, avg_cost, quoted_price in positions:
+        accrued_minor = Decimal(0)
+        for ticker, quantity, avg_cost, quoted_price, fees_acc, divs_acc in positions:
             market_value = Decimal(quantity) * Decimal(quoted_price)
             holdings_value += market_value
+            accrued_minor += Decimal(fees_acc) + Decimal(divs_acc)
             is_short = quantity < 0
             unrealized_pct = (
                 1 - float(quoted_price) / float(avg_cost) if is_short
@@ -395,7 +398,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"{tag}{ticker:<6} {quantity:>6} @ {format_price(avg_cost):>10}  "
                 f"now {format_price(quoted_price):>10}  {format_pct(unrealized_pct):>8}"
             )
-        net_worth_minor = int(cash + holdings_value * 100)
+        # Net worth nets out accrued borrow fees / dividend obligations,
+        # same as the margin health and league scoring paths.
+        net_worth_minor = int(cash + holdings_value * 100 - accrued_minor)
         lines.append(f"\nNet worth: {format_money(net_worth_minor)}")
 
         embed = discord.Embed(
@@ -517,7 +522,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     "Insufficient funds for the collateral.", ephemeral=True
                 )
                 return
-            except TradingError as exc:
+            # MarginError: assert_spend_ok can block the fee spend.
+            # ValueError: "collateral rounds to zero" on tiny shorts.
+            except (TradingError, MarginError, ValueError) as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
                 return
         await interaction.response.send_message(
@@ -788,9 +795,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ticker: str,
         quantity: app_commands.Range[int, 1, 1_000_000_000],
         # NUMERIC(18, 6) tops out just under 1e12; keep the bound inside it.
-        limit: app_commands.Range[float, 0.0001, 999_999_999_999] | None = None,
-        stop: app_commands.Range[float, 0.0001, 999_999_999_999] | None = None,
-        hours: app_commands.Range[float, 0.02, 8760] | None = None,
+        limit: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
+        stop: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
+        hours: app_commands.Range[float, 0.02, 8760.0] | None = None,
         league: bool = False,
     ) -> None:
         await _place_order(
@@ -813,9 +820,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         interaction: discord.Interaction,
         ticker: str,
         quantity: app_commands.Range[int, 1, 1_000_000_000],
-        limit: app_commands.Range[float, 0.0001, 999_999_999_999] | None = None,
-        stop: app_commands.Range[float, 0.0001, 999_999_999_999] | None = None,
-        hours: app_commands.Range[float, 0.02, 8760] | None = None,
+        limit: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
+        stop: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
+        hours: app_commands.Range[float, 0.02, 8760.0] | None = None,
         league: bool = False,
     ) -> None:
         await _place_order(
@@ -1011,11 +1018,15 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     ephemeral=True,
                 )
                 return
-            except SeasonError as exc:
+            # MarginError: the entry fee is a gated discretionary spend.
+            except (SeasonError, MarginError) as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
                 return
         if season is None:
-            return  # join_season already reported "no open season"
+            # Rare race: the season was created between our read and
+            # join_season's own lookup -- confirm the join anyway.
+            await interaction.response.send_message("Entered the league season.")
+            return
         await interaction.response.send_message(
             f"Entered **{season.name}** — your league stake is "
             f"**{format_money(season.stake_minor)}**. Trade it with "

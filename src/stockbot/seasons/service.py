@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from psycopg import AsyncConnection
+from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 
 from stockbot.accounts.service import bootstrap_user
@@ -179,8 +180,19 @@ async def join_season(conn: AsyncConnection, user_id: int, season_id: int | None
         if season.status == "CLOSED":
             raise SeasonNotOpenError(season.id, season.status)
 
-        # Season id is known now; lock the entry row space via the account
-        # unique index (the INSERT itself enforces single-entry).
+        # Hold the season row FOR SHARE until commit: a racing
+        # close_season's status UPDATE blocks on this lock, and a close
+        # that already claimed the row is seen here on the re-read (plain
+        # `season.status` above could have gone stale in between).
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT status FROM seasons WHERE id = %s FOR SHARE", (season.id,)
+            )
+            locked = await cur.fetchone()
+            assert locked is not None
+            if locked[0] == "CLOSED":
+                raise SeasonNotOpenError(season.id, str(locked[0]))
+
         account_id = await bootstrap_user(conn, user_id)
 
         async with conn.cursor() as cur:
@@ -194,14 +206,20 @@ async def join_season(conn: AsyncConnection, user_id: int, season_id: int | None
         tick = await current_tick(conn)
 
         async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO accounts (kind, user_id, season_id, balance)
-                VALUES ('LEAGUE', %s, %s, 0)
-                RETURNING id
-                """,
-                (user_id, season.id),
-            )
+            try:
+                await cur.execute(
+                    """
+                    INSERT INTO accounts (kind, user_id, season_id, balance)
+                    VALUES ('LEAGUE', %s, %s, 0)
+                    RETURNING id
+                    """,
+                    (user_id, season.id),
+                )
+            except UniqueViolation:
+                # Check-then-insert isn't enough: a concurrent join passes
+                # the season_entries probe above, then trips the league-
+                # account unique index here. Map it to the domain error.
+                raise AlreadyEnteredError(season.id, user_id) from None
             row = await cur.fetchone()
             assert row is not None
             league_account_id = int(row[0])
@@ -457,14 +475,38 @@ async def standings(conn: AsyncConnection, season_id: int) -> list[Standing]:
 async def close_season(conn: AsyncConnection, season_id: int) -> None:
     """Score, rank, pay prizes, and sweep league balances back to SINK.
 
-    Idempotent guard: only runs on an ACTIVE season (the caller's UPDATE of
-    status happens inside the same transaction).
+    One transaction (a savepoint when called from `on_tick` inside
+    apply_tick -- without it, a standalone call's bare statements would sit
+    in an implicit transaction that the pool rolls back at checkin). The
+    status flip is claimed atomically up front: a racing closer blocks on
+    the row lock, then sees CLOSED and returns instead of running the
+    scoring/prize work a second time.
     """
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE seasons SET status = 'CLOSED'
+                WHERE id = %s AND status <> 'CLOSED'
+                RETURNING id
+                """,
+                (season_id,),
+            )
+            if await cur.fetchone() is None:
+                await cur.execute(
+                    "SELECT 1 FROM seasons WHERE id = %s", (season_id,)
+                )
+                if await cur.fetchone() is None:
+                    raise SeasonNotFoundError(season_id)
+                return  # already CLOSED -- idempotent no-op
+        await _close_season_claimed(conn, season_id)
+
+
+async def _close_season_claimed(conn: AsyncConnection, season_id: int) -> None:
+    """The scoring/payout/sweep work of close_season. Runs inside the
+    caller's transaction with the seasons row already flipped to CLOSED."""
     season = await get_season(conn, season_id)
-    if season is None:
-        raise SeasonNotFoundError(season_id)
-    if season.status == "CLOSED":
-        return
+    assert season is not None
 
     tick = await current_tick(conn)
     day_index = max(tick, 0) // TICKS_PER_DAY
@@ -602,8 +644,9 @@ async def close_season(conn: AsyncConnection, season_id: int) -> None:
             )
 
     async with conn.cursor() as cur:
+        # status was already flipped by the atomic claim in close_season.
         await cur.execute(
-            "UPDATE seasons SET status = 'CLOSED', prize_pool_minor = %s WHERE id = %s",
+            "UPDATE seasons SET prize_pool_minor = %s WHERE id = %s",
             (prize_pool, season_id),
         )
         # League orders reference a dead season now -- cancel them.
