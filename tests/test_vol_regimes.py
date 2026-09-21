@@ -85,7 +85,10 @@ async def _halted_until(conn: AsyncConnection, instrument_id: int) -> int | None
 async def _cap_size_qty(conn: AsyncConnection, inst: dict) -> int:
     """Largest per-fill quantity that stays under the participation cap,
     with headroom for the whale's own impact raising the fill price."""
-    return max(1, int(0.10 * inst["liquidity"] / inst["quoted"] * 0.80))
+    from stockbot.market.data import participation_cap
+
+    cap = await participation_cap(conn)
+    return max(1, int(cap * inst["liquidity"] / inst["quoted"] * 0.60))
 
 
 # --- pure-math pieces -------------------------------------------------------

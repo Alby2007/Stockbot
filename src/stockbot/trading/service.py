@@ -41,6 +41,7 @@ from stockbot.market.data import (
     assert_feature_enabled,
     assert_market_open,
     current_tick_index,
+    flow_config,
     half_spread_for,
     participation_cap,
     record_flow,
@@ -438,7 +439,8 @@ async def execute_trade(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT id, base_price, impact, liquidity, lambda_impact, max_impact,
+                SELECT id, base_price, impact, liquidity, adv, lambda_impact,
+                       max_impact,
                        is_active, circuit_halted_until_tick, short_interest_pct,
                        COALESCE(sigma_eff, sigma) AS sigma,
                        next_event_tick, last_halt_end_tick
@@ -523,13 +525,19 @@ async def execute_trade(
                 lambda_impact *= float(
                     1 + cfg["margin.squeeze_lambda_boost"] * over
                 )
-        spread_cfg = {**await spread_config(conn), **await session_config(conn)}
+        spread_cfg = {
+            **await spread_config(conn),
+            **await session_config(conn),
+            **await flow_config(conn),
+        }
         half_spread = half_spread_for(instrument, current_tick, spread_cfg)
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=impact_before,
             signed_notional=signed_notional,
-            liquidity=liquidity,
+            liquidity=engine.effective_liquidity(
+                liquidity, float(instrument["adv"]), spread_cfg
+            ),
             lambda_impact=lambda_impact,
             max_impact=max_impact,
             half_spread=half_spread,

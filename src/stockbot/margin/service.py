@@ -38,6 +38,7 @@ from stockbot.ledger.service import get_system_account_id, post_transfer
 from stockbot.margin.errors import MarginSpendBlockedError
 from stockbot.market import engine
 from stockbot.market.data import (
+    flow_config,
     half_spread_for,
     record_flow,
     session_config,
@@ -299,12 +300,18 @@ async def _liquidate_leg(
     # A capped leg would leave an oversized position un-liquidatable and
     # wedge the account below maintenance forever -- depth protection is
     # for user-initiated fills (execute_trade, shorts), not the safety net.
-    spread_cfg = {**await spread_config(conn), **await session_config(conn)}
+    spread_cfg = {
+        **await spread_config(conn),
+        **await session_config(conn),
+        **await flow_config(conn),
+    }
     fill_f, impact_after = engine.apply_trade_impact(
         base_price=base_price,
         impact_before=float(position["impact"]),
         signed_notional=signed,
-        liquidity=float(position["liquidity"]),
+        liquidity=engine.effective_liquidity(
+            float(position["liquidity"]), float(position["adv"]), spread_cfg
+        ),
         lambda_impact=float(position["lambda_impact"]),
         max_impact=float(position["max_impact"]),
         half_spread=half_spread_for(position, tick_index, spread_cfg),
@@ -544,7 +551,7 @@ async def _liquidate_account(
                 """
                 SELECT p.id, p.instrument_id, p.quantity, p.borrow_fees_accrued,
                        p.dividends_accrued,
-                       i.ticker, i.base_price, i.impact, i.liquidity,
+                       i.ticker, i.base_price, i.impact, i.liquidity, i.adv,
                        i.lambda_impact, i.max_impact, i.quoted_price, i.maint_margin_pct,
                        COALESCE(i.sigma_eff, i.sigma) AS sigma,
                        i.next_event_tick, i.last_halt_end_tick
@@ -596,7 +603,7 @@ async def _liquidate_account(
                     """
                     SELECT p.id, p.instrument_id, p.quantity, p.borrow_fees_accrued,
                            p.dividends_accrued,
-                           i.ticker, i.base_price, i.impact, i.liquidity,
+                           i.ticker, i.base_price, i.impact, i.liquidity, i.adv,
                            i.lambda_impact, i.max_impact, i.quoted_price,
                            i.maint_margin_pct,
                            COALESCE(i.sigma_eff, i.sigma) AS sigma,
@@ -651,7 +658,7 @@ async def _liquidate_account(
             """
             SELECT p.id, p.instrument_id, p.quantity, p.borrow_fees_accrued,
                    p.dividends_accrued,
-                   i.ticker, i.base_price, i.impact, i.liquidity,
+                   i.ticker, i.base_price, i.impact, i.liquidity, i.adv,
                    i.lambda_impact, i.max_impact, i.quoted_price, i.maint_margin_pct
             FROM positions p
             JOIN instruments i ON i.id = p.instrument_id

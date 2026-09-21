@@ -236,6 +236,35 @@ fills diverge. Fill-side tick rounding quantizes `impact` deltas to
 ~tick/price — tests asserting small impact deltas must flatten the
 grid (`spread.tick_pct=0`, `tick_min=1e-7`) or the quantum swamps them.
 
+Flow-driven microstructure notes (Phase H): the tick-boundary flow
+accumulator is `pending_flow` (richer than the plan's single-column
+sketch — it keeps per-account rows for the F5 caps). `apply_tick`
+consumes it before stepping, computes each instrument's bounded own
+flow (per-account clip `vol.account_flow_cap`, total `vol.flow_ret_cap`),
+then aggregates per sector. H2 cross-impact: each instrument's bounded
+flow bleeds `flow.cross_impact_coeff`·γ_peer into same-sector peers as
+a direct `impact` write — one hop by construction (the inflow is never
+re-recorded into pending_flow), skipped for halted and INDEX
+instruments, and included in the peer's `flow_ret` for the
+EWMA/breaker (it IS a price move). H3 permanent impact:
+`flow.permanent_frac` of OWN bounded flow moves into
+`fundamental_value` (`F *= exp(shift)`, `impact -= shift`, per-tick cap
+`flow.max_fundamental_move`) — the mark dips by shift now and kappa
+pulls the base up to the new F over ~1/κ ticks, so flow genuinely
+reprices without an unanchored permanent-impact term (finding 5).
+`InstrumentTickResult` is frozen — mutate via `dataclasses.replace`
+and write back into `results[i]` (rebinding the loop variable alone
+silently drops the change). H4 ADV: `instruments.adv` is a sliding-
+window SMA of per-tick notional volume (candles volume*close over
+`flow.adv_window_ticks`), updated once per tick after all fill paths
+by adding the newest tick's notional and subtracting the window-edge
+tick's. `engine.effective_liquidity` scales liquidity for IMPACT only
+by clip(adv/(L·flow.adv_ref_frac), mult_min, mult_max) — dead tape
+halves L (2x impact), frenzied doubles it; the participation cap and
+_assert_depth stay on static liquidity (finding 7's death-spiral
+guard). adv_ref_frac ≈ 2.5e-8 was measured as the sim's mean
+ADV/liquidity ratio so the multiplier centers near 1.
+
 Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
 preserved -- short proceeds credit to cash and are spendable; leverage is
 bounded by post-trade margin gates, not negative cash). Maintenance applies

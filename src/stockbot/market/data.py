@@ -213,6 +213,15 @@ def bound_flow(
     return max(-total_cap, min(total_cap, bounded)), raw
 
 
+async def flow_config(conn: AsyncConnection) -> dict[str, float]:
+    """The `flow.*` config namespace (cross-impact coefficient, permanent-
+    impact fraction + cap, ADV window/multiplier bounds), read fresh like
+    `spread_config`."""
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT key, value FROM config WHERE key LIKE 'flow.%'")
+        return {str(k): float(v) for k, v in await cur.fetchall()}
+
+
 async def session_config(conn: AsyncConnection) -> dict[str, float]:
     """The `session.*` config namespace (open/closed ticks, phase offset,
     open impact reset), read fresh like `spread_config`."""

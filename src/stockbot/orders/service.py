@@ -39,6 +39,7 @@ from stockbot.market import engine
 from stockbot.market.data import (
     assert_feature_enabled,
     assert_market_open,
+    flow_config,
     half_spread_for,
     participation_cap,
     record_flow,
@@ -588,7 +589,11 @@ async def _match_once(
         )
         open_orders = await cur.fetchall()
 
-    spread_cfg = {**await spread_config(conn), **await session_config(conn)}
+    spread_cfg = {
+        **await spread_config(conn),
+        **await session_config(conn),
+        **await flow_config(conn),
+    }
 
     # --- Pass 1: crossing book -------------------------------------------
     # Per (instrument, season scope): bids and asks walk price-time
@@ -705,7 +710,7 @@ async def _match_once(
             SELECT o.id, o.user_id, o.season_id, o.side, o.quantity,
                    o.filled_quantity, o.limit_price, o.order_type, i.ticker,
                    i.base_price,
-                   i.impact, i.liquidity, i.lambda_impact, i.max_impact,
+                   i.impact, i.liquidity, i.adv, i.lambda_impact, i.max_impact,
                    COALESCE(i.sigma_eff, i.sigma) AS sigma,
                    i.next_event_tick, i.last_halt_end_tick
             FROM orders o
@@ -732,11 +737,14 @@ async def _match_once(
         # tick. Estimated on the full-size fill price (conservative). The
         # budget is per-tick: `depth_used` carries it across stop-cascade
         # iterations.
+        liq_eff = engine.effective_liquidity(
+            float(order["liquidity"]), float(order["adv"]), spread_cfg
+        )
         fill_full, _ = engine.apply_trade_impact(
             base_price=float(order["base_price"]),
             impact_before=float(order["impact"]),
             signed_notional=float(order["base_price"]) * remaining_qty * sign,
-            liquidity=float(order["liquidity"]),
+            liquidity=liq_eff,
             lambda_impact=float(order["lambda_impact"]),
             max_impact=float(order["max_impact"]),
             half_spread=half_spread_for(order, tick_index, spread_cfg),
@@ -754,7 +762,7 @@ async def _match_once(
             base_price=float(order["base_price"]),
             impact_before=float(order["impact"]),
             signed_notional=float(order["base_price"]) * trade_qty * sign,
-            liquidity=float(order["liquidity"]),
+            liquidity=liq_eff,
             lambda_impact=float(order["lambda_impact"]),
             max_impact=float(order["max_impact"]),
             half_spread=half_spread_for(order, tick_index, spread_cfg),

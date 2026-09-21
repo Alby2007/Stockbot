@@ -37,6 +37,7 @@ from stockbot.market import engine
 from stockbot.market.data import (
     assert_feature_enabled,
     assert_market_open,
+    flow_config,
     half_spread_for,
     participation_cap,
     record_flow,
@@ -111,7 +112,7 @@ async def _lock_instrument(conn: AsyncConnection, ticker: str) -> dict[str, Any]
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT id, base_price, impact, liquidity, lambda_impact, max_impact,
+            SELECT id, base_price, impact, liquidity, adv, lambda_impact, max_impact,
                    is_active, circuit_halted_until_tick, short_knockout_pct,
                    COALESCE(sigma_eff, sigma) AS sigma,
                    next_event_tick, last_halt_end_tick
@@ -175,12 +176,18 @@ async def open_bounded_short(
 
         base_price = float(instrument["base_price"])
         tick = await _current_tick(conn)
-        spread_cfg = {**await spread_config(conn), **await session_config(conn)}
+        spread_cfg = {
+            **await spread_config(conn),
+            **await session_config(conn),
+            **await flow_config(conn),
+        }
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=float(instrument["impact"]),
             signed_notional=-base_price * quantity,  # sell-side pressure
-            liquidity=float(instrument["liquidity"]),
+            liquidity=engine.effective_liquidity(
+                float(instrument["liquidity"]), float(instrument["adv"]), spread_cfg
+            ),
             lambda_impact=float(instrument["lambda_impact"]),
             max_impact=float(instrument["max_impact"]),
             half_spread=half_spread_for(instrument, tick, spread_cfg),
@@ -291,7 +298,8 @@ async def cover_bounded_short(
             await cur.execute(
                 """
                 SELECT bs.id, bs.user_id, bs.instrument_id, bs.quantity, bs.entry_price,
-                       bs.collateral_minor, i.ticker, i.base_price, i.impact, i.liquidity,
+                       bs.collateral_minor, i.ticker, i.base_price, i.impact,
+                       i.liquidity, i.adv,
                        i.lambda_impact, i.max_impact, i.is_active, bs.season_id,
                        COALESCE(i.sigma_eff, i.sigma) AS sigma,
                        i.next_event_tick, i.last_halt_end_tick
@@ -309,12 +317,18 @@ async def cover_bounded_short(
         base_price = float(short["base_price"])
         quantity = int(short["quantity"])
         tick = await _current_tick(conn)
-        spread_cfg = {**await spread_config(conn), **await session_config(conn)}
+        spread_cfg = {
+            **await spread_config(conn),
+            **await session_config(conn),
+            **await flow_config(conn),
+        }
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=float(short["impact"]),
             signed_notional=base_price * quantity,  # buy-side pressure
-            liquidity=float(short["liquidity"]),
+            liquidity=engine.effective_liquidity(
+                float(short["liquidity"]), float(short["adv"]), spread_cfg
+            ),
             lambda_impact=float(short["lambda_impact"]),
             max_impact=float(short["max_impact"]),
             half_spread=half_spread_for(short, tick, spread_cfg),

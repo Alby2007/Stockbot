@@ -301,6 +301,22 @@ def quote_ticks(mark: float, half_spread: float, tick: float) -> tuple[float, fl
     return bid, ask
 
 
+def effective_liquidity(
+    liquidity: float, adv_notional: float, cfg: dict[str, float]
+) -> float:
+    """Volume-responsive liquidity for IMPACT only (H4): trailing ADV
+    relative to `flow.adv_ref_frac` of static liquidity scales the impact
+    denominator, clamped to [flow.adv_mult_min, flow.adv_mult_max]. A dead
+    tape halves effective liquidity (2x impact); a frenzied tape doubles
+    it. The participation cap deliberately stays on static liquidity --
+    finding 7's death-spiral guard."""
+    lo = cfg.get("flow.adv_mult_min", 0.5)
+    hi = cfg.get("flow.adv_mult_max", 2.0)
+    ref = liquidity * cfg.get("flow.adv_ref_frac", 2.5e-8)
+    mult = lo if ref <= 0 else min(max(adv_notional / ref, lo), hi)
+    return liquidity * mult
+
+
 def half_spread_fraction(
     *,
     cfg: dict[str, float],

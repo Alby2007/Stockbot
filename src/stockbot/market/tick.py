@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import math
@@ -177,6 +178,36 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         for fr in flow_rows:
             flow_delta.setdefault(int(fr[0]), {})[int(fr[1])] = float(fr[2])
         vol_cfg = await data.vol_config(conn)
+        flow_cfg = await data.flow_config(conn)
+
+        # Phase H flow decomposition, computed up front because H2's
+        # cross-impact needs every instrument's bounded flow before any
+        # of them step. `bounded_own` is the F5-clipped per-instrument
+        # flow (each account clipped at account_flow_cap, total at
+        # flow_ret_cap); `cross_inflow` is the sector-sympathy term --
+        # each instrument's bounded flow bleeds cross_impact_coeff into
+        # same-sector peers, scaled by the PEER's gamma loading. One hop
+        # by construction: the inflow lands on impact directly and is
+        # never re-recorded into pending_flow.
+        flow_cap = float(vol_cfg.get("vol.flow_ret_cap", 0.05))
+        acct_cap = float(vol_cfg.get("vol.account_flow_cap", 0.02))
+        bounded_own: dict[int, float] = {}
+        sector_flow: dict[str, float] = {}
+        sector_of = {int(r["id"]): str(r["sector_key"]) for r in instrument_rows}
+        for iid, deltas in flow_delta.items():
+            bf, _raw = data.bound_flow(deltas, acct_cap, flow_cap)
+            bounded_own[iid] = bf
+            skey = sector_of.get(iid)
+            if skey is not None:
+                sector_flow[skey] = sector_flow.get(skey, 0.0) + bf
+        cross_coeff = float(flow_cfg.get("flow.cross_impact_coeff", 0.15))
+        cross_inflow: dict[int, float] = {
+            int(r["id"]): cross_coeff
+            * float(r["gamma"])
+            * (sector_flow.get(str(r["sector_key"]), 0.0)
+               - bounded_own.get(int(r["id"]), 0.0))
+            for r in instrument_rows
+        }
 
         sector_keys = sorted({row["sector_key"] for row in instrument_rows})
         rng = engine.rng_for_tick(master_seed, tick_index)
@@ -320,9 +351,9 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         clip_lo = float(vol_cfg.get("vol.clip_min", 0.5))
         clip_hi = float(vol_cfg.get("vol.clip_max", 4.0))
         mkt_w = float(vol_cfg.get("vol.market_weight", 0.5))
-        flow_cap = float(vol_cfg.get("vol.flow_ret_cap", 0.05))
-        acct_cap = float(vol_cfg.get("vol.account_flow_cap", 0.02))
         flow_halt = int(vol_cfg.get("vol.flow_halt_ticks", 2))
+        perm_frac = float(flow_cfg.get("flow.permanent_frac", 0.10))
+        perm_cap = float(flow_cfg.get("flow.max_fundamental_move", 0.005))
         sqrt_dt = math.sqrt(gap_dt)
         rows_by_id = {int(r["id"]): r for r in instrument_rows}
         vol_new: dict[int, float] = {}
@@ -330,7 +361,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         flow_ret: dict[int, float] = {}
         model_ret: dict[int, float] = {}
         flow_breached: set[int] = set()
-        for result in results:
+        for res_idx, result in enumerate(results):
             row = rows_by_id[result.id]
             sigma_i = float(row["sigma"])
             v_prev = (
@@ -338,12 +369,22 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             )
             open_mark = opens[result.id]
             prev_close = prev_closes.get(result.id)
-            bounded_flow, _raw_flow = data.bound_flow(
-                flow_delta.get(result.id, {}), acct_cap, flow_cap
+            own_flow = bounded_own.get(result.id, 0.0)
+            is_index = row["kind"] == "INDEX"
+            # A halted instrument's mark is frozen: it keeps its own flow
+            # for vol accounting but receives no sector sympathy move and
+            # no permanent transfer.
+            frozen = halts[result.id] is not None
+            xflow = (
+                0.0
+                if frozen or is_index
+                else cross_inflow.get(result.id, 0.0)
             )
-            # model_ret is the pure step return (post-step, pre-fill): fills
-            # amend the candle close later, so it must be persisted now or
-            # the replay vol check can't reconstruct it.
+            bounded_flow = max(-flow_cap, min(flow_cap, own_flow + xflow))
+            # model_ret is the pure step return (post-step, pre-fill AND
+            # pre-flow-application): fills amend the candle close later, so
+            # it must be persisted now or the replay vol check can't
+            # reconstruct it.
             r_model = (
                 math.log(result.quoted_price / open_mark) if open_mark > 0 else 0.0
             )
@@ -363,6 +404,29 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                     # by construction this is a flow-attributed breach.
                     halts[result.id] = tick_index + flow_halt
                     flow_breached.add(result.id)
+            # H2: sector sympathy -- bounded peer flow moves this mark.
+            # Direct impact write, never re-recorded as flow (one hop).
+            new_impact = result.impact + xflow
+            new_fundamental = result.fundamental_value
+            # H3: permanent impact -- move a capped fraction of OWN flow out
+            # of the decaying impact term into the fundamental, where kappa
+            # pulls the base toward it over ~1/kappa ticks. The mark drops
+            # by `shift` now and recovers permanently -- no double count.
+            shift = (
+                0.0
+                if frozen or is_index
+                else max(-perm_cap, min(perm_cap, perm_frac * own_flow))
+            )
+            if shift:
+                new_fundamental *= math.exp(shift)
+                new_impact -= shift
+            if xflow or shift:
+                results[res_idx] = dataclasses.replace(
+                    result,
+                    fundamental_value=new_fundamental,
+                    impact=new_impact,
+                    quoted_price=result.base_price * math.exp(new_impact),
+                )
             vol_new[result.id] = v_i
             sigma_eff_new[result.id] = sigma_i * engine.vol_multiplier(
                 v_mkt, v_i, mkt_w, clip_lo, clip_hi
@@ -495,6 +559,28 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         await margin.refresh_short_interest(conn)
         await margin.accrue_borrow_fees(conn)
         liqs = await margin.sweep_undermargined(conn, tick_index)
+
+        # H4: trailing ADV refresh -- a sliding-window SMA of per-tick
+        # notional volume (candles.volume * close). Once per tick, never
+        # per-trade (finding 7): add this tick's notional, subtract the
+        # tick falling off the window edge. adv feeds effective liquidity
+        # for impact on the NEXT interval's fills.
+        adv_window = max(1, int(flow_cfg.get("flow.adv_window_ticks", 7200)))
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE instruments i
+                SET adv = GREATEST(0, COALESCE(i.adv, 0)
+                        + (COALESCE(nw.n, 0) - COALESCE(ew.n, 0)) / %s)
+                FROM (SELECT instrument_id, volume * close AS n
+                      FROM candles WHERE tick_index = %s) nw
+                FULL JOIN (SELECT instrument_id, volume * close AS n
+                           FROM candles WHERE tick_index = %s) ew
+                    ON ew.instrument_id = nw.instrument_id
+                WHERE i.id = COALESCE(nw.instrument_id, ew.instrument_id)
+                """,
+                (adv_window, tick_index, tick_index - adv_window),
+            )
 
         # Season lifecycle: activate due seasons, write day-boundary equity
         # snapshots, close finished seasons (all inside this tick's tx).
