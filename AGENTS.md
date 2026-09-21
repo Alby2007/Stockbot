@@ -24,6 +24,7 @@ Liquidity plan (phases A–E) status: **Phase A done** (dynamic
 `spread.*` half-spreads at all four fill paths; utilization-scaled borrow
 fees; `next_event_tick`/`last_halt_end_tick`; chart volume; `0013` param
 bounds + `0014` spread config). **Phase B done** (crossing book).
+**Phase C done** (participation cap + sqrt impact + fill epsilon).
 
 Crossing-book design notes: `match_orders` runs two passes inside
 `apply_tick`. Pass 1 walks each (instrument, season_id) book in
@@ -47,6 +48,20 @@ settle, fee leg, trade row, margin gates, season trade counter);
 MARKET_MAKER + mark/candle update. Cross legs do NOT call
 `update_candle_with_fill` individually (would double-count volume) — the
 cross prints once.
+
+Participation/impact notes: impact is concave — `Δimpact =
+λ·sign(N)·√(|N|/L)` (N = signed fill notional, L = instrument liquidity);
+migration 0016 rescaled `lambda_impact` to the new units anchored at a
+$500 typical order so typical-size fills are unchanged. User-initiated
+fills are capped at `liquidity.participation_cap`·liquidity notional
+(`InsufficientDepthError`, atomic — no partial market fills); forced
+liquidation (`_liquidate_leg`) and KO closes bypass the cap so positions
+can't be stranded. Resting orders work over multiple ticks — pass-2 MM
+fills clamp to the cap and leave `filled_quantity` short. MM limit fills
+also need the mark to cross the limit by `order_book.fill_epsilon_bps`,
+not merely touch it (no free trade-throughs). When resizing tests: a
+failing-depth order raises before funds/margin checks — keep test sizes
+under the cap when testing other rejections.
 
 Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
 preserved -- short proceeds credit to cash and are spendable; leverage is

@@ -37,10 +37,16 @@ from stockbot.margin.errors import (
     ShortInterestLimitError,
 )
 from stockbot.market import engine
-from stockbot.market.data import current_tick_index, half_spread_for, spread_config
+from stockbot.market.data import (
+    current_tick_index,
+    half_spread_for,
+    participation_cap,
+    spread_config,
+)
 from stockbot.shop.service import BASE_SLOTS, get_slot_count
 from stockbot.trading.errors import (
     InstrumentHaltedError,
+    InsufficientDepthError,
     NotInLeagueError,
     TooManyPositionsError,
     UnknownInstrumentError,
@@ -459,6 +465,16 @@ async def execute_trade(
             half_spread=half_spread_for(instrument, current_tick, spread_cfg),
         )
         fill_price = Decimal(str(round(fill_price_f, 6)))
+
+        # Participation cap: one marketable fill can't exceed a fraction of
+        # the instrument's depth. Crosses don't come through here (the book
+        # is its own depth); forced liquidation closes bypass the cap by
+        # calling _apply_fill directly via margin's liquidation legs.
+        cap = await participation_cap(conn)
+        cap_minor = _to_minor_units(Decimal(str(cap)) * Decimal(str(liquidity)))
+        notional_minor = _to_minor_units(fill_price * quantity)
+        if notional_minor > cap_minor:
+            raise InsufficientDepthError(ticker, notional_minor, cap_minor)
 
         market_maker_id = await get_system_account_id(conn, "MARKET_MAKER")
         result = await _apply_fill(

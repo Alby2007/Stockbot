@@ -47,8 +47,10 @@ async def test_open_rejects_insufficient_collateral(conn: AsyncConnection) -> No
     from stockbot.ledger.errors import InsufficientFundsError
 
     await bootstrap_user(conn, 2)
+    # Big enough that collateral exceeds the grant, small enough that the
+    # participation cap doesn't reject it first.
     with pytest.raises(InsufficientFundsError):
-        await open_bounded_short(conn, user_id=2, ticker="NORT", quantity=100_000)
+        await open_bounded_short(conn, user_id=2, ticker="NORT", quantity=10)
 
 
 async def test_duplicate_interaction_rejected(conn: AsyncConnection) -> None:

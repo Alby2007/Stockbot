@@ -278,6 +278,10 @@ async def _liquidate_leg(
     qty = int(position["quantity"])
     base_price = float(position["base_price"])
     signed = base_price * close_qty * (1 if qty < 0 else -1)
+    # Deliberately no participation-cap check here: this is a FORCED close.
+    # A capped leg would leave an oversized position un-liquidatable and
+    # wedge the account below maintenance forever -- depth protection is
+    # for user-initiated fills (execute_trade, shorts), not the safety net.
     spread_cfg = await spread_config(conn)
     fill_f, impact_after = engine.apply_trade_impact(
         base_price=base_price,

@@ -34,11 +34,16 @@ from stockbot.ledger.service import (
 )
 from stockbot.margin import service as margin
 from stockbot.market import engine
-from stockbot.market.data import half_spread_for, spread_config
+from stockbot.market.data import (
+    half_spread_for,
+    participation_cap,
+    spread_config,
+)
 from stockbot.seasons.service import get_active_entry
 from stockbot.shorts.errors import ShortNotFoundError
 from stockbot.trading.errors import (
     InstrumentHaltedError,
+    InsufficientDepthError,
     NotInLeagueError,
     UnknownInstrumentError,
 )
@@ -47,6 +52,23 @@ from stockbot.trading.service import (
     _to_minor_units,
     update_candle_with_fill,
 )
+
+
+async def _assert_depth(
+    conn: AsyncConnection,
+    ticker: str,
+    fill_price: Decimal,
+    quantity: int,
+    liquidity: float,
+) -> None:
+    """Participation cap for user-initiated bounded-short fills. The
+    knockout sweep doesn't come through here -- forced closes bypass the
+    cap by design (a capped KO would strand collateral)."""
+    cap = await participation_cap(conn)
+    cap_minor = _to_minor_units(Decimal(str(cap)) * Decimal(str(liquidity)))
+    notional_minor = _to_minor_units(fill_price * quantity)
+    if notional_minor > cap_minor:
+        raise InsufficientDepthError(ticker, notional_minor, cap_minor)
 
 
 @dataclass(frozen=True)
@@ -157,6 +179,9 @@ async def open_bounded_short(
             half_spread=half_spread_for(instrument, tick, spread_cfg),
         )
         fill_price = Decimal(str(round(fill_price_f, 6)))
+        await _assert_depth(
+            conn, ticker, fill_price, quantity, float(instrument["liquidity"])
+        )
         knockout_pct = Decimal(str(instrument["short_knockout_pct"]))
         knockout_price = (fill_price * (1 + knockout_pct)).quantize(
             Decimal("0.000001"), rounding=ROUND_HALF_UP
@@ -275,6 +300,13 @@ async def cover_bounded_short(
             half_spread=half_spread_for(short, tick, spread_cfg),
         )
         close_price = Decimal(str(round(fill_price_f, 6)))
+        await _assert_depth(
+            conn,
+            str(short["ticker"]),
+            close_price,
+            quantity,
+            float(short["liquidity"]),
+        )
 
         entry_price = Decimal(short["entry_price"])
         collateral_minor = int(short["collateral_minor"])

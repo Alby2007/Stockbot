@@ -133,6 +133,22 @@ def test_apply_trade_impact_buy_moves_price_up_and_decays_are_separate() -> None
     assert fill_price > 100.0
 
 
+def test_apply_trade_impact_is_concave_in_size() -> None:
+    """Square-root law: doubling order size multiplies impact by sqrt(2),
+    not 2 -- large orders move the mark less per marginal share."""
+    kwargs = dict(
+        base_price=100.0,
+        impact_before=0.0,
+        liquidity=1_000_000.0,
+        lambda_impact=0.01,
+        max_impact=0.03,
+        half_spread=0.0,
+    )
+    _, single = engine.apply_trade_impact(signed_notional=10_000.0, **kwargs)
+    _, double = engine.apply_trade_impact(signed_notional=20_000.0, **kwargs)
+    assert abs(double / single - math.sqrt(2)) < 1e-9
+
+
 def test_apply_trade_impact_is_clamped() -> None:
     _, impact_after = engine.apply_trade_impact(
         base_price=100.0,

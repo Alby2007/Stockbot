@@ -66,7 +66,8 @@ async def test_buy_pushes_price_up_via_impact(conn: AsyncConnection) -> None:
         await cur.execute("SELECT base_price FROM instruments WHERE ticker = %s", (ticker,))
         (base_price,) = await cur.fetchone()
 
-    result = await execute_trade(conn, user_id=1002, ticker=ticker, side="BUY", quantity=5000)
+    # Under the participation cap but still large enough to move the mark.
+    result = await execute_trade(conn, user_id=1002, ticker=ticker, side="BUY", quantity=100)
     assert result.fill_price > base_price
 
     async with conn.cursor() as cur:
@@ -113,8 +114,9 @@ async def test_insufficient_funds_rejects_buy_atomically(conn: AsyncConnection) 
     ticker = await _first_ticker(conn)
     balance_before = await get_balance(conn, account_id)
 
+    # More than the grant can afford, under the participation cap.
     with pytest.raises(InsufficientFundsError):
-        await execute_trade(conn, user_id=1005, ticker=ticker, side="BUY", quantity=1_000_000)
+        await execute_trade(conn, user_id=1005, ticker=ticker, side="BUY", quantity=5)
 
     assert await get_balance(conn, account_id) == balance_before
     async with conn.cursor() as cur:

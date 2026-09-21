@@ -22,6 +22,22 @@ class InsufficientSharesError(TradingError):
         super().__init__(f"cannot sell {requested} shares of {ticker}; only {held} held")
 
 
+class InsufficientDepthError(TradingError):
+    """A single marketable fill exceeds the participation cap -- the
+    instrument's liquidity can't absorb that much notional at once."""
+
+    def __init__(self, ticker: str, notional_minor: int, cap_minor: int):
+        self.ticker = ticker
+        self.notional_minor = notional_minor
+        self.cap_minor = cap_minor
+        super().__init__(
+            f"order for {ticker} is too large to fill at once "
+            f"(~${notional_minor / 100:,.2f} notional vs a "
+            f"~${cap_minor / 100:,.2f} depth cap) -- split it into smaller "
+            "trades or rest a limit order"
+        )
+
+
 class TooManyPositionsError(TradingError):
     def __init__(self, open_positions: int, slot_count: int):
         self.open_positions = open_positions

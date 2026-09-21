@@ -110,6 +110,23 @@ async def spread_config(conn: AsyncConnection) -> dict[str, float]:
         return {str(k): float(v) for k, v in await cur.fetchall()}
 
 
+async def _config_float(conn: AsyncConnection, key: str, default: float) -> float:
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT value FROM config WHERE key = %s", (key,))
+        row = await cur.fetchone()
+    return float(row[0]) if row else default
+
+
+async def participation_cap(conn: AsyncConnection) -> float:
+    """Max single-fill notional as a fraction of instrument liquidity."""
+    return await _config_float(conn, "impact.participation_cap", 0.10)
+
+
+async def trade_through_epsilon(conn: AsyncConnection) -> float:
+    """Fraction by which the mark must cross a resting limit for an MM fill."""
+    return await _config_float(conn, "cross.trade_through_epsilon", 0.0005)
+
+
 def half_spread_for(
     row: dict[str, Any], current_tick: int | None, cfg: dict[str, float]
 ) -> float:

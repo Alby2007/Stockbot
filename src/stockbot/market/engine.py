@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -174,8 +175,16 @@ def apply_trade_impact(
     `signed_notional` is positive for a buy, negative for a sell. Returns
     `(fill_price, impact_after)`. Impact decay is *not* applied here -- it
     only happens on tick boundaries (`step_instrument` / `freeze_instrument`).
+
+    Impact is concave in size: `Δimpact = λ·sign(N)·√(|N|/L)`, the
+    square-root law -- doubling order size multiplies impact by √2, so
+    large orders move the mark less per marginal share than small ones.
+    `lambda_impact` was rescaled in migration 0016 to preserve typical-size
+    fills (`λ_new = λ_old·√(N_typical/L)`, N_typical = $500).
     """
-    delta_impact = lambda_impact * signed_notional / liquidity
+    delta_impact = lambda_impact * math.copysign(
+        math.sqrt(abs(signed_notional) / liquidity), signed_notional
+    )
     delta_impact = max(-max_impact, min(max_impact, delta_impact))
     impact_after = impact_before + delta_impact
 

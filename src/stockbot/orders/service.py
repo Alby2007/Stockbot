@@ -36,7 +36,11 @@ from stockbot.ledger.service import (
 )
 from stockbot.margin.errors import MarginError
 from stockbot.market import engine
-from stockbot.market.data import half_spread_for, spread_config
+from stockbot.market.data import (
+    half_spread_for,
+    participation_cap,
+    spread_config,
+)
 from stockbot.trading.errors import NotInLeagueError, TradingError, UnknownInstrumentError
 from stockbot.trading.service import (
     _apply_fill,
@@ -360,10 +364,12 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
         )
         open_orders = await cur.fetchall()
         await cur.execute(
-            "SELECT value FROM config WHERE key = 'cross.collar_pct'"
+            "SELECT key, value FROM config WHERE key IN "
+            "('cross.collar_pct', 'cross.trade_through_epsilon')"
         )
-        collar_row = await cur.fetchone()
-    collar = Decimal(str(collar_row["value"])) if collar_row else Decimal("0.02")
+        cfg_rows = {str(r["key"]): float(r["value"]) for r in await cur.fetchall()}
+    collar = Decimal(str(cfg_rows.get("cross.collar_pct", 0.02)))
+    epsilon = float(cfg_rows.get("cross.trade_through_epsilon", 0.0005))
 
     # --- Pass 1: crossing book -------------------------------------------
     # Per (instrument, season scope): bids and asks walk price-time
@@ -451,9 +457,10 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
 
     # --- Pass 2: market-maker fallback ------------------------------------
     async with conn.cursor(row_factory=dict_row) as cur:
-        # A BUY needs quoted <= limit, a SELL quoted >= limit (impact and
-        # half-spread only move the executable price against the taker, so
-        # a mark on the wrong side can never produce a valid fill).
+        # A BUY needs quoted <= limit*(1-eps), a SELL quoted >= limit*(1+eps)
+        # -- the mark must cross the limit by epsilon, not merely touch it
+        # (the crossing book provides the real queue priority; this is the
+        # cheap trade-through rule for the infinite-depth MM).
         await cur.execute(
             """
             SELECT o.id, o.user_id, o.season_id, o.side, o.quantity,
@@ -464,24 +471,42 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
             JOIN instruments i ON i.id = o.instrument_id
             WHERE o.status = 'OPEN'
               AND i.circuit_halted_until_tick IS NULL
-              AND ((o.side = 'BUY'  AND i.quoted_price <= o.limit_price)
-                OR (o.side = 'SELL' AND i.quoted_price >= o.limit_price))
+              AND ((o.side = 'BUY'  AND i.quoted_price <= o.limit_price * (1 - %s))
+                OR (o.side = 'SELL' AND i.quoted_price >= o.limit_price * (1 + %s)))
             ORDER BY o.id
             """,
+            (epsilon, epsilon),
         )
         candidates = await cur.fetchall()
 
     spread_cfg = await spread_config(conn)
+    cap = await participation_cap(conn)
     for order in candidates:
         remaining_qty = int(order["quantity"]) - int(order["filled_quantity"])
-        # Executable price check: the fill path includes half-spread and
-        # impact; verify the worst-case fill respects the limit before
+        sign = 1 if order["side"] == "BUY" else -1
+        # Participation cap: a resting order works over multiple ticks --
+        # fill up to cap*liquidity in notional this tick, the rest next
+        # tick. Estimated on the full-size fill price (conservative).
+        fill_full, _ = engine.apply_trade_impact(
+            base_price=float(order["base_price"]),
+            impact_before=float(order["impact"]),
+            signed_notional=float(order["base_price"]) * remaining_qty * sign,
+            liquidity=float(order["liquidity"]),
+            lambda_impact=float(order["lambda_impact"]),
+            max_impact=float(order["max_impact"]),
+            half_spread=half_spread_for(order, tick_index, spread_cfg),
+        )
+        cap_qty = int(cap * float(order["liquidity"]) / fill_full)
+        trade_qty = min(remaining_qty, cap_qty)
+        if trade_qty < 1:
+            continue
+        # Executable price check at the actual size: the fill path includes
+        # half-spread and impact; verify the fill respects the limit before
         # committing to the trade.
         fill_f, _ = engine.apply_trade_impact(
             base_price=float(order["base_price"]),
             impact_before=float(order["impact"]),
-            signed_notional=float(order["base_price"]) * remaining_qty
-            * (1 if order["side"] == "BUY" else -1),
+            signed_notional=float(order["base_price"]) * trade_qty * sign,
             liquidity=float(order["liquidity"]),
             lambda_impact=float(order["lambda_impact"]),
             max_impact=float(order["max_impact"]),
@@ -500,7 +525,7 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
                     user_id=int(order["user_id"]),
                     ticker=str(order["ticker"]),
                     side=order["side"],
-                    quantity=remaining_qty,
+                    quantity=trade_qty,
                     season_id=(
                         int(order["season_id"])
                         if order["season_id"] is not None
@@ -512,11 +537,18 @@ async def match_orders(conn: AsyncConnection, tick_index: int) -> int:
                     await cur.execute(
                         """
                         UPDATE orders
-                        SET status = 'FILLED', filled_tick = %s, fill_price = %s,
-                            filled_quantity = quantity
+                        SET filled_quantity = filled_quantity + %s,
+                            status = CASE
+                                WHEN filled_quantity + %s >= quantity THEN 'FILLED'
+                                ELSE status END,
+                            filled_tick = CASE
+                                WHEN filled_quantity + %s >= quantity THEN %s
+                                ELSE filled_tick END,
+                            fill_price = %s
                         WHERE id = %s
                         """,
-                        (tick_index, result.fill_price, order["id"]),
+                        (trade_qty, trade_qty, trade_qty, tick_index,
+                         result.fill_price, order["id"]),
                     )
                 fills += 1
         except (TradingError, MarginError, LedgerError, ValueError):

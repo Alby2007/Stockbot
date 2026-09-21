@@ -112,10 +112,11 @@ async def test_initial_margin_blocks_oversized_short(conn: AsyncConnection) -> N
     await _grant_tier(conn, 2003)
     ticker = await _first_ticker(conn)
     cash = await get_balance(conn, account_id)
-    # try to short way more than 2x equity allows
+    # try to short more than 2x equity allows (kept small enough that the
+    # participation cap doesn't reject it before the margin gate can)
     with pytest.raises((InsufficientMarginError, PositionLimitError)):
         await execute_trade(
-            conn, user_id=2003, ticker=ticker, side="SELL", quantity=10_000
+            conn, user_id=2003, ticker=ticker, side="SELL", quantity=5
         )
     assert cash == await get_balance(conn, account_id)  # rolled back cleanly
 
