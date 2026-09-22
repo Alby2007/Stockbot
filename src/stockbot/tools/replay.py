@@ -72,16 +72,23 @@ def _session_parts(cfg: dict[str, float]) -> tuple[int, int, int]:
     )
 
 
-def _gap_dt(tick_index: int, open_ticks: int, closed_ticks: int, offset: int) -> float:
+def _gap_dt(
+    tick_index: int,
+    open_ticks: int,
+    closed_ticks: int,
+    offset: int,
+    var_frac: float = 1.0,
+) -> tuple[float, float]:
+    """(clock dt, variance dt) for the step at `tick_index` -- the reopen
+    scales stochastic terms by closed_ticks*var_frac (0033), clock terms by
+    closed_ticks. Non-gap ticks return (1.0, 1.0)."""
     cycle = open_ticks + closed_ticks
     if cycle <= 0:
-        return 1.0
+        return 1.0, 1.0
     cycle_pos = (tick_index - offset) % cycle
-    return (
-        float(closed_ticks)
-        if cycle_pos == 0 and closed_ticks > 0 and tick_index > 0
-        else 1.0
-    )
+    if cycle_pos == 0 and closed_ticks > 0 and tick_index > 0:
+        return float(closed_ticks), max(1.0, closed_ticks * var_frac)
+    return 1.0, 1.0
 
 
 def replay_factors(
@@ -102,6 +109,7 @@ def replay_factors(
     cur.execute("SELECT key, value FROM config WHERE key LIKE 'session.%'")
     session_cfg = {k: float(v) for k, v in cur.fetchall()}
     open_ticks, closed_ticks, offset = _session_parts(session_cfg)
+    var_frac = float(session_cfg.get("session.overnight_var_frac", 1.0))
 
     cur.execute(
         "SELECT DISTINCT s.key FROM instruments i "
@@ -128,9 +136,11 @@ def replay_factors(
             continue
         report.ticks_checked += 1
         rng = engine.rng_for_tick(master_seed, tick_index)
-        dt = _gap_dt(tick_index, open_ticks, closed_ticks, offset)
-        expected_mf = engine.draw_market_factor(rng, dt=dt)
-        expected_sf = engine.draw_sector_factors(rng, sector_keys, dt=dt)
+        dt, vdt = _gap_dt(tick_index, open_ticks, closed_ticks, offset, var_frac)
+        expected_mf = engine.draw_market_factor(rng, dt=dt, var_dt=vdt)
+        expected_sf = engine.draw_sector_factors(
+            rng, sector_keys, dt=dt, var_dt=vdt
+        )
 
         if not math.isclose(expected_mf, float(stored_mf), rel_tol=0, abs_tol=1e-9):
             report.factor_mismatches.append(
@@ -218,6 +228,7 @@ def check_vol_state(
     cfg = {str(k): float(v) for k, v in cur.fetchall()}
     rho = cfg.get("vol.rho", 0.94)
     open_ticks, closed_ticks, offset = _session_parts(cfg)
+    var_frac = float(cfg.get("session.overnight_var_frac", 1.0))
 
     cur.execute(
         """
@@ -246,7 +257,7 @@ def check_vol_state(
                 )
             v_prev[iid] = stored
             continue
-        dt = _gap_dt(int(tick), open_ticks, closed_ticks, offset)
+        _dt, vdt = _gap_dt(int(tick), open_ticks, closed_ticks, offset, var_frac)
         # model_ret is the pre-fill step return; the candle close already
         # contains this tick's fills, so ln(close/open) would double-count
         # flow. Fall back to it only for rows predating the column.
@@ -256,7 +267,7 @@ def check_vol_state(
             # e.g. the index basket: the tick leaves vol_state untouched.
             expected = v_prev[iid]
         else:
-            numerator = (abs(r_model) / math.sqrt(dt) + abs(flow)) / (
+            numerator = (abs(r_model) / math.sqrt(vdt) + abs(flow)) / (
                 float(sigma) * engine.SQRT_2_OVER_PI
             )
             expected = engine.ewma_vol_update(v_prev[iid], numerator, rho)
@@ -287,9 +298,9 @@ def check_vol_state(
                 )
             v_mkt = stored
             continue
-        dt = _gap_dt(int(tick), open_ticks, closed_ticks, offset)
+        _dt, vdt = _gap_dt(int(tick), open_ticks, closed_ticks, offset, var_frac)
         numerator = abs(float(mf)) / (
-            engine.MARKET_SIGMA * math.sqrt(dt) * engine.SQRT_2_OVER_PI
+            engine.MARKET_SIGMA * math.sqrt(vdt) * engine.SQRT_2_OVER_PI
         )
         expected = engine.ewma_vol_update(v_mkt, numerator, rho)
         if not math.isclose(expected, stored, rel_tol=1e-4, abs_tol=1e-4):

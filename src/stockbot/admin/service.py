@@ -171,6 +171,7 @@ CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "session.closed_ticks": (0, 1440),
     "session.open_impact_reset": (0.0, 1.0),
     "session.open_ticks": (0, 1440),
+    "session.overnight_var_frac": (0.0, 1.0),
     "session.phase_offset_ticks": (0, 1440),
     "shorts.enabled": (0, 1),
     "spread.base_bps": (0.0, 1e4),

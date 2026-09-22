@@ -106,3 +106,40 @@ async def test_closed_window_anchors_to_last_open_tick(
     assert sessions[0] == "CLOSED"  # closed tail present
     assert sessions[-1] == "OPEN"  # window anchored back to open candles
     assert sessions.count("CLOSED") <= 3  # tail never exceeds the closed run
+
+
+async def test_window_skips_intra_window_closed_run(
+    conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0033: the window is the last N OPEN candles -- a closed run inside
+    the window is skipped, not rendered as flat filler. open=3/closed=5
+    (cycle 8): ticks 0-2 open, 3-7 closed, 8-9 open."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = %s WHERE key = 'session.open_ticks'", (3,)
+        )
+        await cur.execute(
+            "UPDATE config SET value = %s WHERE key = 'session.closed_ticks'", (5,)
+        )
+        await cur.execute(
+            "SELECT id FROM instruments WHERE is_active AND kind != 'INDEX' "
+            "ORDER BY id LIMIT 1"
+        )
+        (instrument_id,) = await cur.fetchone()
+
+    for _ in range(10):  # ticks 0-9; last open tick = 9
+        await apply_tick(conn, "chart-test-seed")
+
+    captured: list[list[Any]] = []
+    monkeypatch.setattr(
+        charts,
+        "_render_png",
+        lambda rows, ticker: (captured.append(rows), io.BytesIO(b"png"))[1],
+    )
+    buf = await render_candle_chart(conn, instrument_id, "TEST", limit_ticks=4)
+    assert buf is not None
+
+    ticks = sorted(int(r[0]) for r in captured[0])
+    # Last 4 OPEN candles <= 9 are {1, 2, 8, 9}: the closed run 3-7 must
+    # not appear (the pre-0033 window would have returned {6,7,8,9}).
+    assert ticks == [1, 2, 8, 9]

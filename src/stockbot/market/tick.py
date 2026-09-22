@@ -39,9 +39,11 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
     market row and flat zero-volume candles are still written, borrow fees
     keep accruing (real markets charge calendar days), and season
     snapshots still land, but no matching, knockouts, or liquidation run.
-    The first open tick after a close steps once with dt = closed_ticks,
-    producing the overnight gap (bounded by the circuit breaker), resets a
-    fraction of accumulated impact, then runs the full open-tick pipeline
+    The first open tick after a close steps once with dt = closed_ticks
+    for clock-time terms and dt = closed_ticks*overnight_var_frac for the
+    stochastic ones (the overnight gap, bounded by the circuit breaker),
+    resets a fraction of accumulated impact, then runs the full open-tick
+    pipeline
     -- events due during the close resolve into that gap, and the
     knockout/margin sweeps fire immediately after it.
     """
@@ -114,10 +116,20 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # drift/vol lands as one gap (breaker-bounded like any move).
         # tick_index 0 is the exception: the market never closed, so the
         # first-ever tick must not "reopen" with a closed_ticks gap.
+        # gap_var_dt narrows the stochastic horizon: overnight variance
+        # empirically accrues over ~an hour of trading, not the full closed
+        # stretch -- without it gap sigma is sqrt(480)~22x per-tick vol and
+        # nearly every reopen pins the breaker cap (0033). Clock-time terms
+        # (base drift, mean reversion, impact decay) still see full gap_dt.
         cycle_pos = (tick_index - offset) % (open_ticks + closed_ticks)
         gap_dt = (
             float(closed_ticks)
             if cycle_pos == 0 and closed_ticks > 0 and tick_index > 0
+            else 1.0
+        )
+        gap_var_dt = (
+            max(1.0, gap_dt * float(session_cfg.get("session.overnight_var_frac", 1.0)))
+            if gap_dt > 1.0
             else 1.0
         )
         impact_reset = (
@@ -213,17 +225,25 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
 
         sector_keys = sorted({row["sector_key"] for row in instrument_rows})
         rng = engine.rng_for_tick(master_seed, tick_index)
-        market_factor = engine.draw_market_factor(rng, dt=gap_dt)
-        sector_factors = engine.draw_sector_factors(rng, sector_keys, dt=gap_dt)
+        market_factor = engine.draw_market_factor(
+            rng, dt=gap_dt, var_dt=gap_var_dt
+        )
+        sector_factors = engine.draw_sector_factors(
+            rng, sector_keys, dt=gap_dt, var_dt=gap_var_dt
+        )
 
         # Shared market vol state: EWMA of the normalized market factor.
-        # draw_market_factor already folds in sqrt(dt), so dividing it back
+        # draw_market_factor folds in sqrt(var_dt), so dividing it back
         # out leaves |z|/sqrt(2/pi) -- stationary mean ~1.
         rho = float(vol_cfg.get("vol.rho", 0.94))
         v_mkt = engine.ewma_vol_update(
             v_mkt_prev,
             abs(market_factor)
-            / (engine.MARKET_SIGMA * math.sqrt(gap_dt) * engine.SQRT_2_OVER_PI),
+            / (
+                engine.MARKET_SIGMA
+                * math.sqrt(gap_var_dt)
+                * engine.SQRT_2_OVER_PI
+            ),
             rho,
         )
 
@@ -296,6 +316,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                     market_factor,
                     sector_factors[state.sector_key],
                     dt=gap_dt,
+                    var_dt=gap_var_dt,
                     mom_rho=float(mom_cfg.get("mom.rho", 1.0)),
                     mom_innov_frac=float(mom_cfg.get("mom.innov_frac", 0.0)),
                     mom_max_frac=float(mom_cfg.get("mom.max_frac", 0.0)),
@@ -369,7 +390,9 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         perm_frac = float(flow_cfg.get("flow.permanent_frac", 0.10))
         perm_cap = float(flow_cfg.get("flow.max_fundamental_move", 0.005))
         skew_decay = float(flow_cfg.get("flow.skew_decay", 0.9))
-        sqrt_dt = math.sqrt(gap_dt)
+        # r_model's stochastic terms scale with sqrt(var_dt) at a reopen --
+        # normalizing by sqrt(gap_var_dt) keeps the EWMA input a z-score.
+        sqrt_dt = math.sqrt(gap_var_dt)
         rows_by_id = {int(r["id"]): r for r in instrument_rows}
         vol_new: dict[int, float] = {}
         sigma_eff_new: dict[int, float] = {}

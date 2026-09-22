@@ -7,6 +7,7 @@ from __future__ import annotations
 import math
 from decimal import Decimal
 
+import numpy as np
 import pytest
 from psycopg import AsyncConnection
 
@@ -767,3 +768,112 @@ async def test_first_tick_does_not_gap(conn: AsyncConnection) -> None:
     move = math.log(quoted / seed_base)
     # dt=1 -> ~0.02; the buggy gap (dt=10) -> ~0.2, clipped + halted.
     assert 0.015 < move < 0.03
+
+
+async def test_overnight_gap_scales_variance_not_clock(
+    conn: AsyncConnection,
+) -> None:
+    """0033: the reopen's stochastic terms scale by sqrt(closed*frac), not
+    sqrt(closed). open=2/closed=40, frac=0.125 -> clock dt=40, var_dt=5.
+    Replicates the tick's RNG stream to pin the exact formula."""
+    ticker = await _first_ticker(conn)
+    await _set_session(conn, 2, 40)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = %s "
+            "WHERE key = 'session.overnight_var_frac'",
+            (0.125,),
+        )
+
+    # Ticks 0-1 open, 2-41 closed, 42 reopens. Stop one tick before it.
+    for _ in range(42):
+        await apply_tick(conn, SEED)
+    assert await _last_tick(conn) == 41
+
+    # The draw stream is seed-deterministic, so replicate it before the
+    # tick runs and choose sigma so the expected move lands well clear of
+    # both 0 and the breaker cap.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT i.id FROM instruments i WHERE i.ticker = %s", (ticker,)
+        )
+        iid = int((await cur.fetchone())[0])
+        await cur.execute(
+            "SELECT id FROM instruments WHERE is_active AND kind != 'INDEX' "
+            "ORDER BY id"
+        )
+        draw_order = [int(r[0]) for r in await cur.fetchall()]
+        await cur.execute(
+            "SELECT DISTINCT s.key FROM instruments i "
+            "JOIN sectors s ON s.id = i.sector_id WHERE i.is_active"
+        )
+        n_sectors = len(await cur.fetchall())
+
+    rng = np.random.default_rng(engine.tick_seed(SEED, 42))
+    rng.standard_normal()  # market factor
+    rng.standard_normal(n_sectors)  # sector factors
+    for _ in range(draw_order.index(iid)):
+        rng.standard_normal()  # drift_innov
+        rng.standard_t(engine.STUDENT_T_DF)  # idiosyncratic
+        rng.standard_normal()  # fundamental shock
+    z_mom = rng.standard_normal()  # this instrument's drift_innov
+    z = rng.standard_t(engine.STUDENT_T_DF) * engine.STUDENT_T_SCALE
+
+    sigma = min(0.01, 0.02 / (math.sqrt(5.0) * max(abs(z), 1e-9)))
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE instruments
+            SET sigma = %s, sigma_eff = %s, beta = 0, gamma = 0,
+                drift = 0.0001, drift_state = 0, impact = 0, kappa = 0,
+                fundamental_value = base_price, dividend_drift_offset = 0,
+                circuit_halted_until_tick = NULL
+            WHERE id = %s
+            """,
+            (sigma, sigma, iid),
+        )
+        # An event resolving on the reopen tick would pollute model_ret.
+        await cur.execute(
+            "DELETE FROM events WHERE instrument_id = %s AND NOT resolved",
+            (iid,),
+        )
+
+    tick = await apply_tick(conn, SEED)
+    assert tick == 42
+
+    clock_dt, var_dt = 40.0, 5.0
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT key, value FROM config WHERE key LIKE 'mom.%'")
+        mom_cfg = {k: float(v) for k, v in await cur.fetchall()}
+    # Momentum regime is live (mom.innov_frac>0): the gap tick's
+    # drift_state innovation scales by sqrt(var_dt) and the carried term
+    # multiplies var_dt -- both part of what this test pins. Prior
+    # drift_state was pinned to 0 above, so rho*state contributes nothing.
+    mom_innov = mom_cfg.get("mom.innov_frac", 0.0)
+    mom_max = mom_cfg.get("mom.max_frac", 0.0)
+    drift_state = float(
+        np.clip(
+            mom_innov * sigma * math.sqrt(var_dt) * z_mom,
+            -mom_max * sigma,
+            mom_max * sigma,
+        )
+    )
+    expected = (
+        0.0001 * clock_dt
+        + drift_state * var_dt
+        + sigma * math.sqrt(var_dt) * z
+    )
+    assert abs(expected) < engine.CIRCUIT_BREAKER_CAP
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT model_ret, halt_kind FROM candles "
+            "WHERE instrument_id = %s AND tick_index = %s",
+            (iid, tick),
+        )
+        model_ret, halt_kind = await cur.fetchone()
+    assert math.isclose(float(model_ret), expected, abs_tol=1e-7)
+    assert halt_kind is None
+    # The pre-0033 formula multiplies the stochastic term by sqrt(40/5):
+    old_style = sigma * math.sqrt(clock_dt) * z
+    assert abs(old_style) > 2 * abs(sigma * math.sqrt(var_dt) * z)

@@ -12,7 +12,7 @@ matplotlib.use("Agg")
 
 from matplotlib.figure import Figure  # noqa: E402
 from matplotlib.patches import Rectangle  # noqa: E402
-from matplotlib.ticker import FuncFormatter  # noqa: E402
+from matplotlib.ticker import FuncFormatter, MaxNLocator  # noqa: E402
 from psycopg import AsyncConnection  # noqa: E402
 
 # TradingView-style dark terminal palette.
@@ -27,17 +27,14 @@ _HALT_FLOW = "#ff9800"
 _HALT_MODEL = "#ef5350"
 
 
-async def render_candle_chart(
-    conn: AsyncConnection, instrument_id: int, ticker: str, limit_ticks: int = 240
-) -> io.BytesIO | None:
-    """Candlestick chart of the last `limit_ticks` candles. Returns None
-    if the instrument has no candle history yet.
-    """
+async def _select_window_rows(
+    conn: AsyncConnection, instrument_id: int, limit_ticks: int
+) -> list[Any]:
+    """Window selection for the chart: the last `limit_ticks` OPEN-phase
+    candles ending at the last open tick, plus a short tail of the current
+    closed run (so a closed market still signals CLOSED at the right edge).
+    Rows are newest-first."""
     async with conn.cursor() as cur:
-        # Anchor the window to the last OPEN tick so a closed session
-        # doesn't produce an all-flat, all-shaded chart: show the last
-        # `limit_ticks` open-phase candles plus a short tail of the
-        # current closed run to signal the market is closed now.
         await cur.execute(
             """
             WITH last_open AS (
@@ -46,11 +43,17 @@ async def render_candle_chart(
                 WHERE session_state = 'OPEN'
             ),
             picked AS (
+                -- Last `limit_ticks` OPEN-phase candles: flat closed-run
+                -- candles carry no information and would eat most of the
+                -- window near a reopen. Missing market_ticks rows default
+                -- to OPEN, same as the outer join.
                 (SELECT c.tick_index FROM candles c
+                 LEFT JOIN market_ticks mt ON mt.tick_index = c.tick_index
                  WHERE c.instrument_id = %s
                    AND c.tick_index <= COALESCE(
                        (SELECT t FROM last_open),
                        (SELECT MAX(tick_index) FROM market_ticks))
+                   AND COALESCE(mt.session_state, 'OPEN') = 'OPEN'
                  ORDER BY c.tick_index DESC LIMIT %s)
                 UNION ALL
                 (SELECT c.tick_index FROM candles c
@@ -74,7 +77,16 @@ async def render_candle_chart(
                 instrument_id,
             ),
         )
-        rows = await cur.fetchall()
+        return await cur.fetchall()
+
+
+async def render_candle_chart(
+    conn: AsyncConnection, instrument_id: int, ticker: str, limit_ticks: int = 240
+) -> io.BytesIO | None:
+    """Candlestick chart of the last `limit_ticks` open-phase candles.
+    Returns None if the instrument has no candle history yet.
+    """
+    rows = await _select_window_rows(conn, instrument_id, limit_ticks)
     if not rows:
         return None
     # The render is ~100ms+ of synchronous CPU -- run it off the event loop
@@ -130,11 +142,17 @@ def _render_png(rows: list[Any], ticker: str) -> io.BytesIO:
             spans.append((run_start, i - 1))
             run_start = None
     for lo_i, hi_i in spans:
-        ax.axvspan(ticks[lo_i] - 0.5, ticks[hi_i] + 0.5, color=_GRID, alpha=0.03, lw=0)
+        ax.axvspan(lo_i - 0.5, hi_i + 0.5, color=_GRID, alpha=0.03, lw=0)
+
+    # X positions are ordinal (0..N-1): the window holds OPEN candles only
+    # (plus a short CLOSED tail), so a skipped closed run shows as a price
+    # discontinuity between neighbours -- like real charts compress the
+    # overnight -- instead of a hundreds-wide empty band on a tick axis.
+    pos = list(range(len(ticks)))
 
     # Candlesticks: wick low->high, body over [min(o,c), |o-c|].
     vol_colors = []
-    for i, x in enumerate(ticks):
+    for i, x in enumerate(pos):
         closed = sessions[i] == "CLOSED"
         color = _MUTED if closed else (_UP if up[i] else _DOWN)
         ax.vlines(x, lows[i], highs[i], color=color, linewidth=0.8)
@@ -175,7 +193,7 @@ def _render_png(rows: list[Any], ticker: str) -> io.BytesIO:
     ax.set_ylim(price_lo - ypad, price_hi + ypad)
     for lo_i, hi_i in spans:
         ax.text(
-            (ticks[lo_i] + ticks[hi_i]) / 2,
+            (lo_i + hi_i) / 2,
             price_hi + ypad,
             "CLOSED",
             color=_TEXT,
@@ -195,8 +213,19 @@ def _render_png(rows: list[Any], ticker: str) -> io.BytesIO:
     ax.set_ylabel("price", color=_TEXT, fontsize=8)
     ax.margins(x=0.02)
 
-    axv.bar(ticks, volumes, width=0.8, color=vol_colors, alpha=0.6)
+    axv.bar(pos, volumes, width=0.8, color=vol_colors, alpha=0.6)
     axv.set_ylim(bottom=0)
+    # Labels show the real tick_index at each ordinal position -- a skipped
+    # closed run reads as a jump in the axis, not a hole in the plot.
+    axv.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    def _tick_label(v: float, _pos: int) -> str:
+        i = int(round(v))
+        if abs(v - i) > 1e-6 or not (0 <= i < len(ticks)):
+            return ""
+        return str(ticks[i])
+
+    axv.xaxis.set_major_formatter(FuncFormatter(_tick_label))
     axv.set_xlabel("tick", color=_TEXT, fontsize=8)
     axv.set_ylabel("volume", color=_TEXT, fontsize=8)
     axv.yaxis.set_major_formatter(

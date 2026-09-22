@@ -40,20 +40,18 @@ SECTOR_DRIFT = 0.0
 SECTOR_DAILY_VOL = 0.012
 SECTOR_SIGMA = SECTOR_DAILY_VOL / TICKS_PER_DAY**0.5
 
-# F6 calibration: the realized |r_model + bounded_flow| distribution from a
-# 21-day harness run is bimodal -- intraday moves essentially never reach
-# 2% even with t(5) tails and 4x vol regimes, while dt=480 overnight gaps
-# breach at ~37% per reopen at cap 0.03. A 14-day validation run at this
-# cap measured 2.43 halts/instrument/sim-week (target: a few per week,
-# ~2-5). The cap is absolute (not dt-normalized) so the breaker mostly
+# F6 calibration: the realized |r_model + bounded_flow| distribution is
+# bimodal -- intraday moves essentially never reach 2% even with t(5)
+# tails and 4x vol regimes, while overnight-gap ticks carry the tail.
+# Post-0033 the gap's stochastic terms scale by sqrt(closed_ticks *
+# session.overnight_var_frac) (default 480*0.125=60, not sqrt(480)): the
+# old full-dt gap pinned ~85% of instruments at the cap every reopen.
+# The cap is absolute (not dt-normalized) so the breaker still mostly
 # guards gap reopens -- the real-world analogue of limit-halts at the
-# open. Lowering it further mostly raises gap-halt frequency; raising it
-# removes halts entirely.
+# open -- plus genuine intraday dislocations at the extreme tail.
 # Max |Δlog P| in a single tick. Calibrated in F6 to a few halts per
-# instrument per simulated week. Every measured breach is an overnight-gap
-# tick (intraday |r| never gets near this), and Phase I's drift_state
-# applies its full drift to the gap, so the realized gap distribution is
-# wide: 0.03 -> ~5.4 halts/instr/wk, 0.035 -> ~5.2, 0.045 lands mid-band.
+# instrument per simulated week; with the narrowed gap variance, breaches
+# now require a real tail draw rather than an ordinary overnight roll.
 CIRCUIT_BREAKER_CAP = 0.045
 CIRCUIT_HALT_TICKS = 5  # ticks an instrument stays halted after a breach
 
@@ -126,21 +124,28 @@ def rng_for_tick(master_seed: str, tick_index: int) -> np.random.Generator:
     return np.random.default_rng(tick_seed(master_seed, tick_index))
 
 
-def draw_market_factor(rng: np.random.Generator, dt: float = 1.0) -> float:
-    return float(MARKET_DRIFT * dt + MARKET_SIGMA * dt**0.5 * rng.standard_normal())
+def draw_market_factor(
+    rng: np.random.Generator, dt: float = 1.0, var_dt: float | None = None
+) -> float:
+    vdt = dt if var_dt is None else var_dt
+    return float(MARKET_DRIFT * dt + MARKET_SIGMA * vdt**0.5 * rng.standard_normal())
 
 
 def draw_sector_factors(
-    rng: np.random.Generator, sector_keys: list[str], dt: float = 1.0
+    rng: np.random.Generator,
+    sector_keys: list[str],
+    dt: float = 1.0,
+    var_dt: float | None = None,
 ) -> dict[str, float]:
     """One draw per sector, consumed from the same tick's RNG stream.
 
     `sector_keys` must be passed in a stable (e.g. sorted) order for the draw
     to be reproducible.
     """
+    vdt = dt if var_dt is None else var_dt
     draws = rng.standard_normal(len(sector_keys))
     return {
-        key: float(SECTOR_DRIFT * dt + SECTOR_SIGMA * dt**0.5 * draw)
+        key: float(SECTOR_DRIFT * dt + SECTOR_SIGMA * vdt**0.5 * draw)
         for key, draw in zip(sector_keys, draws, strict=True)
     }
 
@@ -180,6 +185,7 @@ def step_instrument(
     sector_factor: float,
     dt: float = 1.0,
     *,
+    var_dt: float | None = None,
     mom_rho: float = 1.0,
     mom_innov_frac: float = 0.0,
     mom_max_frac: float = 0.0,
@@ -200,9 +206,18 @@ def step_instrument(
     `mom_innov_frac * sigma` per sqrt-tick, clipped to
     `mom_max_frac * sigma` (sigma_eff == 0 names keep drift_state pinned at
     0). Defaults disable the regime entirely.
+
+    `var_dt` splits the step's time horizon: stochastic terms (idiosyncratic
+    shock, fundamental shock, momentum innovation, the carried momentum
+    drift) scale by sqrt(var_dt), while clock-time terms (base drift, mean
+    reversion, impact decay) use `dt`. The overnight gap calls this with
+    dt=closed_ticks and var_dt=closed_ticks*overnight_var_frac -- overnight
+    variance empirically accrues over ~an hour of trading, not the whole
+    closed stretch (var_dt=None keeps every term on dt).
     """
+    vdt = dt if var_dt is None else var_dt
     drift_innov = (
-        mom_innov_frac * inst.sigma * dt**0.5 * float(rng.standard_normal())
+        mom_innov_frac * inst.sigma * vdt**0.5 * float(rng.standard_normal())
     )
     drift_cap = mom_max_frac * inst.sigma
     drift_state = float(
@@ -212,10 +227,11 @@ def step_instrument(
     idiosyncratic = float(rng.standard_t(STUDENT_T_DF)) * STUDENT_T_SCALE
     mean_reversion = inst.kappa * float(np.log(inst.fundamental_value / inst.base_price)) * dt
     delta_log_price = (
-        (inst.drift + drift_state) * dt
+        inst.drift * dt
+        + drift_state * vdt
         + inst.beta * market_factor
         + inst.gamma * sector_factor
-        + inst.sigma * dt**0.5 * idiosyncratic
+        + inst.sigma * vdt**0.5 * idiosyncratic
         + mean_reversion
     )
 
@@ -225,7 +241,7 @@ def step_instrument(
 
     new_base_price = inst.base_price * float(np.exp(delta_log_price))
 
-    fundamental_shock = inst.fundamental_sigma * dt**0.5 * float(rng.standard_normal())
+    fundamental_shock = inst.fundamental_sigma * vdt**0.5 * float(rng.standard_normal())
     new_fundamental = inst.fundamental_value * float(np.exp(fundamental_shock))
 
     new_impact = inst.impact * float(np.exp(-dt / inst.tau_ticks))

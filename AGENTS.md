@@ -118,6 +118,11 @@ steps once with `dt=closed_ticks` (the overnight gap, breaker-bounded
 like any move) and applies `session.open_impact_reset`. Tick 0 is the
 exception: the market never closed, so the first-ever tick steps with
 dt=1 -- otherwise it "reopens" with a closed_ticks gap it never had.
+Gap variance is split (0033): stochastic terms scale by
+sqrt(closed_ticks * `session.overnight_var_frac`) (default 0.125 ->
+var_dt=60, ~an hour of trading), while clock-time terms (base drift,
+mean reversion, impact decay) keep the full closed_ticks. Without the
+split ~85% of instruments pinned the 4.5% breaker every reopen.
 "Now" = phase of `MAX(tick_index)`;
 `assert_market_open` (market/data.py) gates `execute_trade`,
 `place_order`, and both bounded-short endpoints with `MarketClosedError`
@@ -190,7 +195,7 @@ use the COALESCE'd value, never raw `sigma`. The EWMA numerator is
 (|r_model|/sqrt(dt) + |bounded_flow|) / (sigma_i * sqrt(2/pi)) — total
 returns including trade impact, with the sqrt(2/pi) normalization because
 E|r|/sigma = sqrt(2/pi) for Gaussian returns, and gap returns normalized
-by sqrt(dt) so a reopen doesn't pin vol at clip_max. Idiosyncratic noise
+by sqrt(var_dt) (0033) so a reopen doesn't pin vol at clip_max. Idiosyncratic noise
 is Student-t(5) rescaled to unit variance; draw counts are unconditional —
 never add branch-dependent RNG draws (replay determinism depends on draw
 order). sigma=0 instruments (the index basket) skip the EWMA entirely.
@@ -212,8 +217,9 @@ guarantee narrowed: vol_state is flow-fed and can't be re-derived from
 the seed — `replay` verifies internal consistency against stored
 model_ret/flow_ret, NOT seed-determinism. F6 calibration: every measured
 breach is an overnight-gap tick (intraday |r| never gets near the cap);
-the gap's dt=480 step plus I1's drift_state·480 term make the realized
-gap distribution wide — CIRCUIT_BREAKER_CAP = 0.045 yields ~a few halts
+post-0033 the gap's stochastic horizon is closed_ticks*overnight_var_frac
+(default 60) so breaches need a real tail draw, not an ordinary roll —
+CIRCUIT_BREAKER_CAP = 0.045 yields ~a few halts
 per instrument-week (measured 5.2/wk at 0.035, 5.4/wk at 0.03 pre-I1
 measured 2.4/wk before drift_state existed). Because the clamp censors
 candles.model_ret at the cap, the breach distribution can't be
