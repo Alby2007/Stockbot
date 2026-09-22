@@ -34,17 +34,45 @@ async def render_candle_chart(
     if the instrument has no candle history yet.
     """
     async with conn.cursor() as cur:
+        # Anchor the window to the last OPEN tick so a closed session
+        # doesn't produce an all-flat, all-shaded chart: show the last
+        # `limit_ticks` open-phase candles plus a short tail of the
+        # current closed run to signal the market is closed now.
         await cur.execute(
             """
+            WITH last_open AS (
+                SELECT MAX(tick_index) AS t
+                FROM market_ticks
+                WHERE session_state = 'OPEN'
+            ),
+            picked AS (
+                (SELECT c.tick_index FROM candles c
+                 WHERE c.instrument_id = %s
+                   AND c.tick_index <= COALESCE(
+                       (SELECT t FROM last_open),
+                       (SELECT MAX(tick_index) FROM market_ticks))
+                 ORDER BY c.tick_index DESC LIMIT %s)
+                UNION ALL
+                (SELECT c.tick_index FROM candles c
+                 WHERE c.instrument_id = %s
+                   AND c.tick_index > (SELECT t FROM last_open)
+                 ORDER BY c.tick_index LIMIT %s)
+            )
             SELECT c.tick_index, c.open, c.high, c.low, c.close, c.volume,
                    c.halt_kind, COALESCE(mt.session_state, 'OPEN') AS session_state
             FROM candles c
+            JOIN picked p ON p.tick_index = c.tick_index
             LEFT JOIN market_ticks mt ON mt.tick_index = c.tick_index
             WHERE c.instrument_id = %s
             ORDER BY c.tick_index DESC
-            LIMIT %s
             """,
-            (instrument_id, limit_ticks),
+            (
+                instrument_id,
+                limit_ticks,
+                instrument_id,
+                max(8, limit_ticks // 10),
+                instrument_id,
+            ),
         )
         rows = await cur.fetchall()
     if not rows:
@@ -157,7 +185,12 @@ def _render_png(rows: list[Any], ticker: str) -> io.BytesIO:
             alpha=0.7,
         )
 
-    ax.set_title(f"{ticker} — last {len(ticks)} ticks", color=_TEXT, fontsize=11)
+    closed_now = sessions[-1] == "CLOSED"
+    ax.set_title(
+        f"{ticker} — last {len(ticks)} ticks" + (" · MARKET CLOSED" if closed_now else ""),
+        color=_TEXT,
+        fontsize=11,
+    )
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.2f}"))
     ax.set_ylabel("price", color=_TEXT, fontsize=8)
     ax.margins(x=0.02)
