@@ -644,6 +644,97 @@ async def test_event_halt_lifts_after_resolution(conn: AsyncConnection) -> None:
     assert int(next_halt) - (current + 1) > 1000  # ~30d out, not imminently halted
 
 
+async def test_auction_tick_keeps_event_halt_risk_reducing_path(
+    conn: AsyncConnection,
+) -> None:
+    """Auction + T1-halt interaction: on the auction tick the MM fallback
+    still runs for books that had no auction -- an event-halted name's
+    resting orders keep the same position-aware gate as every other tick
+    (a holder's resting SELL fills; an exposure-increasing BUY waits)."""
+    from stockbot.market import events as events_mod
+    from stockbot.market.data import session_parts
+
+    account = await bootstrap_user(conn, 7040)
+    await post_transfer(
+        conn,
+        from_account_id=await get_system_account_id(conn, "FAUCET"),
+        to_account_id=account,
+        amount=10_000_000,
+        reason="TEST_TOPUP",
+    )
+    ticker = await _first_ticker(conn)
+    await _set_session(conn, 4, 2)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = 1 WHERE key = 'session.auction_ticks'"
+        )
+    await _run_to_phase(conn, "OPEN")
+
+    # A position to reduce, and a clean event stream so the seed can't
+    # schedule an earnings inside the halt window first.
+    await execute_trade(conn, user_id=7040, ticker=ticker, side="BUY", quantity=10)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            DELETE FROM events WHERE kind = 'EARNINGS' AND NOT resolved
+              AND instrument_id = (SELECT id FROM instruments WHERE ticker = %s)
+            """,
+            (ticker,),
+        )
+        await cur.execute(
+            "SELECT id FROM instruments WHERE ticker = %s", (ticker,)
+        )
+        iid = int((await cur.fetchone())[0])
+
+    # Advance until the NEXT applied tick is the auction (until_close == 1).
+    for _ in range(10):
+        last = await _last_tick(conn)
+        _, _, cfg = await current_session(conn)
+        open_t, closed_t, offset = session_parts(cfg)
+        if engine.ticks_until_close(last, open_t, closed_t, offset) == 2:
+            break
+        await apply_tick(conn, SEED)
+    else:
+        raise AssertionError("never reached ticks_until_close == 2")
+    current = await _last_tick(conn)
+
+    # Resting orders placed BEFORE the halt: an MM-fillable sell against
+    # the held long (risk-reducing) and an MM-fillable buy (increasing).
+    mark = Decimal(str(await _quoted(conn, ticker)))
+    sell = await place_order(
+        conn, user_id=7040, ticker=ticker, side="SELL", quantity=5,
+        limit_price=mark * Decimal("0.95"),
+    )
+    buy = await place_order(
+        conn, user_id=7040, ticker=ticker, side="BUY", quantity=5,
+        limit_price=mark * Decimal("1.05"),
+    )
+    # Earnings resolves one tick past the auction: the halt window covers
+    # the auction tick and refresh_next_event_ticks keeps it that way.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            INSERT INTO events (instrument_id, kind, scheduled_tick, resolve_tick,
+                                estimate)
+            VALUES (%s, 'EARNINGS', %s, %s, 0.01)
+            """,
+            (iid, current, current + 2),
+        )
+    await events_mod.refresh_next_event_ticks(conn)
+
+    await apply_tick(conn, SEED)  # the auction tick, inside the halt window
+
+    # The holder's resting sell MM-filled mid-halt (same as any other
+    # tick); the exposure-increasing buy waited with no strike.
+    assert await _order_status(conn, sell.order_id) == "FILLED"
+    assert await _order_status(conn, buy.order_id) == "OPEN"
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT fill_failures FROM orders WHERE id = %s", (buy.order_id,)
+        )
+        assert (await cur.fetchone())[0] == 0
+
+
 async def test_first_tick_does_not_gap(conn: AsyncConnection) -> None:
     """Tick 0 must not 'reopen' with dt=closed_ticks -- the market never
     closed. With a large drift and all vol terms zeroed, the first tick's

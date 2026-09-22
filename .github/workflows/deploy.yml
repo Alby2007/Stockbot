@@ -3,10 +3,48 @@ name: deploy
 on:
   push:
     branches: [master]
+  pull_request:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: stockbot
+          POSTGRES_PASSWORD: stockbot
+          POSTGRES_DB: stockbot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stockbot -d stockbot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://stockbot:stockbot@localhost:5432/stockbot
+      TEST_DATABASE_URL: postgresql://stockbot:stockbot@localhost:5432/stockbot_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      # conftest applies migrations itself; the suite just needs the db to exist.
+      - name: Create test database
+        run: psql "$DATABASE_URL" -c "CREATE DATABASE stockbot_test"
+      - run: python -m pytest -x -q
+      - run: ruff check
+      - run: mypy src
+
   deploy:
+    # The VM only ever receives a green commit: `needs` pins deploy to the
+    # same SHA's test run, so a broken push can't reach production.
+    needs: test
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to VM

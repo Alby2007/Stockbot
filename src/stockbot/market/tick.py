@@ -575,7 +575,8 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # the orders.enabled kill switch is off -- resting orders wait.
         # On the session's last `session.auction_ticks` open ticks the
         # continuous book clears at a uniform price (Plan C closing
-        # auction); the MM fallback is skipped -- the print is the auction.
+        # auction); the MM fallback is skipped for auctioned books (the
+        # print is the auction) but still runs for event-halted ones.
         if await data.feature_enabled_flag(conn, "orders.enabled"):
             auction_window = int(session_cfg.get("session.auction_ticks", 30))
             closing_auction = (

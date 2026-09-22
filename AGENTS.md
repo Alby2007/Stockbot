@@ -377,7 +377,13 @@ Session-auction & event-halt notes (Plan C, migration 0030):
 `session.auction_ticks` (0 disables) -- a real window: on EACH of the
 last N open ticks (`ticks_until_close <= N`)
 `match_orders(closing_auction=True)` runs `_auction_clear` per book
-instead of the continuous loop and skips the MM fallback entirely.
+instead of the continuous loop and restricts the MM fallback (pass 2)
+to books that had no auction: event-halted names keep their
+position-aware reduce-only path via execute_trade's gate, so a holder's
+resting SELL still MM-fills mid-halt on a closing tick (previously pass
+2 was skipped entirely -- resting orders on halted names froze for the
+whole window while marketable sells still worked). Auctioned books
+never reach pass 2 -- the print IS the close.
 Clearing price = the candidate maximizing executable volume over the
 union of resting limits + the snapped open_mark; ties break toward
 open_mark then lower. A maximizing price outside `cross.collar_pct` of

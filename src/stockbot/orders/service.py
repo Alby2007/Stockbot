@@ -515,9 +515,10 @@ async def match_orders(
     participation budget across iterations so a cascade can't drain more
     depth than one tick allows.
 
-    `closing_auction` (Plan C) is set on the session's last open tick:
-    pass 1 becomes a single-price clearing auction per book and the MM
-    fallback is skipped -- the close print IS the auction.
+    `closing_auction` (Plan C) is set on the session's last open ticks
+    (`session.auction_ticks`): pass 1 becomes a single-price clearing
+    auction per book and the MM fallback is restricted to books that had
+    no auction -- event-halted names keep their risk-reducing MM path.
     """
     if stats is not None:
         stats.setdefault("crosses", 0)
@@ -918,9 +919,13 @@ async def _match_once(
                 break
 
     # --- Pass 2: market-maker fallback ------------------------------------
-    # Skipped on the closing-auction tick: the auction print IS the close.
-    if closing_auction:
-        return fills
+    # On the closing-auction tick the auction print IS the close, so pass 2
+    # only runs for books that had no auction to clear in: event-halted
+    # names keep their normal risk-reducing MM path (execute_trade's
+    # position-aware gate decides per fill). Without this clause a resting
+    # order on a T1-halted name would lose its reduce-only path for the
+    # whole auction window -- the halt semantics would silently differ by
+    # order type.
     async with conn.cursor(row_factory=dict_row) as cur:
         # A BUY needs quoted <= limit*(1-eps), a SELL quoted >= limit*(1+eps)
         # -- the mark must cross the limit by epsilon, not merely touch it
@@ -945,9 +950,10 @@ async def _match_once(
               AND (o.order_type = 'STOP'
                 OR (o.side = 'BUY'  AND i.quoted_price <= o.limit_price * (1 - %s))
                 OR (o.side = 'SELL' AND i.quoted_price >= o.limit_price * (1 + %s)))
+              AND (NOT %s OR %s >= i.next_halting_event_tick - %s)
             ORDER BY o.id
             """,
-            (epsilon, epsilon),
+            (epsilon, epsilon, closing_auction, tick_index, event_halt_lead),
         )
         candidates = await cur.fetchall()
 
