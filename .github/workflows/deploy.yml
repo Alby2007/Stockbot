@@ -1,0 +1,24 @@
+name: deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to VM
+        env:
+          VM_HOST: ${{ secrets.STOCKBOT_VM_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.STOCKBOT_VM_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key opc@"$VM_HOST" '
+            set -e
+            cd ~/stockbot
+            curl -sL "https://github.com/Alby2007/Stockbot/archive/${{ github.sha }}.tar.gz" | tar xz --strip-components=1
+            docker compose up -d --build bot market
+          '
