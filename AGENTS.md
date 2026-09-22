@@ -142,10 +142,15 @@ Chart UI notes: `/chart` attaches a stateless `discord.ui.View`
 `cbt:{action}:{iid}:{end}:{span}` so clicks need no server-side session
 and survive nothing except the message itself. Two paths reach
 `handle_chart_component`: the live View's item callback and
-`StockBotClient.on_interaction` (discord.py fires BOTH for one click --
-the `is_done()` guard at handler entry and re-check before
-`edit_message` make the second a no-op; post-restart the View is gone
-and `on_interaction` is the only path). Window state is in open-tick
+`StockBotClient.on_interaction` (discord.py fires BOTH for one click on
+the SAME Interaction object -- the `_INFLIGHT` id set claims the first
+entrant and the loser no-ops; post-restart the View is gone and
+`on_interaction` is the only path). The handler ACKs with a
+payload-free `response.defer()` (type 6) then edits via
+`interaction.message.edit(attachments=[...])` -- do NOT use
+`response.edit_message` with new files: the type-7 interaction callback
+rejects uploaded attachments (observed in prod as 10062 Unknown
+interaction); files only work on the message PATCH endpoint. Window state is in open-tick
 units: `render_candle_chart(conn, iid, ticker, end=, span=)` selects the
 `span` open-phase candles ending at `end` (None = last open tick),
 bucketed `ceil(span/240)` ticks per candle in SQL (grp anchors at the

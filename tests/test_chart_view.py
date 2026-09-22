@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import cast
 
 import discord
@@ -7,6 +8,7 @@ import pytest
 from psycopg import AsyncConnection
 
 from stockbot.bot.chart_view import (
+    _INFLIGHT,
     MAX_SPAN,
     MIN_SPAN,
     build_chart_view,
@@ -122,10 +124,11 @@ def test_build_chart_view_encodes_window() -> None:
 
 
 class _FakeResponse:
-    def __init__(self, done: bool = False) -> None:
+    def __init__(self, done: bool = False, defer_gate: asyncio.Event | None = None) -> None:
         self.done = done
+        self.defer_gate = defer_gate
+        self.deferred = False
         self.sent: list[tuple[tuple[object, ...], dict[str, object]]] = []
-        self.edited: dict[str, object] | None = None
 
     def is_done(self) -> bool:
         return self.done
@@ -134,17 +137,26 @@ class _FakeResponse:
         self.done = True
         self.sent.append((args, kwargs))
 
-    async def edit_message(self, **kwargs: object) -> None:
+    async def defer(self) -> None:
+        if self.defer_gate is not None:
+            await self.defer_gate.wait()
         self.done = True
-        self.edited = kwargs
+        self.deferred = True
 
 
 class _FakeInteraction:
     """Duck-type stand-in for discord.Interaction on the pre-DB paths."""
 
-    def __init__(self, custom_id: str, done: bool = False) -> None:
+    def __init__(
+        self,
+        custom_id: str,
+        done: bool = False,
+        interaction_id: int = 1,
+        defer_gate: asyncio.Event | None = None,
+    ) -> None:
+        self.id = interaction_id
         self.data: dict[str, str] = {"custom_id": custom_id}
-        self.response = _FakeResponse(done)
+        self.response = _FakeResponse(done, defer_gate)
 
 
 async def test_handler_noops_when_already_responded() -> None:
@@ -153,7 +165,7 @@ async def test_handler_noops_when_already_responded() -> None:
     it = _FakeInteraction("cbt:panl:1:2:3", done=True)
     await handle_chart_component(cast(discord.Interaction, it))
     assert it.response.sent == []
-    assert it.response.edited is None
+    assert not it.response.deferred
 
 
 async def test_handler_rejects_bad_cid_ephemerally() -> None:
@@ -161,3 +173,28 @@ async def test_handler_rejects_bad_cid_ephemerally() -> None:
     await handle_chart_component(cast(discord.Interaction, it))
     assert len(it.response.sent) == 1
     assert it.response.sent[0][1].get("ephemeral") is True
+
+
+async def test_handler_dedups_concurrent_dispatch() -> None:
+    """View callback + on_interaction race on the same interaction id:
+    the second entry must return without responding or deferring."""
+    gate = asyncio.Event()
+    first = _FakeInteraction("cbt:zin:1:100:240", interaction_id=42, defer_gate=gate)
+    task = asyncio.create_task(
+        handle_chart_component(cast(discord.Interaction, first))
+    )
+    await asyncio.sleep(0)  # let the first handler reach its defer() wait
+    await asyncio.sleep(0)
+    assert 42 in _INFLIGHT
+
+    second = _FakeInteraction("cbt:zin:1:100:240", interaction_id=42)
+    await handle_chart_component(cast(discord.Interaction, second))
+    assert not second.response.deferred
+    assert second.response.sent == []
+
+    gate.set()
+    # First handler proceeds past defer into db.connection(), whose pool
+    # is uninitialized in tests -- it raising proves it owned the id.
+    with pytest.raises(RuntimeError, match="pool is not initialized"):
+        await task
+    assert 42 not in _INFLIGHT

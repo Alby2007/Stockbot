@@ -88,11 +88,19 @@ class StockBotClient(discord.Client):
                 await handle_chart_component(interaction)
             except Exception:
                 log.exception("chart component interaction failed")
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        "Couldn't refresh that chart — run /chart again.",
-                        ephemeral=True,
-                    )
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(
+                            "Couldn't refresh that chart — run /chart again.",
+                            ephemeral=True,
+                        )
+                    else:
+                        await interaction.response.send_message(
+                            "Couldn't refresh that chart — run /chart again.",
+                            ephemeral=True,
+                        )
+                except discord.HTTPException:
+                    pass
 
     async def on_ready(self) -> None:
         if getattr(self, "_heartbeat_task", None) is None:

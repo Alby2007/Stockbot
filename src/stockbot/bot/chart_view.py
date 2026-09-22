@@ -172,12 +172,25 @@ def build_chart_view(iid: int, end: int, span: int) -> discord.ui.View:
     return view
 
 
+_INFLIGHT: set[int] = set()
+
+
 async def handle_chart_component(interaction: discord.Interaction) -> None:
     # A live View AND on_interaction both fire for one click (discord.py
-    # dispatches both); the response is single-use so the second entry
-    # returns immediately.
-    if interaction.response.is_done():
+    # dispatches both, on the SAME Interaction object). is_done() alone
+    # doesn't dedup -- both tasks can enter before either responds -- so
+    # the in-flight set claims the interaction id atomically; the loser
+    # of the race returns here as a no-op.
+    if interaction.response.is_done() or interaction.id in _INFLIGHT:
         return
+    _INFLIGHT.add(interaction.id)
+    try:
+        await _handle(interaction)
+    finally:
+        _INFLIGHT.discard(interaction.id)
+
+
+async def _handle(interaction: discord.Interaction) -> None:
     data: Any = interaction.data or {}
     parsed = parse_cid(str(data.get("custom_id", "")))
     if parsed is None:
@@ -187,6 +200,12 @@ async def handle_chart_component(interaction: discord.Interaction) -> None:
         return
     action, iid, end, span = parsed
 
+    # Payload-free type-6 ACK up front. New file attachments cannot ride
+    # the type-7 edit_message interaction callback (Discord rejects it --
+    # observed as 10062 Unknown interaction); the PNG goes up on the
+    # follow-up message PATCH, which supports uploads.
+    await interaction.response.defer()
+
     async with db.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -194,7 +213,7 @@ async def handle_chart_component(interaction: discord.Interaction) -> None:
             )
             info = await cur.fetchone()
         if info is None:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "That instrument no longer exists — run /chart.", ephemeral=True
             )
             return
@@ -204,7 +223,7 @@ async def handle_chart_component(interaction: discord.Interaction) -> None:
             conn, iid, ticker, end=new_end, span=new_span
         )
     if result is None:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "No candles in that window — zoom out or pan forward.",
             ephemeral=True,
         )
@@ -220,12 +239,12 @@ async def handle_chart_component(interaction: discord.Interaction) -> None:
             f" · {bucket_for_span(new_span)}t/candle"
         )
     )
-    # Re-check after the DB/render await: the other dispatch path (live
-    # View vs on_interaction) may have responded while we were rendering.
-    if interaction.response.is_done():
-        return
-    await interaction.response.edit_message(
-        embed=embed,
-        attachments=[discord.File(buf, filename=filename)],
-        view=build_chart_view(iid, resolved_end, new_span),
-    )
+    view = build_chart_view(iid, resolved_end, new_span)
+    file = discord.File(buf, filename=filename)
+    msg = interaction.message
+    if msg is not None:
+        await msg.edit(embed=embed, attachments=[file], view=view)
+    else:
+        await interaction.edit_original_response(
+            embed=embed, attachments=[file], view=view
+        )
