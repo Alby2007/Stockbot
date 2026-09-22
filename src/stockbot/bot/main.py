@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from typing import Any
 
 import discord
 
 from stockbot import db
+from stockbot.bot.chart_view import CHART_CID_PREFIX, handle_chart_component
 from stockbot.bot.commands import register_commands
 from stockbot.config import get_settings
 from stockbot.logging import setup_logging
@@ -73,6 +75,24 @@ class StockBotClient(discord.Client):
             except Exception:
                 log.exception("heartbeat write failed")
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        # Post-restart fallback for chart buttons: live Views get the click
+        # first (their callback responds), so by the time this fires the
+        # response is already consumed -- handle_chart_component's is_done()
+        # guard turns the double dispatch into a no-op. After a restart the
+        # View is gone and this is the only path.
+        data: Any = interaction.data or {}
+        if str(data.get("custom_id", "")).startswith(CHART_CID_PREFIX):
+            try:
+                await handle_chart_component(interaction)
+            except Exception:
+                log.exception("chart component interaction failed")
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "Couldn't refresh that chart — run /chart again.",
+                        ephemeral=True,
+                    )
 
     async def on_ready(self) -> None:
         if getattr(self, "_heartbeat_task", None) is None:

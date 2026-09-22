@@ -137,7 +137,24 @@ lands in the closed phase and every trade/quote is silently swallowed
 by `_run_agent_day`'s broad TradingError catch (the sim "ran" with zero
 orders for weeks before this was noticed).
 
-Observability notes: every `apply_tick` writes per-tick stats on the
+Chart UI notes: `/chart` attaches a stateless `discord.ui.View`
+(`bot/chart_view.py`) -- every button's custom_id encodes
+`cbt:{action}:{iid}:{end}:{span}` so clicks need no server-side session
+and survive nothing except the message itself. Two paths reach
+`handle_chart_component`: the live View's item callback and
+`StockBotClient.on_interaction` (discord.py fires BOTH for one click --
+the `is_done()` guard at handler entry and re-check before
+`edit_message` make the second a no-op; post-restart the View is gone
+and `on_interaction` is the only path). Window state is in open-tick
+units: `render_candle_chart(conn, iid, ticker, end=, span=)` selects the
+`span` open-phase candles ending at `end` (None = last open tick),
+bucketed `ceil(span/240)` ticks per candle in SQL (grp anchors at the
+window's right edge so the OLDEST bucket is partial). The closed tail
+appends only when `end == last_open`. `next_window` resolves
+panl/panr (half-span shifts in open candles, clamped to history
+bounds), zin/zout (span/2, span*2 clamped to [30, 6720]), home and
+s<span> presets (re-anchor to last open). Action names starting `s`
+carry the target span (`s960` = 1D at 960-tick sessions).
 `market_ticks` row itself (duration_ms, fills, crosses, stops_triggered,
 knockouts, liquidations, events_resolved) plus one structured log line
 (`tick=N phase=… crosses=… ms=…`) — tick 4532 is fully re-describable

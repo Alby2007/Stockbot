@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import math
 from typing import Any
 
 import matplotlib
@@ -27,13 +28,25 @@ _HALT_FLOW = "#ff9800"
 _HALT_MODEL = "#ef5350"
 
 
+def bucket_for_span(span: int) -> int:
+    """Ticks aggregated per rendered candle; keeps any span at <=240 bars."""
+    return max(1, math.ceil(span / 240))
+
+
 async def _select_window_rows(
-    conn: AsyncConnection, instrument_id: int, limit_ticks: int
-) -> list[Any]:
-    """Window selection for the chart: the last `limit_ticks` OPEN-phase
-    candles ending at the last open tick, plus a short tail of the current
-    closed run (so a closed market still signals CLOSED at the right edge).
-    Rows are newest-first."""
+    conn: AsyncConnection,
+    instrument_id: int,
+    end_tick: int | None,
+    span: int,
+) -> tuple[list[Any], int | None]:
+    """Window selection: the last `span` OPEN-phase ticks ending at
+    `end_tick` (None = last open tick), bucketed `bucket_for_span(span)`
+    ticks per row -- OHLCV aggregated in SQL so any span renders <=240
+    candles. A short tail of the current closed run is appended only when
+    the window ends at last_open (a panned-back view doesn't want it).
+    Returns (rows newest-first, resolved_end) -- resolved_end is the
+    clamped end the buttons encode."""
+    bucket = bucket_for_span(span)
     async with conn.cursor() as cur:
         await cur.execute(
             """
@@ -42,61 +55,107 @@ async def _select_window_rows(
                 FROM market_ticks
                 WHERE session_state = 'OPEN'
             ),
+            eff AS (
+                -- LEAST ignores NULL: end=None -> last_open; a panned end
+                -- past it clamps down. No open ticks at all -> NULL ->
+                -- empty window.
+                SELECT LEAST(%s, (SELECT t FROM last_open)) AS end_tick
+            ),
             picked AS (
-                -- Last `limit_ticks` OPEN-phase candles: flat closed-run
-                -- candles carry no information and would eat most of the
-                -- window near a reopen. Missing market_ticks rows default
-                -- to OPEN, same as the outer join.
-                (SELECT c.tick_index FROM candles c
+                -- Open-phase candles only (missing market_ticks default
+                -- OPEN); rn numbers newest-first so grp buckets anchor at
+                -- the window's right edge and the OLDEST bucket may be
+                -- partial.
+                (SELECT c.tick_index,
+                        (ROW_NUMBER() OVER (ORDER BY c.tick_index DESC) - 1)
+                            / %s AS grp
+                 FROM candles c
                  LEFT JOIN market_ticks mt ON mt.tick_index = c.tick_index
                  WHERE c.instrument_id = %s
-                   AND c.tick_index <= COALESCE(
-                       (SELECT t FROM last_open),
-                       (SELECT MAX(tick_index) FROM market_ticks))
+                   AND c.tick_index <= (SELECT end_tick FROM eff)
                    AND COALESCE(mt.session_state, 'OPEN') = 'OPEN'
-                 ORDER BY c.tick_index DESC LIMIT %s)
+                 ORDER BY c.tick_index DESC
+                 LIMIT %s)
                 UNION ALL
-                (SELECT c.tick_index FROM candles c
+                -- Closed-run tail: 1-min rows (grp offset keeps them
+                -- unaggregated and disjoint from open bucket indexes).
+                (SELECT c.tick_index, 1000000 + c.tick_index
+                 FROM candles c
                  WHERE c.instrument_id = %s
-                   AND c.tick_index > (SELECT t FROM last_open)
-                 ORDER BY c.tick_index LIMIT %s)
+                   AND (SELECT end_tick FROM eff) = (SELECT t FROM last_open)
+                   AND c.tick_index > (SELECT end_tick FROM eff)
+                 ORDER BY c.tick_index
+                 LIMIT %s)
             )
-            SELECT c.tick_index, c.open, c.high, c.low, c.close, c.volume,
-                   c.halt_kind, COALESCE(mt.session_state, 'OPEN') AS session_state
+            SELECT MAX(c.tick_index) AS tick_index,
+                   (array_agg(c.open ORDER BY c.tick_index))[1] AS open,
+                   MAX(c.high) AS high,
+                   MIN(c.low) AS low,
+                   (array_agg(c.close ORDER BY c.tick_index DESC))[1] AS close,
+                   SUM(c.volume) AS volume,
+                   MAX(c.halt_kind) AS halt_kind,
+                   -- 'OPEN' > 'CLOSED': a bucket mixing the session
+                   -- boundary renders as the open-phase candle it mostly is.
+                   MAX(COALESCE(mt.session_state, 'OPEN')) AS session_state
             FROM candles c
             JOIN picked p ON p.tick_index = c.tick_index
             LEFT JOIN market_ticks mt ON mt.tick_index = c.tick_index
             WHERE c.instrument_id = %s
-            ORDER BY c.tick_index DESC
+            GROUP BY p.grp
+            ORDER BY tick_index DESC
             """,
             (
+                end_tick,
+                bucket,
                 instrument_id,
-                limit_ticks,
+                span,
                 instrument_id,
-                max(8, limit_ticks // 10),
+                min(24, max(8, span // 40)),
                 instrument_id,
             ),
         )
-        return await cur.fetchall()
+        rows = await cur.fetchall()
+
+        await cur.execute(
+            """
+            SELECT LEAST(%s, (SELECT MAX(tick_index) FROM market_ticks
+                              WHERE session_state = 'OPEN'))
+            """,
+            (end_tick,),
+        )
+        end_row = await cur.fetchone()
+    resolved_end = end_row[0] if end_row else None
+    return rows, int(resolved_end) if resolved_end is not None else None
 
 
 async def render_candle_chart(
-    conn: AsyncConnection, instrument_id: int, ticker: str, limit_ticks: int = 240
-) -> io.BytesIO | None:
-    """Candlestick chart of the last `limit_ticks` open-phase candles.
-    Returns None if the instrument has no candle history yet.
-    """
-    rows = await _select_window_rows(conn, instrument_id, limit_ticks)
-    if not rows:
+    conn: AsyncConnection,
+    instrument_id: int,
+    ticker: str,
+    *,
+    end: int | None = None,
+    span: int = 240,
+) -> tuple[io.BytesIO, int] | None:
+    """Candlestick chart of the `span` open ticks ending at `end`.
+    Returns (png, resolved_end) -- the clamped end tick for encoding into
+    button state -- or None if the window holds no candles."""
+    rows, resolved_end = await _select_window_rows(
+        conn, instrument_id, end, span
+    )
+    if not rows or resolved_end is None:
         return None
     # The render is ~100ms+ of synchronous CPU -- run it off the event loop
     # so gateway heartbeats aren't delayed. matplotlib.figure.Figure (not
     # pyplot) keeps it off pyplot's shared global state, which isn't
     # thread-safe.
-    return await asyncio.to_thread(_render_png, rows, ticker)
+    bucket = bucket_for_span(span)
+    buf = await asyncio.to_thread(_render_png, rows, ticker, span, bucket)
+    return buf, resolved_end
 
 
-def _render_png(rows: list[Any], ticker: str) -> io.BytesIO:
+def _render_png(
+    rows: list[Any], ticker: str, span: int = 240, bucket: int = 1
+) -> io.BytesIO:
     rows = list(reversed(rows))
 
     ticks = [int(r[0]) for r in rows]
@@ -111,12 +170,12 @@ def _render_png(rows: list[Any], ticker: str) -> io.BytesIO:
     up = [c >= o for o, c in zip(opens, closes, strict=True)]
     price_hi = max(highs)
     price_lo = min(lows)
-    span = price_hi - price_lo
+    price_span = price_hi - price_lo
     # Autoscale on flat/near-flat data collapses ylim to a hair-thin
     # interval and eps-height doji bodies would fill the whole panel --
     # force the pad so the displayed range is always meaningful.
-    ypad = max(span * 0.08, price_lo * 0.002, 1e-9)
-    view = span + 2 * ypad
+    ypad = max(price_span * 0.08, price_lo * 0.002, 1e-9)
+    view = price_span + 2 * ypad
     doji_eps = view * 0.004  # minimum body height so doji stay visible
 
     fig = Figure(figsize=(10, 6), facecolor=_BG)
@@ -204,8 +263,10 @@ def _render_png(rows: list[Any], ticker: str) -> io.BytesIO:
         )
 
     closed_now = sessions[-1] == "CLOSED"
+    bucket_note = f" · {bucket}t/candle" if bucket > 1 else ""
     ax.set_title(
-        f"{ticker} — last {len(ticks)} ticks" + (" · MARKET CLOSED" if closed_now else ""),
+        f"{ticker} — {span} open ticks{bucket_note}"
+        + (" · MARKET CLOSED" if closed_now else ""),
         color=_TEXT,
         fontsize=11,
     )

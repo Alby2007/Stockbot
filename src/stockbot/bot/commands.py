@@ -33,6 +33,7 @@ from stockbot.admin.service import (
     set_config,
     tune_instrument,
 )
+from stockbot.bot.chart_view import TIMEFRAME_SPANS, build_chart_view
 from stockbot.bot.charts import render_candle_chart
 from stockbot.bot.format import format_money, format_pct, format_price
 from stockbot.claims.errors import AlreadyClaimedTodayError
@@ -256,19 +257,28 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
         await interaction.response.send_message(embed=embed)
 
-    @tree.command(name="chart", description="Show a price chart for an instrument")
+    @tree.command(name="chart", description="Show an interactive price chart")
     @app_commands.describe(
         ticker="Instrument ticker, e.g. NORT",
-        ticks="How many recent ticks to show (default 240, ~4h)",
+        timeframe="Window to show (default 4h; the buttons pan/zoom after)",
+    )
+    @app_commands.choices(
+        timeframe=[
+            app_commands.Choice(name="1 hour", value="1h"),
+            app_commands.Choice(name="4 hours", value="4h"),
+            app_commands.Choice(name="1 day", value="1d"),
+            app_commands.Choice(name="1 week", value="1w"),
+        ]
     )
     async def chart(
         interaction: discord.Interaction,
         ticker: str,
-        ticks: app_commands.Range[int, 10, 1440] = 240,
+        timeframe: str = "4h",
     ) -> None:
         # Defer up front: the render is slow enough to risk blowing the 3s
         # response window on a cold pool.
         await interaction.response.defer()
+        span = TIMEFRAME_SPANS.get(timeframe, 240)
         async with db.connection() as conn:
             snapshot = await get_instrument_snapshot(conn, ticker)
             if snapshot is None:
@@ -276,17 +286,27 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     f"No instrument found for `{ticker.upper()}`.", ephemeral=True
                 )
                 return
-            buf = await render_candle_chart(conn, snapshot.id, snapshot.ticker, ticks)
+            result = await render_candle_chart(
+                conn, snapshot.id, snapshot.ticker, span=span
+            )
 
-        if buf is None:
+        if result is None:
             await interaction.followup.send("No price history yet.", ephemeral=True)
             return
+        buf, end = result
 
         filename = f"{snapshot.ticker}.png"
         file = discord.File(buf, filename=filename)
         embed = discord.Embed(title=f"{snapshot.ticker} \u2014 {snapshot.name}")
         embed.set_image(url=f"attachment://{filename}")
-        await interaction.followup.send(embed=embed, file=file)
+        embed.set_footer(
+            text=f"{span} open ticks ending {end} · pan/zoom buttons below"
+        )
+        await interaction.followup.send(
+            embed=embed,
+            file=file,
+            view=build_chart_view(snapshot.id, end, span),
+        )
 
     @tree.command(name="movers", description="Show today's biggest gainers and losers")
     async def movers(interaction: discord.Interaction) -> None:
