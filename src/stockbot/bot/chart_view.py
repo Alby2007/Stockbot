@@ -15,6 +15,7 @@ presets: set span, re-anchor).
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import discord
@@ -22,6 +23,8 @@ from psycopg import AsyncConnection
 
 from stockbot import db
 from stockbot.bot.charts import bucket_for_span, render_candle_chart
+
+log = logging.getLogger("stockbot.bot.chart_view")
 
 CHART_CID_PREFIX = "cbt:"
 
@@ -182,8 +185,15 @@ async def handle_chart_component(interaction: discord.Interaction) -> None:
     # the in-flight set claims the interaction id atomically; the loser
     # of the race returns here as a no-op.
     if interaction.response.is_done() or interaction.id in _INFLIGHT:
+        log.info(
+            "chart component skipped iid=%s done=%s inflight=%s",
+            interaction.id,
+            interaction.response.is_done(),
+            interaction.id in _INFLIGHT,
+        )
         return
     _INFLIGHT.add(interaction.id)
+    log.info("chart component handling iid=%s", interaction.id)
     try:
         await _handle(interaction)
     finally:
@@ -204,7 +214,12 @@ async def _handle(interaction: discord.Interaction) -> None:
     # the type-7 edit_message interaction callback (Discord rejects it --
     # observed as 10062 Unknown interaction); the PNG goes up on the
     # follow-up message PATCH, which supports uploads.
-    await interaction.response.defer()
+    try:
+        await interaction.response.defer()
+    except Exception:
+        log.exception("chart component defer failed iid=%s", interaction.id)
+        raise
+    log.info("chart component deferred iid=%s", interaction.id)
 
     async with db.connection() as conn:
         async with conn.cursor() as cur:
@@ -242,9 +257,14 @@ async def _handle(interaction: discord.Interaction) -> None:
     view = build_chart_view(iid, resolved_end, new_span)
     file = discord.File(buf, filename=filename)
     msg = interaction.message
-    if msg is not None:
-        await msg.edit(embed=embed, attachments=[file], view=view)
-    else:
-        await interaction.edit_original_response(
-            embed=embed, attachments=[file], view=view
-        )
+    try:
+        if msg is not None:
+            await msg.edit(embed=embed, attachments=[file], view=view)
+        else:
+            await interaction.edit_original_response(
+                embed=embed, attachments=[file], view=view
+            )
+    except Exception:
+        log.exception("chart component message edit failed iid=%s", interaction.id)
+        raise
+    log.info("chart component edited iid=%s span=%s end=%s", interaction.id, new_span, resolved_end)
