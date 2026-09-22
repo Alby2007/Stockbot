@@ -258,6 +258,16 @@ async def test_stop_cascade_is_bounded(conn: AsyncConnection) -> None:
         await cur.execute(
             "UPDATE config SET value = 1 WHERE key = 'order.stop_cascade_max_iters'"
         )
+        # The participation cap binds on effective liquidity now -- pin adv
+        # at the reference ratio (adv_mult = 1) so the full-cap sizing below
+        # still fits in one fill.
+        await cur.execute(
+            "UPDATE instruments SET adv = liquidity * 2.5e-8 "
+            "WHERE ticker = ("
+            "    SELECT ticker FROM instruments "
+            "    WHERE is_active AND kind != 'INDEX' "
+            "    ORDER BY liquidity ASC, ticker LIMIT 1)"
+        )
         await cur.execute(
             "SELECT liquidity, lambda_impact FROM instruments "
             "WHERE is_active AND kind != 'INDEX' "

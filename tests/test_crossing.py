@@ -322,11 +322,15 @@ async def test_cross_moves_cash_and_fees_without_market_maker(
 
     notional = _minor(cross * 2)
     fee = _minor(cross * 2 * Decimal("0.001"))
+    # Plan E: the maker pays no fee and collects fee.maker_rebate_bps
+    # (2bps) of the notional, funded from the taker's fee -- SINK keeps
+    # the remainder.
+    rebate = _minor(cross * 2 * Decimal("0.0002"))
     assert await get_balance(conn, mm_id) == mm_before
-    # Buyer paid notional + fee; seller received notional - fee.
+    # Buyer paid notional + fee; seller received notional + rebate.
     assert await get_balance(conn, buyer_account) == buyer_before - notional - fee
-    assert await get_balance(conn, seller_account) == seller_before + notional - fee
-    assert await get_balance(conn, sink_id) == sink_before + 2 * fee
+    assert await get_balance(conn, seller_account) == seller_before + notional + rebate
+    assert await get_balance(conn, sink_id) == sink_before + fee - rebate
 
     async with conn.cursor() as cur:
         await cur.execute("SELECT COALESCE(SUM(amount), 0) FROM ledger_entries")
@@ -430,3 +434,35 @@ async def test_cross_collar_anchors_to_tick_open_mark(conn: AsyncConnection) -> 
     new_mark = await _quoted(conn, ticker)
     assert new_mark < mark * Decimal("1.035")
     assert (await _order_row(conn, ask2.order_id))["status"] == "OPEN"
+
+
+async def test_inactive_instrument_orders_neither_cross_nor_fill(
+    conn: AsyncConnection,
+) -> None:
+    """A manually deactivated instrument keeps no live book: its resting
+    orders are invisible to pass 1 (no cross) and pass 2 (no MM fill)."""
+    await bootstrap_user(conn, 4050)
+    await bootstrap_user(conn, 4051)
+    ticker = await _liquid_ticker(conn)
+    mark = await _give_shares(conn, 4050, ticker, 2)
+    await _fund(conn, 4051, 10_000_000)
+    cross = _grid(mark * Decimal("1.01"))
+    ask = await place_order(
+        conn, user_id=4050, ticker=ticker, side="SELL", quantity=2,
+        limit_price=cross,
+    )
+    bid = await place_order(
+        conn, user_id=4051, ticker=ticker, side="BUY", quantity=2,
+        limit_price=cross,
+    )
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE instruments SET is_active = FALSE WHERE ticker = %s",
+            (ticker,),
+        )
+
+    fills = await match_orders(conn, 1)
+
+    assert fills == 0
+    for order_id in (ask.order_id, bid.order_id):
+        assert (await _order_row(conn, order_id))["status"] == "OPEN"

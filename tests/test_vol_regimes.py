@@ -84,11 +84,26 @@ async def _halted_until(conn: AsyncConnection, instrument_id: int) -> int | None
 
 async def _cap_size_qty(conn: AsyncConnection, inst: dict) -> int:
     """Largest per-fill quantity that stays under the participation cap,
-    with headroom for the whale's own impact raising the fill price."""
-    from stockbot.market.data import participation_cap
+    with headroom for the whale's own impact raising the fill price.
+    The cap binds on EFFECTIVE liquidity (Plan A) -- the whale's flow
+    raises vol_state and thins the book mid-loop -- so this re-reads the
+    live adv/vol_state/mark each call. Sizing as a fraction of liq_eff
+    keeps the per-fill impact ~constant under the sqrt law, which is what
+    the F5 assertions depend on."""
+    from stockbot.market.data import flow_config, participation_cap
 
     cap = await participation_cap(conn)
-    return max(1, int(cap * inst["liquidity"] / inst["quoted"] * 0.60))
+    cfg = await flow_config(conn)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT quoted_price, adv, vol_state FROM instruments WHERE id = %s",
+            (inst["id"],),
+        )
+        quoted, adv, vol_state = await cur.fetchone()
+    liq_eff = engine.effective_liquidity(
+        inst["liquidity"], float(adv), cfg, float(vol_state)
+    )
+    return max(1, int(cap * liq_eff / float(quoted) * 0.60))
 
 
 # --- pure-math pieces -------------------------------------------------------
@@ -301,11 +316,11 @@ async def test_lone_whale_cannot_trip_breaker(conn, monkeypatch) -> None:
     await _set_config(conn, "vol.flow_ret_cap", 0.05)
     inst = await _first_stock(conn)
     await _fund(conn, 9101, 10_000_000_000_00)  # $10B
-    qty = await _cap_size_qty(conn, inst)
 
     await apply_tick(conn, _SEED)  # establish tick-0 candles
     for _ in range(4):
         for _ in range(10):
+            qty = await _cap_size_qty(conn, inst)
             await execute_trade(
                 conn, user_id=9101, ticker=inst["ticker"], side="BUY", quantity=qty
             )
@@ -331,7 +346,6 @@ async def test_crowd_flow_trips_short_halt_not_full_halt(conn, monkeypatch) -> N
     await _set_config(conn, "vol.flow_ret_cap", 0.08)
     await _set_config(conn, "vol.flow_halt_ticks", 2)
     inst = await _first_stock(conn)
-    qty = await _cap_size_qty(conn, inst)
 
     await apply_tick(conn, _SEED)
     users = [9200 + i for i in range(6)]
@@ -340,6 +354,7 @@ async def test_crowd_flow_trips_short_halt_not_full_halt(conn, monkeypatch) -> N
         # ~8 cap-sized buys per user -> raw ~2.4%, clipped at the 2% cap;
         # 6 users -> bounded total min(6*0.02, 0.08) = 0.08 > 0.03 cap.
         for _ in range(8):
+            qty = await _cap_size_qty(conn, inst)
             await execute_trade(
                 conn, user_id=uid, ticker=inst["ticker"], side="BUY", quantity=qty
             )

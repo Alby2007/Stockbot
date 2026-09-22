@@ -33,6 +33,7 @@ class InstrumentSnapshot:
     day_volume: int = 0
     bid: Decimal | None = None
     ask: Decimal | None = None
+    event_halted: bool = False  # T1 halt into a pending earnings print
 
     @property
     def day_change_pct(self) -> float | None:
@@ -61,7 +62,11 @@ async def _fetch_snapshots(
     """
     current_tick = await current_tick_index(conn)
     day_ago_tick = max((current_tick or 0) - TICKS_PER_DAY, 0)
-    spread_cfg = {**await spread_config(conn), **await session_config(conn)}
+    spread_cfg = {
+        **await spread_config(conn),
+        **await session_config(conn),
+        **await flow_config(conn),
+    }
 
     async with conn.cursor() as cur:
         await cur.execute(
@@ -70,7 +75,8 @@ async def _fetch_snapshots(
                    i.circuit_halted_until_tick, c.close, i.short_interest_pct,
                    COALESCE(v.volume, 0),
                    COALESCE(i.sigma_eff, i.sigma) AS sigma, i.liquidity,
-                   i.next_event_tick, i.last_halt_end_tick
+                   i.next_event_tick, i.last_halt_end_tick, i.flow_skew,
+                   i.next_halting_event_tick
             FROM instruments i
             JOIN sectors s ON s.id = i.sector_id
             LEFT JOIN LATERAL (
@@ -90,6 +96,7 @@ async def _fetch_snapshots(
         )
         rows = await cur.fetchall()
 
+    halt_lead = await event_halt_lead_ticks(conn)
     snapshots: list[InstrumentSnapshot] = []
     for r in rows:
         # Bid/ask on the tick grid, outward-rounded so the display is the
@@ -102,8 +109,11 @@ async def _fetch_snapshots(
             "last_halt_end_tick": r[14],
         }
         half = half_spread_for(row, current_tick, spread_cfg)
+        skew = float(r[15] or 0.0)
+        half_bid = half * engine.flow_skew_mult(-mark, skew, spread_cfg)
+        half_ask = half * engine.flow_skew_mult(mark, skew, spread_cfg)
         tick = engine.tick_size(mark, spread_cfg)
-        bid_f, ask_f = engine.quote_ticks(mark, half, tick)
+        bid_f, ask_f = engine.quote_ticks_skewed(mark, half_bid, half_ask, tick)
         snapshots.append(
             InstrumentSnapshot(
                 id=r[0],
@@ -119,6 +129,7 @@ async def _fetch_snapshots(
                 day_volume=int(r[10]),
                 bid=Decimal(str(round(bid_f, 6))),
                 ask=Decimal(str(round(ask_f, 6))),
+                event_halted=event_halted(r[16], current_tick, halt_lead),
             )
         )
     return snapshots
@@ -147,6 +158,25 @@ async def participation_cap(conn: AsyncConnection) -> float:
 async def trade_through_epsilon(conn: AsyncConnection) -> float:
     """Fraction by which the mark must cross a resting limit for an MM fill."""
     return await _config_float(conn, "cross.trade_through_epsilon", 0.0005)
+
+
+async def event_halt_lead_ticks(conn: AsyncConnection) -> int:
+    """Plan C T1 halt lead: ticks before an EARNINGS resolution during
+    which new exposure on the instrument is suspended. 0 disables."""
+    return int(await _config_float(conn, "event.halt_lead_ticks", 10))
+
+
+def event_halted(
+    next_halting_event_tick: int | None,
+    current_tick: int | None,
+    lead_ticks: int,
+) -> bool:
+    """True while inside the T1-halt window [resolve - lead, resolve).
+    The gate reopens automatically: once the event resolves, the
+    aggregate recomputes to the next earnings ~30 days out."""
+    if next_halting_event_tick is None or current_tick is None or lead_ticks <= 0:
+        return False
+    return int(current_tick) >= int(next_halting_event_tick) - lead_ticks
 
 
 async def vol_config(conn: AsyncConnection) -> dict[str, float]:
@@ -219,6 +249,14 @@ async def mom_config(conn: AsyncConnection) -> dict[str, float]:
     fraction, drift-state clip), read fresh like `spread_config`."""
     async with conn.cursor() as cur:
         await cur.execute("SELECT key, value FROM config WHERE key LIKE 'mom.%'")
+        return {str(k): float(v) for k, v in await cur.fetchall()}
+
+
+async def fee_config(conn: AsyncConnection) -> dict[str, float]:
+    """The `fee.*` config namespace (maker rebate bps, volume-tier
+    thresholds and rates), read fresh like `spread_config`."""
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT key, value FROM config WHERE key LIKE 'fee.%'")
         return {str(k): float(v) for k, v in await cur.fetchall()}
 
 
@@ -352,6 +390,7 @@ async def get_instrument_snapshot(conn: AsyncConnection, ticker: str) -> Instrum
 class DepthLevel:
     price: Decimal
     quantity: int
+    cumulative: int  # running total of displayed size from the inside out
     synthetic: bool  # True = MM padding, False = real resting orders
 
 
@@ -379,7 +418,7 @@ async def book_depth(
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT quoted_price, liquidity,
+            SELECT quoted_price, liquidity, adv, vol_state, flow_skew,
                    COALESCE(sigma_eff, sigma) AS sigma,
                    next_event_tick, last_halt_end_tick
             FROM instruments WHERE id = %s
@@ -392,14 +431,23 @@ async def book_depth(
         mark = float(inst["quoted_price"])
         tick = engine.tick_size(mark, cfg)
         half = half_spread_for(inst, current_tick, cfg)
-        bid0, ask0 = engine.quote_ticks(mark, half, tick)
-        cap_notional = (await participation_cap(conn)) * float(inst["liquidity"])
+        skew = float(inst["flow_skew"] or 0.0)
+        half_bid = half * engine.flow_skew_mult(-mark, skew, cfg)
+        half_ask = half * engine.flow_skew_mult(mark, skew, cfg)
+        bid0, ask0 = engine.quote_ticks_skewed(mark, half_bid, half_ask, tick)
+        cap_notional = (await participation_cap(conn)) * engine.effective_liquidity(
+            float(inst["liquidity"]),
+            float(inst["adv"]),
+            cfg,
+            float(inst["vol_state"] or 1.0),
+        )
         mm_qty = max(1, int(cap_notional / mark / levels)) if mark > 0 else 0
 
         await cur.execute(
             """
             SELECT side, limit_price,
-                   SUM(quantity - filled_quantity) AS qty
+                   SUM(LEAST(COALESCE(display_qty, quantity - filled_quantity),
+                             quantity - filled_quantity)) AS qty
             FROM orders
             WHERE instrument_id = %s AND status = 'OPEN'
               AND limit_price IS NOT NULL AND season_id IS NULL
@@ -422,7 +470,14 @@ async def book_depth(
     def _pad(
         real: list[tuple[Decimal, int]], start: float, step: float
     ) -> list[DepthLevel]:
-        out = [DepthLevel(price=p, quantity=q, synthetic=False) for p, q in real[:levels]]
+        # `qty` for real levels is the DISPLAYED size: iceberg orders only
+        # show `display_qty` (refilling as fills drain it) while the
+        # matcher works the real remaining quantity.
+        out: list[DepthLevel] = []
+        cum = 0
+        for p, q in real[:levels]:
+            cum += q
+            out.append(DepthLevel(price=p, quantity=q, cumulative=cum, synthetic=False))
         edges = [start] + [float(p) for p, _ in real[:levels]]
         edge = min(edges) if step < 0 else max(edges)
         price = edge
@@ -430,10 +485,12 @@ async def book_depth(
             price += step
             if price <= 0:
                 break
+            cum += mm_qty
             out.append(
                 DepthLevel(
                     price=Decimal(str(engine.round_to_tick(price, tick))),
                     quantity=mm_qty,
+                    cumulative=cum,
                     synthetic=True,
                 )
             )

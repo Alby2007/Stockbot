@@ -16,6 +16,7 @@ Exit code 0 = all checks pass, 1 = at least one finding.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,7 +27,10 @@ import psycopg
 from stockbot.admin.service import CONFIG_BOUNDS
 from stockbot.config import get_settings
 
-MIGRATIONS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "migrations"
+MIGRATIONS_DIR = Path(
+    os.environ.get("MIGRATIONS_DIR")
+    or Path(__file__).resolve().parent.parent.parent.parent / "migrations"
+)
 
 # Indexes the hot paths actually depend on -- a missing one is a
 # silent performance regression, not a crash, so it needs a check.
@@ -57,6 +61,11 @@ def _check_pending_migrations(cur: psycopg.Cursor) -> Finding:
     )
     cur.execute("SELECT name FROM schema_migrations")
     applied = {row[0] for row in cur.fetchall()}
+    if not MIGRATIONS_DIR.is_dir():
+        return Finding(
+            "migrations", False,
+            f"migrations dir missing: {MIGRATIONS_DIR} (set MIGRATIONS_DIR)",
+        )
     files = {p.name for p in MIGRATIONS_DIR.glob("*.sql")}
     pending = sorted(files - applied)
     recorded_missing = sorted(applied - files)

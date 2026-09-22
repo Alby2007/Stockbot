@@ -1,3 +1,6 @@
+from decimal import Decimal
+
+
 class TradingError(Exception):
     """Base class for trading errors."""
 
@@ -27,6 +30,27 @@ class InsufficientDepthError(TradingError):
             f"(~${notional_minor / 100:,.2f} notional vs a "
             f"~${cap_minor / 100:,.2f} depth cap) -- split it into smaller "
             "trades or rest a limit order"
+        )
+
+
+class SlippageExceededError(TradingError):
+    """The computed fill deviates from the mark by more than the caller's
+    `slippage` bound (a fraction, e.g. 0.025 = 2.5%). Measured against the
+    mark at fill time -- the bound is vs. the mark, not the quote shown
+    when the command was submitted. Carries the would-be fill so the
+    error path can tell the user what they dodged."""
+
+    def __init__(self, ticker: str, fill_price: Decimal, mark: float, bound: Decimal):
+        self.ticker = ticker
+        self.fill_price = fill_price
+        self.mark = mark
+        self.bound = bound
+        deviation = abs(float(fill_price) / mark - 1)
+        super().__init__(
+            f"fill for {ticker} would land at ${float(fill_price):,.2f} vs "
+            f"mark ${mark:,.2f} -- {deviation * 100:.2f}% slippage exceeds "
+            f"your {float(bound) * 100:.2f}% cap. Retry with a higher "
+            "slippage or a smaller size."
         )
 
 
@@ -66,6 +90,24 @@ class MarketClosedError(TradingError):
         self.ticks_until_open = ticks_until_open
         super().__init__(
             f"the market is closed -- it reopens in ~{ticks_until_open} min"
+        )
+
+
+class EventHaltedError(TradingError):
+    """T1-style halt: a scheduled EARNINGS event resolves within
+    `event.halt_lead_ticks`, so new exposure on the instrument is
+    suspended until the print lands. Risk-reducing trades still fill --
+    same rule as circuit-breaker halts. Transient: the gate reopens the
+    tick the event resolves (the aggregate recomputes to the next
+    earnings ~30 days out)."""
+
+    def __init__(self, ticker: str, resolve_tick: int):
+        self.ticker = ticker
+        self.resolve_tick = resolve_tick
+        super().__init__(
+            f"{ticker} is halted pending an earnings release "
+            f"(resolves ~tick {resolve_tick}) -- closing existing "
+            "positions is still allowed"
         )
 
 

@@ -330,3 +330,82 @@ async def test_deterministic_fill_failures_auto_cancel(conn: AsyncConnection) ->
 
     await match_orders(conn, 999999)
     assert await _order_status(conn, order.order_id) == "CANCELLED"
+
+
+async def test_iceberg_shows_display_qty_but_fills_full_size(
+    conn: AsyncConnection,
+) -> None:
+    """B2: `display_qty` caps what the /stock depth ladder shows -- the
+    matcher still works the real remaining quantity, so a cross can fill
+    the whole hidden size in one tick."""
+    from stockbot.market.data import book_depth
+
+    await bootstrap_user(conn, 3020)
+    buyer_account = await get_user_account_id(conn, 3020)
+    await post_transfer(
+        conn,
+        from_account_id=await get_system_account_id(conn, "FAUCET"),
+        to_account_id=buyer_account,
+        amount=10_000_000,
+        reason="TEST_TOPUP",
+    )
+    await bootstrap_user(conn, 3021)
+    seller_account = await get_user_account_id(conn, 3021)
+    await post_transfer(
+        conn,
+        from_account_id=await get_system_account_id(conn, "FAUCET"),
+        to_account_id=seller_account,
+        amount=10_000_000,
+        reason="TEST_TOPUP",
+    )
+    ticker = await _first_ticker(conn)
+    mark = await _quoted(conn, ticker)
+
+    # Seller needs inventory to sell 200 shares.
+    await execute_trade(conn, user_id=3021, ticker=ticker, side="BUY", quantity=200)
+    # Refresh the mark after the buy moved it, then rest the iceberg ask
+    # just above it and a crossing bid at the same price.
+    mark = await _quoted(conn, ticker)
+    ask = await place_order(
+        conn, user_id=3021, ticker=ticker, side="SELL", quantity=200,
+        limit_price=mark * Decimal("1.02"), display_qty=25,
+    )
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT id FROM instruments WHERE ticker = %s", (ticker,)
+        )
+        (instrument_id,) = await cur.fetchone()
+    bids, asks = await book_depth(conn, instrument_id)
+    visible = next(
+        (lv for lv in asks if not lv.synthetic and lv.price == ask.limit_price),
+        None,
+    )
+    assert visible is not None
+    assert visible.quantity == 25  # the displayed slice, not 200
+    assert visible.cumulative >= 25
+
+    bid = await place_order(
+        conn, user_id=3020, ticker=ticker, side="BUY", quantity=200,
+        limit_price=mark * Decimal("1.02"),
+    )
+    await match_orders(conn, 999999)
+    assert await _order_status(conn, ask.order_id) == "FILLED"
+    assert await _order_status(conn, bid.order_id) == "FILLED"
+    assert await _position_qty(conn, 3020, ticker) == 200
+
+
+async def test_place_order_rejects_bad_display_qty(conn: AsyncConnection) -> None:
+    await bootstrap_user(conn, 3022)
+    ticker = await _first_ticker(conn)
+    mark = await _quoted(conn, ticker)
+    with pytest.raises(ValueError):
+        await place_order(
+            conn, user_id=3022, ticker=ticker, side="BUY", quantity=10,
+            limit_price=mark, display_qty=11,
+        )
+    with pytest.raises(ValueError):
+        await place_order(
+            conn, user_id=3022, ticker=ticker, side="BUY", quantity=10,
+            limit_price=mark, display_qty=0,
+        )

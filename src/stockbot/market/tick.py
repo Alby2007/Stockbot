@@ -136,7 +136,8 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                        i.kappa, i.fundamental_sigma, i.tau_ticks, i.base_price,
                        i.fundamental_value, i.impact, i.circuit_halted_until_tick,
                        i.float_shares, i.index_divisor, i.dividend_drift_offset,
-                       i.vol_state, i.sigma_eff, i.drift_state
+                       i.index_member,
+                       i.vol_state, i.sigma_eff, i.drift_state, i.flow_skew
                 FROM instruments i
                 JOIN sectors s ON s.id = i.sector_id
                 WHERE i.is_active
@@ -328,7 +329,10 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                 sum(
                     float(r["float_shares"]) * quoted_by_id[r["id"]]
                     for r in instrument_rows
-                    if r["kind"] != "INDEX"
+                    # index_member is the fixed v1 basket (0031): listings
+                    # never join it, and a delisted member is divisor-
+                    # adjusted out by admin.delist_instrument.
+                    if r["kind"] != "INDEX" and r["index_member"]
                 )
                 / divisor
             )
@@ -364,12 +368,14 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         flow_halt = int(vol_cfg.get("vol.flow_halt_ticks", 2))
         perm_frac = float(flow_cfg.get("flow.permanent_frac", 0.10))
         perm_cap = float(flow_cfg.get("flow.max_fundamental_move", 0.005))
+        skew_decay = float(flow_cfg.get("flow.skew_decay", 0.9))
         sqrt_dt = math.sqrt(gap_dt)
         rows_by_id = {int(r["id"]): r for r in instrument_rows}
         vol_new: dict[int, float] = {}
         sigma_eff_new: dict[int, float] = {}
         flow_ret: dict[int, float] = {}
         model_ret: dict[int, float] = {}
+        skew_new: dict[int, float] = {}
         flow_breached: set[int] = set()
         for res_idx, result in enumerate(results):
             row = rows_by_id[result.id]
@@ -442,6 +448,13 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                 v_mkt, v_i, mkt_w, clip_lo, clip_hi
             )
             flow_ret[result.id] = bounded_flow
+            # Plan A: decaying EWMA of bounded OWN flow -- the adverse-
+            # selection signal fill paths use to skew the half-spread.
+            # Own flow only (cross-impact is peer sympathy, not this name's
+            # tape); decays toward 0 when the tape goes quiet.
+            skew_new[result.id] = skew_decay * float(
+                row["flow_skew"] or 0.0
+            ) + (1.0 - skew_decay) * own_flow
 
         # Single-statement writes: executemany still round-trips per row,
         # which dominates tick latency (~100ms -> ~15ms measured on a local
@@ -451,7 +464,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             if results:
                 update_rows = sql.SQL(", ").join(
                     sql.SQL("({})").format(
-                        sql.SQL(", ").join(sql.Placeholder() for _ in range(10))
+                        sql.SQL(", ").join(sql.Placeholder() for _ in range(11))
                     )
                     for _ in results
                 )
@@ -468,11 +481,12 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                                 v.new_halt_end::bigint, i.last_halt_end_tick),
                             vol_state = v.vol_state::numeric,
                             sigma_eff = v.sigma_eff::numeric,
-                            drift_state = v.drift_state::numeric
+                            drift_state = v.drift_state::numeric,
+                            flow_skew = v.flow_skew::numeric
                         FROM (VALUES {}) AS v(
                             base_price, fundamental_value, impact, quoted_price,
                             circuit_halted_until_tick, new_halt_end,
-                            vol_state, sigma_eff, drift_state, id
+                            vol_state, sigma_eff, drift_state, flow_skew, id
                         )
                         WHERE i.id = v.id::int
                         """
@@ -495,6 +509,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                             vol_new[result.id],
                             sigma_eff_new[result.id],
                             result.drift_state,
+                            skew_new[result.id],
                             result.id,
                         )
                     ],
@@ -558,8 +573,21 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # Before the margin sweep so a fill's impact and equity change land
         # in this tick's margin state, not next tick's. Skipped entirely when
         # the orders.enabled kill switch is off -- resting orders wait.
+        # On the session's last `session.auction_ticks` open ticks the
+        # continuous book clears at a uniform price (Plan C closing
+        # auction); the MM fallback is skipped -- the print is the auction.
         if await data.feature_enabled_flag(conn, "orders.enabled"):
-            await orders.match_orders(conn, tick_index, stats=stats)
+            auction_window = int(session_cfg.get("session.auction_ticks", 30))
+            closing_auction = (
+                auction_window > 0
+                and engine.ticks_until_close(
+                    tick_index, open_ticks, closed_ticks, offset
+                )
+                <= auction_window
+            )
+            await orders.match_orders(
+                conn, tick_index, stats=stats, closing_auction=closing_auction
+            )
 
         # Phase 2 margin maintenance, all inside the tick transaction where
         # every instrument is already locked: refresh published short
@@ -605,7 +633,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                 UPDATE market_ticks SET
                     duration_ms = %s, fills = %s, crosses = %s,
                     stops_triggered = %s, knockouts = %s, liquidations = %s,
-                    events_resolved = %s
+                    events_resolved = %s, auction_fills = %s
                 WHERE tick_index = %s
                 """,
                 (
@@ -616,6 +644,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                     kos,
                     liqs,
                     stats.get("events_resolved", 0),
+                    stats.get("auction_fills", 0),
                     tick_index,
                 ),
             )
@@ -625,7 +654,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
 
     log.info(
         "tick=%d phase=OPEN steps=%d events=%d crosses=%d mm_fills=%d "
-        "stops=%d kos=%d liqs=%d ms=%.1f",
+        "stops=%d kos=%d liqs=%d auction=%d ms=%.1f",
         tick_index,
         len(results),
         stats.get("events_resolved", 0),
@@ -634,6 +663,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         stats.get("stops_triggered", 0),
         kos,
         liqs,
+        stats.get("auction_fills", 0),
         duration_ms,
     )
     await _post_tick(conn, tick_index)

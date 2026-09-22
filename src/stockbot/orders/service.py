@@ -39,6 +39,8 @@ from stockbot.market import engine
 from stockbot.market.data import (
     assert_feature_enabled,
     assert_market_open,
+    event_halt_lead_ticks,
+    event_halted,
     flow_config,
     half_spread_for,
     participation_cap,
@@ -47,6 +49,7 @@ from stockbot.market.data import (
     spread_config,
 )
 from stockbot.trading.errors import (
+    EventHaltedError,
     FeatureDisabledError,
     MarketClosedError,
     NotInLeagueError,
@@ -83,6 +86,7 @@ class OrderResult:
     expires_tick: int | None
     order_type: OrderType = "LIMIT"
     stop_price: Decimal | None = None
+    display_qty: int | None = None
 
 
 async def _current_tick(conn: AsyncConnection) -> int | None:
@@ -104,12 +108,16 @@ async def place_order(
     expires_in_ticks: int | None = None,
     interaction_id: str | None = None,
     stop_price: Decimal | None = None,
+    display_qty: int | None = None,
 ) -> OrderResult:
     """Validate and rest an order. Marketability/margin are re-checked at
     fill time; placement only rejects structurally bad orders.
 
     limit only -> LIMIT; stop only -> STOP (triggers to a marketable
     order); both -> STOP_LIMIT (triggers to a limit order at limit_price).
+    `display_qty` caps the size shown in the /stock depth ladder (an
+    iceberg): the matcher still works the real remaining quantity, and
+    the visible slice refills until the order drains.
     """
     if quantity <= 0:
         raise ValueError("quantity must be positive")
@@ -117,6 +125,8 @@ async def place_order(
         raise ValueError("limit price must be positive")
     if stop_price is not None and stop_price <= 0:
         raise ValueError("stop price must be positive")
+    if display_qty is not None and not 0 < display_qty <= quantity:
+        raise ValueError("display quantity must be between 1 and the order quantity")
     order_type: OrderType
     if stop_price is None:
         if limit_price is None:
@@ -132,13 +142,15 @@ async def place_order(
         await assert_feature_enabled(conn, "orders.enabled", "order placement")
         await assert_market_open(conn)
         await cur.execute(
-            "SELECT id, is_active, quoted_price FROM instruments WHERE ticker = %s",
+            "SELECT id, is_active, quoted_price, next_halting_event_tick "
+            "FROM instruments WHERE ticker = %s",
             (ticker,),
         )
         row = await cur.fetchone()
         if row is None or not row[1]:
             raise UnknownInstrumentError(ticker)
         instrument_id = int(row[0])
+        next_halt_tick = row[3]
 
         # Tick-size rounding (G3): resting prices snap to the same grid
         # fills print on, so a displayed quote is always attainable.
@@ -168,6 +180,13 @@ async def place_order(
             if await cur.fetchone() is None:
                 raise NotInLeagueError(user_id, season_id)
         tick = await _current_tick(conn)
+        # T1 halt: no new resting orders inside the lead window before a
+        # scheduled earnings print -- consistent with closed-market
+        # placement being blocked. Existing orders keep resting.
+        if event_halted(
+            next_halt_tick, tick, await event_halt_lead_ticks(conn)
+        ):
+            raise EventHaltedError(ticker, int(next_halt_tick))
         expires_tick = (
             None if expires_in_ticks is None else (tick or 0) + expires_in_ticks
         )
@@ -175,8 +194,9 @@ async def place_order(
             """
             INSERT INTO orders
                 (user_id, instrument_id, season_id, side, quantity,
-                 limit_price, opened_tick, expires_tick, order_type, stop_price)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 limit_price, opened_tick, expires_tick, order_type, stop_price,
+                 display_qty)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -190,6 +210,7 @@ async def place_order(
                 expires_tick,
                 order_type,
                 stop_price,
+                display_qty,
             ),
         )
         order_row = await cur.fetchone()
@@ -205,6 +226,7 @@ async def place_order(
         expires_tick=expires_tick,
         order_type=order_type,
         stop_price=stop_price,
+        display_qty=display_qty,
     )
 
 
@@ -229,7 +251,7 @@ async def list_open_orders(
             """
             SELECT o.id, i.ticker, o.side, o.quantity, o.filled_quantity,
                    o.limit_price, o.order_type, o.stop_price, o.triggered_tick,
-                   i.quoted_price, o.expires_tick, o.created_at
+                   o.display_qty, i.quoted_price, o.expires_tick, o.created_at
             FROM orders o
             JOIN instruments i ON i.id = o.instrument_id
             WHERE o.user_id = %s AND o.status = 'OPEN'
@@ -474,6 +496,7 @@ async def match_orders(
     conn: AsyncConnection,
     tick_index: int,
     stats: dict[str, int] | None = None,
+    closing_auction: bool = False,
 ) -> int:
     """Match the book (crosses, then MM fills) for this tick.
 
@@ -491,11 +514,16 @@ async def match_orders(
     order.stop_cascade_max_iters, and `depth_used` enforces the per-tick
     participation budget across iterations so a cascade can't drain more
     depth than one tick allows.
+
+    `closing_auction` (Plan C) is set on the session's last open tick:
+    pass 1 becomes a single-price clearing auction per book and the MM
+    fallback is skipped -- the close print IS the auction.
     """
     if stats is not None:
         stats.setdefault("crosses", 0)
         stats.setdefault("mm_fills", 0)
         stats.setdefault("stops_triggered", 0)
+        stats.setdefault("auction_fills", 0)
     async with conn.cursor() as cur:
         await cur.execute(
             """
@@ -510,7 +538,7 @@ async def match_orders(
             "SELECT key, value FROM config WHERE key IN "
             "('cross.collar_pct', 'cross.trade_through_epsilon', "
             " 'order.stop_cascade_max_iters', 'order.max_fill_failures', "
-            " 'vol.flow_halt_ticks')"
+            " 'vol.flow_halt_ticks', 'event.halt_lead_ticks')"
         )
         cfg_rows = {str(r["key"]): float(r["value"]) for r in await cur.fetchall()}
     collar = Decimal(str(cfg_rows.get("cross.collar_pct", 0.02)))
@@ -518,6 +546,7 @@ async def match_orders(
     cascade_max = int(cfg_rows.get("order.stop_cascade_max_iters", 8))
     max_fill_failures = int(cfg_rows.get("order.max_fill_failures", 5))
     flow_halt_ticks = int(cfg_rows.get("vol.flow_halt_ticks", 2))
+    event_halt_lead = int(cfg_rows.get("event.halt_lead_ticks", 10))
 
     # Per-order, not per-instrument: the participation budget is keyed by
     # order id, so N resting orders on one instrument get N*cap notional
@@ -543,12 +572,170 @@ async def match_orders(
             open_marks=open_marks,
             max_fill_failures=max_fill_failures,
             flow_halt_ticks=flow_halt_ticks,
+            event_halt_lead=event_halt_lead,
+            closing_auction=closing_auction,
             stats=stats,
         )
         triggered = await _trigger_due_stops(conn, tick_index)
         if stats is not None:
             stats["stops_triggered"] += triggered
         if triggered == 0:
+            break
+    return fills
+
+
+async def _auction_clear(
+    conn: AsyncConnection,
+    *,
+    bids: list[dict[str, Any]],
+    asks: list[dict[str, Any]],
+    remaining: dict[int, int],
+    base_price: float,
+    max_impact: float,
+    open_mark: float,
+    collar: Decimal,
+    tick_index: int,
+    flow_halt_ticks: int,
+    spread_cfg: dict[str, float],
+    stats: dict[str, int] | None,
+) -> int:
+    """Closing auction (Plan C): clear one book at a single uniform price.
+
+    The clearing price maximizes executable volume over the union of
+    resting limit prices plus the tick-open mark; ties break toward the
+    open mark, then toward the lower price -- deterministic, no RNG. The
+    result is collar-checked against `cross.collar_pct` of the open mark:
+    a maximizing price outside the collar is clamped to the collar
+    boundary rather than abandoned, so resting off-market orders still
+    clear at the boundary price like a real auction's price cap.
+
+    Eligible pairs then settle at THE SAME price via `_settle_cross` --
+    the maker/taker split still applies (the earlier order earns the
+    rebate) but there's no price improvement to take: an auction is one
+    print. Self-matches stay banned; the later order steps past, matching
+    pass 1's taker-advances convention.
+    """
+    tick = engine.tick_size(open_mark, spread_cfg)
+    open_mark_d = Decimal(str(open_mark))
+    snapped_mark = Decimal(str(engine.round_to_tick(open_mark, tick)))
+
+    def _eff(order: dict[str, Any], marketable: Decimal) -> Decimal:
+        return marketable if _marketable(order) else Decimal(order["limit_price"])
+
+    # Candidate prices: every resting limit (already grid-snapped at
+    # placement) plus the snapped open mark -- the tie-break anchor must
+    # be a candidate so the auction can clear at the mark even when no
+    # order rests exactly there.
+    candidates = sorted(
+        {
+            Decimal(o["limit_price"])
+            for o in bids + asks
+            if o["limit_price"] is not None
+        }
+        | {snapped_mark}
+    )
+    if not candidates:
+        return 0
+
+    def _volume_at(price: Decimal) -> int:
+        demand = sum(
+            remaining[int(b["id"])]
+            for b in bids
+            if _eff(b, Decimal("Infinity")) >= price
+        )
+        supply = sum(
+            remaining[int(a["id"])]
+            for a in asks
+            if _eff(a, Decimal(0)) <= price
+        )
+        return min(demand, supply)
+
+    best_price: Decimal | None = None
+    best_vol = 0
+    for price in candidates:
+        vol = _volume_at(price)
+        if vol == 0:
+            continue
+        better = vol > best_vol
+        if not better and vol == best_vol and best_price is not None:
+            # Tie-break: closest to the open mark, then the lower price.
+            better = (abs(price - open_mark_d), price) < (
+                abs(best_price - open_mark_d),
+                best_price,
+            )
+        if better:
+            best_price, best_vol = price, vol
+    if best_price is None or best_vol == 0:
+        return 0
+
+    clear_price = best_price
+    if abs(clear_price - open_mark_d) / open_mark_d > collar:
+        boundary = open_mark_d * (Decimal(1) + collar * (1 if clear_price > open_mark_d else -1))
+        clear_price = Decimal(
+            str(engine.round_to_tick(float(boundary), tick))
+        )
+        # round_to_tick is nearest-grid: a boundary between grid points
+        # can round up to half a tick OUTSIDE the collar. Step one tick
+        # back toward the mark so the print never exceeds it.
+        if clear_price > open_mark_d and clear_price > boundary:
+            clear_price -= Decimal(str(tick))
+        elif clear_price < open_mark_d and clear_price < boundary:
+            clear_price += Decimal(str(tick))
+
+    fills = 0
+    i = j = 0
+    mark = open_mark
+    while i < len(bids) and j < len(asks):
+        bid, ask = bids[i], asks[j]
+        # Bids sort by effective limit descending, asks ascending: the
+        # first ineligible order on a side ends that side's book.
+        if _eff(bid, Decimal("Infinity")) < clear_price:
+            break
+        if _eff(ask, Decimal(0)) > clear_price:
+            break
+        if bid["user_id"] == ask["user_id"]:
+            # Self-match banned: the later order steps past (same rule as
+            # the continuous book -- there is no aggressor in an auction,
+            # so the maker convention stands in for one).
+            if _is_maker(bid, ask):
+                j += 1
+            else:
+                i += 1
+            continue
+        quantity = min(remaining[int(bid["id"])], remaining[int(ask["id"])])
+        try:
+            async with conn.transaction():
+                mark, _impact, halted = await _settle_cross(
+                    conn,
+                    bid=bid,
+                    ask=ask,
+                    cross_price=clear_price,
+                    quantity=quantity,
+                    base_price=base_price,
+                    mark=mark,
+                    max_impact=max_impact,
+                    tick_index=tick_index,
+                    flow_halt_ticks=flow_halt_ticks,
+                )
+        except (TradingError, MarginError, LedgerError, ValueError):
+            # A side can't settle: the later order steps past, matching
+            # the continuous book's taker-advances rule.
+            if _is_maker(bid, ask):
+                j += 1
+            else:
+                i += 1
+            continue
+        fills += 1
+        if stats is not None:
+            stats["crosses"] += 1
+            stats["auction_fills"] = stats.get("auction_fills", 0) + 1
+        remaining[int(bid["id"])] -= quantity
+        remaining[int(ask["id"])] -= quantity
+        if remaining[int(bid["id"])] == 0:
+            i += 1
+        if remaining[int(ask["id"])] == 0:
+            j += 1
+        if halted:
             break
     return fills
 
@@ -563,11 +750,14 @@ async def _match_once(
     open_marks: dict[int, float],
     max_fill_failures: int,
     flow_halt_ticks: int,
+    event_halt_lead: int,
+    closing_auction: bool,
     stats: dict[str, int] | None = None,
 ) -> int:
-    """One matching pass over the book: crosses, then MM fallback.
-    `depth_used` accumulates MM-filled shares per order across cascade
-    iterations so the participation cap is per-tick, not per-pass."""
+    """One matching pass over the book: crosses (or the closing auction),
+    then MM fallback. `depth_used` accumulates MM-filled shares per order
+    across cascade iterations so the participation cap is per-tick, not
+    per-pass."""
     fills = 0
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
@@ -577,12 +767,14 @@ async def _match_once(
                    o.opened_tick,
                    o.instrument_id, i.ticker, i.base_price, i.impact,
                    i.quoted_price, i.liquidity, i.lambda_impact, i.max_impact,
+                   i.next_halting_event_tick,
                    COALESCE(i.sigma_eff, i.sigma) AS sigma,
                    i.next_event_tick, i.last_halt_end_tick,
                    i.circuit_halted_until_tick
             FROM orders o
             JOIN instruments i ON i.id = o.instrument_id
             WHERE o.status = 'OPEN'
+              AND i.is_active
               AND (o.order_type = 'LIMIT' OR o.triggered_tick IS NOT NULL)
             ORDER BY o.instrument_id, o.id
             """,
@@ -603,6 +795,15 @@ async def _match_once(
     for order in open_orders:
         if order["circuit_halted_until_tick"] is not None:
             continue  # halted instruments can't cross this tick
+        if event_halted(
+            order["next_halting_event_tick"], tick_index, event_halt_lead
+        ):
+            # T1 halt into an earnings print: the book freezes entirely --
+            # no risk-reducing exception for crosses (the cross settles
+            # order-to-order without a position view). Resting orders that
+            # would reduce risk can still MM-fill via pass 2, where
+            # execute_trade applies the position-aware gate.
+            continue
         key = (int(order["instrument_id"]), order["season_id"])
         books.setdefault(key, {"BUY": [], "SELL": []})[order["side"]].append(order)
 
@@ -619,12 +820,30 @@ async def _match_once(
             int(o["id"]): int(o["quantity"]) - int(o["filled_quantity"])
             for o in bids + asks
         }
-        i = j = 0
         # Tick-open anchor for the collar: `mark` drifts as crosses print,
         # so comparing each new cross to the live mark lets pairs ratchet
         # the price collar-width at a time. Anchor to the mark this
         # instrument opened the tick with instead.
         open_mark = open_marks.setdefault(_iid, mark)
+        if closing_auction:
+            # Plan C: on the last open tick the continuous book clears
+            # once at a uniform price -- the closing auction.
+            fills += await _auction_clear(
+                conn,
+                bids=bids,
+                asks=asks,
+                remaining=remaining,
+                base_price=base_price,
+                max_impact=max_impact,
+                open_mark=open_mark,
+                collar=collar,
+                tick_index=tick_index,
+                flow_halt_ticks=flow_halt_ticks,
+                spread_cfg=spread_cfg,
+                stats=stats,
+            )
+            continue
+        i = j = 0
         while i < len(bids) and j < len(asks):
             bid, ask = bids[i], asks[j]
             bid_eff = Decimal("Infinity") if _marketable(bid) else bid["limit_price"]
@@ -699,6 +918,9 @@ async def _match_once(
                 break
 
     # --- Pass 2: market-maker fallback ------------------------------------
+    # Skipped on the closing-auction tick: the auction print IS the close.
+    if closing_auction:
+        return fills
     async with conn.cursor(row_factory=dict_row) as cur:
         # A BUY needs quoted <= limit*(1-eps), a SELL quoted >= limit*(1+eps)
         # -- the mark must cross the limit by epsilon, not merely touch it
@@ -711,11 +933,13 @@ async def _match_once(
                    o.filled_quantity, o.limit_price, o.order_type, i.ticker,
                    i.base_price,
                    i.impact, i.liquidity, i.adv, i.lambda_impact, i.max_impact,
+                   i.vol_state, i.flow_skew,
                    COALESCE(i.sigma_eff, i.sigma) AS sigma,
                    i.next_event_tick, i.last_halt_end_tick
             FROM orders o
             JOIN instruments i ON i.id = o.instrument_id
             WHERE o.status = 'OPEN'
+              AND i.is_active
               AND i.circuit_halted_until_tick IS NULL
               AND (o.order_type = 'LIMIT' OR o.triggered_tick IS NOT NULL)
               AND (o.order_type = 'STOP'
@@ -738,7 +962,18 @@ async def _match_once(
         # budget is per-tick: `depth_used` carries it across stop-cascade
         # iterations.
         liq_eff = engine.effective_liquidity(
-            float(order["liquidity"]), float(order["adv"]), spread_cfg
+            float(order["liquidity"]),
+            float(order["adv"]),
+            spread_cfg,
+            float(order["vol_state"]),
+        )
+        # One half-spread for both the cap-estimate and actual-size fills:
+        # same order, same side -- the flow skew depends only on direction.
+        half_spread = half_spread_for(order, tick_index, spread_cfg)
+        half_spread *= engine.flow_skew_mult(
+            float(order["base_price"]) * remaining_qty * sign,
+            float(order["flow_skew"]),
+            spread_cfg,
         )
         fill_full, _ = engine.apply_trade_impact(
             base_price=float(order["base_price"]),
@@ -747,10 +982,10 @@ async def _match_once(
             liquidity=liq_eff,
             lambda_impact=float(order["lambda_impact"]),
             max_impact=float(order["max_impact"]),
-            half_spread=half_spread_for(order, tick_index, spread_cfg),
+            half_spread=half_spread,
             tick_size=tick,
         )
-        cap_qty = int(cap * float(order["liquidity"]) / fill_full)
+        cap_qty = int(cap * liq_eff / fill_full)
         budget = cap_qty - depth_used.get(int(order["id"]), 0)
         trade_qty = min(remaining_qty, budget)
         if trade_qty < 1:
@@ -765,7 +1000,7 @@ async def _match_once(
             liquidity=liq_eff,
             lambda_impact=float(order["lambda_impact"]),
             max_impact=float(order["max_impact"]),
-            half_spread=half_spread_for(order, tick_index, spread_cfg),
+            half_spread=half_spread,
             tick_size=tick,
         )
         if order["limit_price"] is not None:
@@ -839,10 +1074,10 @@ async def _match_once(
         except _LimitBreach:
             # Mark-dependent, not deterministic: leave fill_failures alone.
             continue
-        except (FeatureDisabledError, MarketClosedError):
+        except (FeatureDisabledError, MarketClosedError, EventHaltedError):
             # Global transient, not an order-deterministic failure: a kill
-            # switch or closed session must not burn strikes toward
-            # auto-cancel -- the order just waits it out.
+            # switch, closed session, or T1 halt window must not burn
+            # strikes toward auto-cancel -- the order just waits it out.
             continue
         except (TradingError, MarginError, LedgerError, ValueError):
             # Not fillable right now (funds, margin gates, slot limits) --

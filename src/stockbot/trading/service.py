@@ -41,6 +41,9 @@ from stockbot.market.data import (
     assert_feature_enabled,
     assert_market_open,
     current_tick_index,
+    event_halt_lead_ticks,
+    event_halted,
+    fee_config,
     flow_config,
     half_spread_for,
     participation_cap,
@@ -50,9 +53,11 @@ from stockbot.market.data import (
 )
 from stockbot.shop.service import BASE_SLOTS, get_slot_count
 from stockbot.trading.errors import (
+    EventHaltedError,
     InstrumentHaltedError,
     InsufficientDepthError,
     NotInLeagueError,
+    SlippageExceededError,
     TooManyPositionsError,
     UnknownInstrumentError,
 )
@@ -78,6 +83,39 @@ class TradeResult:
 
 def _to_minor_units(major_units: Decimal) -> int:
     return int((major_units * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+async def taker_fee_bps(conn: AsyncConnection, user_id: int) -> Decimal:
+    """The user's volume-tiered taker fee rate. Lifetime traded notional
+    (users.total_traded_minor, main + league combined) crosses the
+    fee.tier{1,2}_volume thresholds; read BEFORE this fill's volume
+    accrues, like a real 30d tier."""
+    cfg = await fee_config(conn)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT total_traded_minor FROM users WHERE id = %s", (user_id,)
+        )
+        row = await cur.fetchone()
+    total = int(row[0]) if row else 0
+    if total >= cfg.get("fee.tier2_volume", float("inf")):
+        return Decimal(str(cfg["fee.tier2_bps"]))
+    if total >= cfg.get("fee.tier1_volume", float("inf")):
+        return Decimal(str(cfg["fee.tier1_bps"]))
+    return FEE_BPS
+
+
+async def record_volume(
+    conn: AsyncConnection, user_id: int, notional_minor: int
+) -> None:
+    """Accrue lifetime traded notional for the fee tier. Called by every
+    user-facing fill path (_apply_fill covers shares/crosses; bounded
+    shorts call it directly since they settle outside _apply_fill)."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE users SET total_traded_minor = total_traded_minor + %s "
+            "WHERE id = %s",
+            (notional_minor, user_id),
+        )
 
 
 async def update_candle_with_fill(
@@ -140,9 +178,31 @@ async def _apply_fill(
         await cur.fetchone()
 
     notional = fill_price * quantity
-    fee = (notional * FEE_BPS / 10_000).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     notional_minor = _to_minor_units(notional)
-    fee_minor = _to_minor_units(fee)
+    # Plan E: makers pay nothing -- posting liquidity is rebated out of
+    # the taker's fee instead of charged. Takers pay their volume-tier
+    # rate; maker_rebate_bps of the notional (clamped to that rate) routes
+    # to the maker's account, the remainder to SINK. MM fills carry
+    # maker_taker=None -> flat tier fee, no rebate.
+    fee_bps = FEE_BPS if maker_taker == "MAKER" else await taker_fee_bps(
+        conn, user_id
+    )
+    fee_minor = _to_minor_units(
+        (notional * fee_bps / 10_000).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    )
+    if maker_taker == "MAKER":
+        fee_minor = 0
+    rebate_minor = 0
+    if maker_taker == "TAKER":
+        rebate_bps = min(
+            Decimal(str((await fee_config(conn)).get("fee.maker_rebate_bps", 2.0))),
+            fee_bps,
+        )
+        rebate_minor = _to_minor_units(
+            (notional * rebate_bps / 10_000).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        )
 
     sink_id = await get_system_account_id(conn, "SINK")
 
@@ -282,15 +342,26 @@ async def _apply_fill(
     assert cash_transfer_id is not None
 
     fee_transfer_id = None
-    if fee_minor > 0:
+    sink_fee_minor = fee_minor - rebate_minor
+    if sink_fee_minor > 0:
         fee_transfer_id = await post_transfer(
             conn,
             from_account_id=account_id,
             to_account_id=sink_id,
-            amount=fee_minor,
+            amount=sink_fee_minor,
             reason="TRADE_FEE",
             memo=ticker,
         )
+    if rebate_minor > 0:
+        await post_transfer(
+            conn,
+            from_account_id=account_id,
+            to_account_id=counterparty_account_id,
+            amount=rebate_minor,
+            reason="MAKER_REBATE",
+            memo=ticker,
+        )
+    await record_volume(conn, user_id, notional_minor)
 
     async with conn.cursor() as cur:
         await cur.execute(
@@ -329,9 +400,9 @@ async def _apply_fill(
                 user_id, instrument_id, side, quantity, fill_price,
                 notional_minor, fee_minor, cash_transfer_id, fee_transfer_id,
                 tick_index, season_id, maker_taker, counterparty_user_id,
-                order_id, half_spread, impact_delta
+                order_id, half_spread, impact_delta, maker_rebate_minor
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -351,6 +422,7 @@ async def _apply_fill(
                 order_id,
                 half_spread,
                 impact_delta,
+                rebate_minor,
             ),
         )
         row = await cur.fetchone()
@@ -419,11 +491,19 @@ async def execute_trade(
     interaction_id: str | None = None,
     season_id: int | None = None,
     order_id: int | None = None,
+    max_slippage: Decimal | None = None,
 ) -> TradeResult:
     """When `season_id` is set, the trade runs against the user's LEAGUE
     account and a season-scoped position (league portfolio), keeping league
     wealth isolated from the persistent main portfolio. `order_id` links the
     trade row back to the resting order that produced it (MM order fills).
+
+    `max_slippage` (a fraction, e.g. 0.025) is price protection for
+    marketable user orders: the computed fill is rejected if it deviates
+    from the mark by more than the bound -- the user's marketable-limit
+    collar, like a real broker's marketable-limit conversion. Matching and
+    liquidation paths leave it unset (orders have their own limit checks;
+    forced flows must fill).
     """
     if quantity <= 0:
         raise ValueError("quantity must be positive")
@@ -440,8 +520,9 @@ async def execute_trade(
             await cur.execute(
                 """
                 SELECT id, base_price, impact, liquidity, adv, lambda_impact,
-                       max_impact,
+                       max_impact, vol_state, flow_skew,
                        is_active, circuit_halted_until_tick, short_interest_pct,
+                       next_halting_event_tick,
                        COALESCE(sigma_eff, sigma) AS sigma,
                        next_event_tick, last_halt_end_tick
                 FROM instruments
@@ -453,14 +534,22 @@ async def execute_trade(
             instrument = await cur.fetchone()
         if instrument is None or not instrument["is_active"]:
             raise UnknownInstrumentError(ticker)
-        if instrument["circuit_halted_until_tick"] is not None:
-            # F5.3: a halt blocks exposure-INCREASING trades only. Closing
-            # or shrinking an existing position stays legal -- otherwise a
-            # halt is a freeze-out DoS on holders, asymmetric with the
-            # liquidation sweep that keeps running during halts. Same
-            # direction, strictly smaller gross: no adds, no flips. The
-            # position row lock here is re-taken by _apply_fill inside the
-            # same transaction, which is a no-op.
+        current_tick = await current_tick_index(conn)
+        # Two halt states gate exposure-increasing trades: the circuit
+        # breaker (F5.3) and the Plan-C T1 halt ahead of a scheduled
+        # earnings resolution. Risk-reducing trades stay legal under
+        # either -- otherwise a halt is a freeze-out DoS on holders,
+        # asymmetric with the liquidation sweep that keeps running during
+        # halts. Same direction, strictly smaller gross: no adds, no
+        # flips. The position row lock here is re-taken by _apply_fill
+        # inside the same transaction, which is a no-op.
+        circuit_halted = instrument["circuit_halted_until_tick"] is not None
+        ev_halted = event_halted(
+            instrument["next_halting_event_tick"],
+            current_tick,
+            await event_halt_lead_ticks(conn),
+        )
+        if circuit_halted or ev_halted:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
@@ -480,8 +569,11 @@ async def execute_trade(
                 and (new_qty == 0 or (new_qty > 0) == (held > 0))
             )
             if not risk_reducing:
-                raise InstrumentHaltedError(ticker)
-        current_tick = await current_tick_index(conn)
+                if circuit_halted:
+                    raise InstrumentHaltedError(ticker)
+                raise EventHaltedError(
+                    ticker, int(instrument["next_halting_event_tick"])
+                )
 
         if season_id is None:
             account_id = await get_user_account_id(conn, user_id)
@@ -531,13 +623,20 @@ async def execute_trade(
             **await flow_config(conn),
         }
         half_spread = half_spread_for(instrument, current_tick, spread_cfg)
+        half_spread *= engine.flow_skew_mult(
+            signed_notional, float(instrument["flow_skew"]), spread_cfg
+        )
+        liq_eff = engine.effective_liquidity(
+            liquidity,
+            float(instrument["adv"]),
+            spread_cfg,
+            float(instrument["vol_state"]),
+        )
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=impact_before,
             signed_notional=signed_notional,
-            liquidity=engine.effective_liquidity(
-                liquidity, float(instrument["adv"]), spread_cfg
-            ),
+            liquidity=liq_eff,
             lambda_impact=lambda_impact,
             max_impact=max_impact,
             half_spread=half_spread,
@@ -545,12 +644,22 @@ async def execute_trade(
         )
         fill_price = Decimal(str(round(fill_price_f, 6)))
 
+        # Price protection (B1): reject a fill that lands too far from
+        # the mark the user saw. Measured vs. the pre-fill mark
+        # (base*exp(impact)), which is what /stock displays.
+        if max_slippage is not None:
+            mark = base_price * math.exp(impact_before)
+            if abs(float(fill_price) / mark - 1) > float(max_slippage):
+                raise SlippageExceededError(
+                    ticker, fill_price, mark, max_slippage
+                )
+
         # Participation cap: one marketable fill can't exceed a fraction of
         # the instrument's depth. Crosses don't come through here (the book
         # is its own depth); forced liquidation closes bypass the cap by
         # calling _apply_fill directly via margin's liquidation legs.
         cap = await participation_cap(conn)
-        cap_minor = _to_minor_units(Decimal(str(cap)) * Decimal(str(liquidity)))
+        cap_minor = _to_minor_units(Decimal(str(cap)) * Decimal(str(liq_eff)))
         notional_minor = _to_minor_units(fill_price * quantity)
         if notional_minor > cap_minor:
             raise InsufficientDepthError(ticker, notional_minor, cap_minor)

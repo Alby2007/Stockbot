@@ -18,7 +18,7 @@ from stockbot.market.tick import apply_tick
 from stockbot.orders.service import place_order
 from stockbot.seasons.service import create_season
 from stockbot.shorts.service import open_bounded_short
-from stockbot.trading.errors import MarketClosedError
+from stockbot.trading.errors import EventHaltedError, MarketClosedError
 from stockbot.trading.service import execute_trade
 
 SEED = "sessions-test-seed"
@@ -72,6 +72,14 @@ async def _quoted(conn: AsyncConnection, ticker: str) -> float:
         row = await cur.fetchone()
         assert row is not None
         return float(row[0])
+
+
+async def _order_status(conn: AsyncConnection, order_id: int) -> str:
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT status FROM orders WHERE id = %s", (order_id,))
+        row = await cur.fetchone()
+        assert row is not None
+        return str(row[0])
 
 
 async def test_closed_ticks_reject_all_trading(conn: AsyncConnection) -> None:
@@ -324,6 +332,316 @@ async def _borrow_fees(conn: AsyncConnection, user_id: int) -> Decimal:
         row = await cur.fetchone()
         assert row is not None
         return Decimal(row[0])
+
+
+async def test_closing_auction_clears_uniform_and_skips_mm(
+    conn: AsyncConnection,
+) -> None:
+    """C1: on the last open tick, crossing books print once at the
+    volume-maximizing uniform price and the MM fallback doesn't run --
+    an MM-fillable resting order waits through the close and fills on
+    the next open tick instead."""
+    for uid in (7010, 7011, 7012):
+        account = await bootstrap_user(conn, uid)
+        await post_transfer(
+            conn,
+            from_account_id=await get_system_account_id(conn, "FAUCET"),
+            to_account_id=account,
+            amount=10_000_000,
+            reason="TEST_TOPUP",
+        )
+    ticker = await _first_ticker(conn)
+    await _set_session(conn, 4, 2)
+    # Pin the auction window to the boundary tick so pass 2 still runs on
+    # the other open ticks (the scenario asserts the MM fallback resumes).
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = 1 WHERE key = 'session.auction_ticks'"
+        )
+    await _run_to_phase(conn, "OPEN")
+    # Determinism: clear any pending-earnings halt flag the seed draws.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE instruments SET next_halting_event_tick = NULL WHERE ticker = %s",
+            (ticker,),
+        )
+
+    # Advance to ticks_until_close == 2: orders placed now meet the book
+    # for the first time on the last open tick -- the auction.
+    from stockbot.market.data import session_parts
+
+    for _ in range(10):
+        last = await _last_tick(conn)
+        _, _, cfg = await current_session(conn)
+        open_t, closed_t, offset = session_parts(cfg)
+        if engine.ticks_until_close(last, open_t, closed_t, offset) == 2:
+            break
+        await apply_tick(conn, SEED)
+    else:
+        raise AssertionError("never reached ticks_until_close == 2")
+
+    mark = Decimal(str(await _quoted(conn, ticker)))
+    # Seller needs inventory; the buy also gives 7011 a position to close.
+    await execute_trade(conn, user_id=7011, ticker=ticker, side="BUY", quantity=10)
+    mark = Decimal(str(await _quoted(conn, ticker)))
+    bid = await place_order(
+        conn, user_id=7010, ticker=ticker, side="BUY", quantity=10,
+        limit_price=mark * Decimal("1.05"),
+    )
+    ask = await place_order(
+        conn, user_id=7011, ticker=ticker, side="SELL", quantity=10,
+        limit_price=mark * Decimal("0.98"),
+    )
+    # An MM-fillable bid on a SECOND instrument -- a book with no
+    # counterparty: the auction finds zero clearing volume for it, and
+    # with pass 2 skipped it can't MM-fill on the auction tick either.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT ticker FROM instruments WHERE is_active AND kind != 'INDEX' "
+            "AND ticker <> %s ORDER BY ticker LIMIT 1",
+            (ticker,),
+        )
+        ticker2 = str((await cur.fetchone())[0])
+        await cur.execute(
+            "UPDATE instruments SET next_halting_event_tick = NULL WHERE ticker = %s",
+            (ticker2,),
+        )
+    mark2 = await _quoted(conn, ticker2)
+    late_bid = await place_order(
+        conn, user_id=7012, ticker=ticker2, side="BUY", quantity=5,
+        limit_price=Decimal(str(mark2)) * Decimal("1.01"),
+    )
+
+    auction_tick = await apply_tick(conn, SEED)
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT fill_price FROM trades WHERE order_id IN (%s, %s) ORDER BY order_id",
+            (bid.order_id, ask.order_id),
+        )
+        fills = [Decimal(r[0]) for r in await cur.fetchall()]
+        await cur.execute(
+            "SELECT crosses FROM market_ticks WHERE tick_index = %s",
+            (auction_tick,),
+        )
+        (crosses,) = await cur.fetchone()
+        await cur.execute(
+            "SELECT quoted_price FROM instruments WHERE ticker = %s", (ticker,)
+        )
+        quoted = Decimal(str((await cur.fetchone())[0]))
+
+    assert len(fills) == 2
+    # Uniform clearing: both legs of the auction print at one price, and
+    # the mark IS that price afterwards.
+    assert fills[0] == fills[1] == quoted
+    assert int(crosses) >= 1
+    assert await _order_status(conn, bid.order_id) == "FILLED"
+    assert await _order_status(conn, ask.order_id) == "FILLED"
+    # Pass 2 was skipped: the extra bid rests through the close.
+    assert await _order_status(conn, late_bid.order_id) == "OPEN"
+
+    # MM fallback resumes after the auction: the leftover bid fills on
+    # the next open tick.
+    await _run_to_phase(conn, "OPEN")
+    assert await _order_status(conn, late_bid.order_id) == "FILLED"
+
+
+async def test_closing_auction_window_spans_n_ticks(
+    conn: AsyncConnection,
+) -> None:
+    """session.auction_ticks is a real window, not a flag: with N=2 the
+    second-to-last open tick auctions too -- a lone MM-fillable bid stays
+    OPEN because pass 2 is skipped inside the window."""
+    from stockbot.market.data import session_parts
+
+    account = await bootstrap_user(conn, 7030)
+    await post_transfer(
+        conn,
+        from_account_id=await get_system_account_id(conn, "FAUCET"),
+        to_account_id=account,
+        amount=10_000_000,
+        reason="TEST_TOPUP",
+    )
+    ticker = await _first_ticker(conn)
+    await _set_session(conn, 4, 2)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = 2 WHERE key = 'session.auction_ticks'"
+        )
+        await cur.execute(
+            "UPDATE instruments SET next_halting_event_tick = NULL "
+            "WHERE ticker = %s",
+            (ticker,),
+        )
+    await _run_to_phase(conn, "OPEN")
+
+    # Advance so the NEXT applied tick has ticks_until_close == 2 --
+    # inside the window but not the final open tick.
+    for _ in range(10):
+        last = await _last_tick(conn)
+        _, _, cfg = await current_session(conn)
+        open_t, closed_t, offset = session_parts(cfg)
+        if engine.ticks_until_close(last, open_t, closed_t, offset) == 3:
+            break
+        await apply_tick(conn, SEED)
+    else:
+        raise AssertionError("never reached ticks_until_close == 3")
+
+    mark = Decimal(str(await _quoted(conn, ticker)))
+    bid = await place_order(
+        conn, user_id=7030, ticker=ticker, side="BUY", quantity=1,
+        limit_price=mark * Decimal("1.01"),
+    )
+    await apply_tick(conn, SEED)  # until_close == 2: auction, no pass 2
+    # A lone bid has no clearing volume and the MM fallback is skipped --
+    # under the old flag-semantics this tick would have MM-filled it.
+    # (Resumption of pass 2 outside the window is covered by C1 above.)
+    assert await _order_status(conn, bid.order_id) == "OPEN"
+
+
+async def test_event_halt_blocks_exposure_but_not_closing(
+    conn: AsyncConnection,
+) -> None:
+    """C2: inside event.halt_lead_ticks of an earnings resolution, new
+    exposure (trade, order, bounded short) is rejected, resting orders
+    freeze without burning fill_failures, and closing stays legal."""
+    from stockbot.orders.service import match_orders
+    from stockbot.shorts.service import open_bounded_short
+
+    account = await bootstrap_user(conn, 7020)
+    await post_transfer(
+        conn,
+        from_account_id=await get_system_account_id(conn, "FAUCET"),
+        to_account_id=account,
+        amount=10_000_000,
+        reason="TEST_TOPUP",
+    )
+    account2 = await bootstrap_user(conn, 7021)
+    await post_transfer(
+        conn,
+        from_account_id=await get_system_account_id(conn, "FAUCET"),
+        to_account_id=account2,
+        amount=10_000_000,
+        reason="TEST_TOPUP",
+    )
+    ticker = await _first_ticker(conn)
+    await apply_tick(conn, SEED)
+    current = await _last_tick(conn)
+    # Isolate the event stream before the buys: a seed-scheduled earnings
+    # inside the lead window would halt the name early.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            DELETE FROM events WHERE kind = 'EARNINGS' AND NOT resolved
+              AND instrument_id = (SELECT id FROM instruments WHERE ticker = %s)
+            """,
+            (ticker,),
+        )
+        await cur.execute(
+            "UPDATE instruments SET next_halting_event_tick = NULL WHERE ticker = %s",
+            (ticker,),
+        )
+
+    # Park a crossing pair on the name before the halt. Both legs are
+    # exposure-INCREASING for their owners (the ask sits above the mark:
+    # selling into it opens a short for the holder of 10 only after the
+    # cross; as an MM candidate it's above the mark so pass 2 won't touch
+    # it, and the bid's MM path is what the halt blocks).
+    await execute_trade(conn, user_id=7020, ticker=ticker, side="BUY", quantity=10)
+    mark = Decimal(str(await _quoted(conn, ticker)))
+    ask = await place_order(
+        conn, user_id=7020, ticker=ticker, side="SELL", quantity=15,
+        limit_price=mark * Decimal("1.05"),
+    )
+    bid = await place_order(
+        conn, user_id=7021, ticker=ticker, side="BUY", quantity=5,
+        limit_price=mark * Decimal("1.05"),
+    )
+
+    # Enter the halt window: earnings resolves 2 ticks out, lead is 10.
+    resolve_tick = current + 2
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE instruments SET next_halting_event_tick = %s WHERE ticker = %s",
+            (resolve_tick, ticker),
+        )
+
+    with pytest.raises(EventHaltedError):
+        await execute_trade(conn, user_id=7021, ticker=ticker, side="BUY", quantity=1)
+    with pytest.raises(EventHaltedError):
+        await place_order(
+            conn, user_id=7021, ticker=ticker, side="BUY", quantity=1,
+            limit_price=mark,
+        )
+    with pytest.raises(EventHaltedError):
+        await open_bounded_short(conn, user_id=7021, ticker=ticker, quantity=1)
+
+    # The book freezes: no cross, no MM fill, and no strikes recorded.
+    fills = await match_orders(conn, current)
+    assert fills == 0
+    assert await _order_status(conn, bid.order_id) == "OPEN"
+    assert await _order_status(conn, ask.order_id) == "OPEN"
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT fill_failures FROM orders WHERE id IN (%s, %s)",
+            (bid.order_id, ask.order_id),
+        )
+        assert all(r[0] == 0 for r in await cur.fetchall())
+
+    # Risk-reducing stays legal: 7020 holds 10 shares and can sell 5.
+    result = await execute_trade(
+        conn, user_id=7020, ticker=ticker, side="SELL", quantity=5
+    )
+    assert result.quantity == 5
+
+
+async def test_event_halt_lifts_after_resolution(conn: AsyncConnection) -> None:
+    """The gate reopens on its own: once the event resolves the aggregate
+    rolls to the next earnings ~30d out and the halt window ends."""
+    from stockbot.market import events as events_mod
+
+    await bootstrap_user(conn, 7022)
+    ticker = await _first_ticker(conn)
+    await apply_tick(conn, SEED)
+    current = await _last_tick(conn)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT id FROM instruments WHERE ticker = %s", (ticker,)
+        )
+        (instrument_id,) = await cur.fetchone()
+        # Isolate the event stream: the seed may already have scheduled an
+        # earnings for this name inside the halt window.
+        await cur.execute(
+            "DELETE FROM events WHERE instrument_id = %s AND kind = 'EARNINGS'",
+            (instrument_id,),
+        )
+        await cur.execute(
+            """
+            INSERT INTO events (instrument_id, kind, scheduled_tick, resolve_tick,
+                                estimate)
+            VALUES (%s, 'EARNINGS', %s, %s, 0.01)
+            """,
+            (instrument_id, current, current + 1),
+        )
+    await events_mod.refresh_next_event_ticks(conn)
+
+    # Inside the window now (resolve is next tick, lead default 10).
+    with pytest.raises(EventHaltedError):
+        await execute_trade(conn, user_id=7022, ticker=ticker, side="BUY", quantity=1)
+
+    await apply_tick(conn, SEED)  # resolves the event + reschedules
+    # Gate lifted: the next earnings is ~30 days out.
+    result = await execute_trade(
+        conn, user_id=7022, ticker=ticker, side="BUY", quantity=1
+    )
+    assert result.quantity == 1
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT next_halting_event_tick FROM instruments WHERE id = %s",
+            (instrument_id,),
+        )
+        (next_halt,) = await cur.fetchone()
+    assert int(next_halt) - (current + 1) > 1000  # ~30d out, not imminently halted
 
 
 async def test_first_tick_does_not_gap(conn: AsyncConnection) -> None:

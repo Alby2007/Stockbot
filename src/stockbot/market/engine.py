@@ -325,25 +325,57 @@ def round_to_tick(price: float, tick: float) -> float:
 def quote_ticks(mark: float, half_spread: float, tick: float) -> tuple[float, float]:
     """Displayed (bid, ask) on the tick grid, rounded OUTWARD so the
     shown quote is the worst case a market fill can land at."""
-    bid = math.floor(mark * (1.0 - half_spread) / tick) * tick
-    ask = math.ceil(mark * (1.0 + half_spread) / tick) * tick
+    return quote_ticks_skewed(mark, half_spread, half_spread, tick)
+
+
+def quote_ticks_skewed(
+    mark: float, half_bid: float, half_ask: float, tick: float
+) -> tuple[float, float]:
+    """Asymmetric variant: the bid leg uses the half-spread a SELLER
+    would face, the ask leg the one a BUYER would face -- with a nonzero
+    `flow_skew` the two sides differ."""
+    bid = math.floor(mark * (1.0 - half_bid) / tick) * tick
+    ask = math.ceil(mark * (1.0 + half_ask) / tick) * tick
     return bid, ask
 
 
 def effective_liquidity(
-    liquidity: float, adv_notional: float, cfg: dict[str, float]
+    liquidity: float,
+    adv_notional: float,
+    cfg: dict[str, float],
+    vol_state: float = 1.0,
 ) -> float:
-    """Volume-responsive liquidity for IMPACT only (H4): trailing ADV
-    relative to `flow.adv_ref_frac` of static liquidity scales the impact
-    denominator, clamped to [flow.adv_mult_min, flow.adv_mult_max]. A dead
-    tape halves effective liquidity (2x impact); a frenzied tape doubles
-    it. The participation cap deliberately stays on static liquidity --
-    finding 7's death-spiral guard."""
+    """Volume- and vol-responsive liquidity: trailing ADV relative to
+    `flow.adv_ref_frac` of static liquidity scales the impact denominator,
+    clamped to [flow.adv_mult_min, flow.adv_mult_max], and an elevated vol
+    regime thins the book further via `(1/vol_state) ** flow.vol_liq_coeff` --
+    storms shrink depth, not just widen the spread. The participation cap
+    is computed on this effective value too (it used to stay on static
+    liquidity as a death-spiral guard; the liq_coeff term makes static
+    too generous exactly when it matters)."""
     lo = cfg.get("flow.adv_mult_min", 0.5)
     hi = cfg.get("flow.adv_mult_max", 2.0)
     ref = liquidity * cfg.get("flow.adv_ref_frac", 2.5e-8)
     mult = lo if ref <= 0 else min(max(adv_notional / ref, lo), hi)
-    return liquidity * mult
+    vol_mult = (1.0 / max(1.0, vol_state)) ** cfg.get("flow.vol_liq_coeff", 1.0)
+    return float(liquidity * mult * vol_mult)
+
+
+def flow_skew_mult(
+    signed_notional: float, flow_skew: float, cfg: dict[str, float]
+) -> float:
+    """Adverse-selection skew on the half-spread: the side matching the
+    prevailing bounded flow pays up to `flow.skew_coeff` extra spread;
+    the contra side is discounted (floored at 0 so it never pays to take
+    liquidity). `flow_skew` is a bounded log-return-scale EWMA, normalized
+    by `flow.skew_norm` (same scale as vol.flow_ret_cap), and the result
+    clips at `flow.skew_max`."""
+    norm = cfg.get("flow.skew_norm", 0.05)
+    scaled = flow_skew / norm if norm > 0 else 0.0
+    mult = 1.0 + cfg.get("flow.skew_coeff", 0.5) * math.copysign(
+        1.0, signed_notional
+    ) * scaled
+    return min(max(mult, 0.0), cfg.get("flow.skew_max", 3.0))
 
 
 def half_spread_fraction(

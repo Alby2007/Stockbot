@@ -20,3 +20,6 @@ RUN useradd --system --uid 10001 stockbot
 USER stockbot
 
 ENV PYTHONUNBUFFERED=1
+# The package is pip-installed to site-packages, so migrate.py's
+# repo-relative default doesn't exist here -- point it at the copy.
+ENV MIGRATIONS_DIR=/app/migrations

@@ -234,6 +234,14 @@ async def test_adv_shrinks_recorded_impact_delta(conn: AsyncConnection) -> None:
         )
     a, _ = await _sector_pair(conn)
     cap = await participation_cap(conn)
+    # The participation cap now binds on EFFECTIVE liquidity (Plan A):
+    # pin adv to the reference ratio so adv_mult lands at exactly 1 and
+    # the sizing below stays inside the cap.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE instruments SET adv = liquidity * 2.5e-8 WHERE id = %s",
+            (a["id"],),
+        )
     qty = max(1, int(cap * float(a["liquidity"]) * 0.5 / float(a["quoted_price"])))
 
     await execute_trade(

@@ -186,9 +186,13 @@ async def test_forced_close_bypasses_participation_cap(conn: AsyncConnection) ->
     await _grant_tier(conn, 5004, tier=3)
     ticker, liquidity = await _ticker_by_liquidity(conn, smallest=True)
     async with conn.cursor() as cur:
+        # adv at the reference ratio pins adv_mult at 1, so the effective
+        # liquidity the cap now binds on equals static liquidity -- the
+        # slices below keep their ~0.8x-cap sizing.
         await cur.execute(
             "UPDATE instruments SET init_margin_pct = 0.5, "
-            "maint_margin_pct = 0.3 WHERE ticker = %s RETURNING quoted_price",
+            "maint_margin_pct = 0.3, adv = liquidity * 2.5e-8 "
+            "WHERE ticker = %s RETURNING quoted_price",
             (ticker,),
         )
         (price,) = await cur.fetchone()

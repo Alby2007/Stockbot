@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 from psycopg import AsyncConnection
 
@@ -11,6 +13,7 @@ from stockbot.market.tick import apply_tick
 from stockbot.trading.errors import (
     DuplicateInteractionError,
     InstrumentHaltedError,
+    SlippageExceededError,
     UnknownInstrumentError,
 )
 from stockbot.trading.service import execute_trade
@@ -202,3 +205,46 @@ async def test_trade_prints_onto_the_latest_candle(conn: AsyncConnection) -> Non
     high, low, volume = row
     assert float(volume) == 10
     assert float(low) <= float(result.fill_price) <= float(high)
+
+
+async def test_slippage_cap_rejects_and_reports_the_would_be_fill(
+    conn: AsyncConnection,
+) -> None:
+    """B1: `max_slippage` is a marketable-limit collar -- a zero bound
+    rejects every fill (spread+impact always deviate from the mark), and
+    the error carries the would-be fill for the reply. A 100% bound is
+    today's behavior: fills unconditionally."""
+    account_id = await bootstrap_user(conn, 1010)
+    await _give_cash(conn, account_id, 1_000_000)
+    ticker = await _first_ticker(conn)
+    balance_before = await get_balance(conn, account_id)
+
+    with pytest.raises(SlippageExceededError) as excinfo:
+        await execute_trade(
+            conn, user_id=1010, ticker=ticker, side="BUY", quantity=5,
+            max_slippage=Decimal("0"),
+        )
+    assert excinfo.value.fill_price > 0
+    assert excinfo.value.mark > 0
+    assert float(excinfo.value.fill_price) != excinfo.value.mark
+
+    # Atomic: nothing settled, no position, no trade row.
+    assert await get_balance(conn, account_id) == balance_before
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT COUNT(*) FROM trades WHERE user_id = %s", (1010,)
+        )
+        (trade_count,) = await cur.fetchone()
+        await cur.execute(
+            "SELECT COUNT(*) FROM positions WHERE user_id = %s AND quantity <> 0",
+            (1010,),
+        )
+        (pos_count,) = await cur.fetchone()
+    assert trade_count == 0 and pos_count == 0
+
+    # A permissive bound fills normally.
+    result = await execute_trade(
+        conn, user_id=1010, ticker=ticker, side="BUY", quantity=5,
+        max_slippage=Decimal("1"),
+    )
+    assert result.quantity == 5

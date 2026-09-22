@@ -24,8 +24,10 @@ from stockbot.accounts.service import bootstrap_user
 from stockbot.admin.service import (
     TUNABLE_CONFIG_KEYS,
     TUNABLE_PARAMS,
+    add_instrument,
     admin_adjust,
     admin_cancel_order,
+    delist_instrument,
     ledger_audit,
     recalc_balances,
     set_config,
@@ -85,7 +87,7 @@ from stockbot.shorts.service import (
     open_bounded_short,
 )
 from stockbot.trading.errors import DuplicateInteractionError, TradingError
-from stockbot.trading.service import execute_trade
+from stockbot.trading.service import execute_trade, taker_fee_bps
 
 log = logging.getLogger("stockbot.bot.commands")
 
@@ -99,7 +101,19 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         async with db.connection() as conn:
             account_id = await bootstrap_user(conn, interaction.user.id)
             cash = await get_balance(conn, account_id)
-        await interaction.response.send_message(f"Cash balance: **{format_money(cash)}**")
+            fee_bps = await taker_fee_bps(conn, interaction.user.id)
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT total_traded_minor FROM users WHERE id = %s",
+                    (interaction.user.id,),
+                )
+                row = await cur.fetchone()
+            total_traded = int(row[0]) if row else 0
+        await interaction.response.send_message(
+            f"Cash balance: **{format_money(cash)}**\n"
+            f"Lifetime volume {format_money(total_traded)} — "
+            f"taker fee {fee_bps}bps (makers earn a rebate on crosses)"
+        )
 
     @tree.command(name="claim", description="Claim your daily faucet grant")
     async def claim(interaction: discord.Interaction) -> None:
@@ -204,21 +218,28 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         embed.add_field(name="Impact", value=format_pct(float(snapshot.impact)))
         bids, asks = depth
         if bids or asks:
-            lines = ["`   BID      | ASK     `"]
+            lines = ["`  size    px    cum | cum     px   size `"]
             for i in range(max(len(bids), len(asks))):
                 b = (
-                    f"{bids[i].quantity:>7,} {float(bids[i].price):>8.2f}"
+                    f"{bids[i].quantity:>6,} {float(bids[i].price):>7.2f}"
+                    f"{bids[i].cumulative:>7,}"
                     + ("~" if bids[i].synthetic else " ")
                     if i < len(bids)
-                    else " " * 17
+                    else " " * 22
                 )
                 a = (
-                    f"{float(asks[i].price):>8.2f} {asks[i].quantity:<7,}"
+                    f"{asks[i].cumulative:>5,} {float(asks[i].price):>7.2f}"
+                    f" {asks[i].quantity:<6,}"
                     + ("~" if asks[i].synthetic else "")
                     if i < len(asks)
                     else ""
                 )
                 lines.append(f"`{b}|{a}`")
+                if i == 0:
+                    # Inside market: the first row on each side is the
+                    # best resting level -- a divider separates it from
+                    # the depth behind it like a terminal ladder.
+                    lines.append("`   ─── inside ── | ── inside ───    `")
             embed.add_field(
                 name="Book depth (~ = MM)", value="\n".join(lines), inline=False
             )
@@ -229,6 +250,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
         if snapshot.is_halted:
             embed.add_field(name="Status", value="Halted (circuit breaker)")
+        elif snapshot.event_halted:
+            embed.add_field(
+                name="Status", value="Halted pending earnings (T1)"
+            )
         await interaction.response.send_message(embed=embed)
 
     @tree.command(name="chart", description="Show a price chart for an instrument")
@@ -319,7 +344,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
-                    SELECT i.ticker, e.resolve_tick
+                    SELECT i.ticker, e.resolve_tick, e.estimate
                     FROM events e
                     JOIN instruments i ON i.id = e.instrument_id
                     WHERE e.kind = 'EARNINGS' AND NOT e.resolved
@@ -338,7 +363,12 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
         lines = [
             f"{ticker:<6} in {(resolve_tick - current_tick) / TICKS_PER_DAY:>5.1f} day(s)"
-            for ticker, resolve_tick in rows
+            + (
+                f"   street {format_pct(float(estimate))}"
+                if estimate is not None
+                else ""
+            )
+            for ticker, resolve_tick, estimate in rows
         ]
         embed = discord.Embed(title="Earnings calendar")
         embed.description = "```\n" + "\n".join(lines) + "\n```"
@@ -348,10 +378,17 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def news(interaction: discord.Interaction) -> None:
         async with db.connection() as conn:
             current_tick = await current_tick_index(conn) or 0
+            # analyst_tools holders get a noisy size read on pending news
+            # (the magnitude exists pre-resolution but is hidden otherwise).
+            entitlements = await get_user_entitlements(conn, interaction.user.id)
+            has_desk = any(
+                e["item_key"] == "analyst_tools" and e["quantity"] > 0
+                for e in entitlements
+            )
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
-                    SELECT i.ticker, e.headline, e.resolve_tick
+                    SELECT i.ticker, e.headline, e.resolve_tick, e.magnitude
                     FROM events e
                     JOIN instruments i ON i.id = e.instrument_id
                     WHERE e.kind = 'NEWS' AND NOT e.resolved AND e.scheduled_tick <= %s
@@ -364,7 +401,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
                 await cur.execute(
                     """
-                    SELECT i.ticker, e.headline, e.magnitude
+                    SELECT i.ticker, e.headline, e.magnitude, e.fizzled
                     FROM events e
                     JOIN instruments i ON i.id = e.instrument_id
                     WHERE e.kind = 'NEWS' AND e.resolved AND e.resolve_tick > %s
@@ -375,18 +412,29 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 )
                 resolved = await cur.fetchall()
 
+        def _desk_read(magnitude: float | None) -> str:
+            """analyst_tools size hint: bucketed |magnitude| -- a fizzle
+            reads 'minor', indistinguishable from a small real move."""
+            if magnitude is None:
+                return ""
+            m = abs(float(magnitude))
+            bucket = "minor" if m < 0.01 else ("sizable" if m < 0.03 else "major")
+            return f" · desk: {bucket}"
+
         embed = discord.Embed(title="News")
         if pending:
             lines = [
                 f"[{ticker}] {headline} (effect lands in "
                 f"{(resolve_tick - current_tick) / 60:.1f}h)"
-                for ticker, headline, resolve_tick in pending
+                + (_desk_read(float(magnitude)) if has_desk else "")
+                for ticker, headline, resolve_tick, magnitude in pending
             ]
             embed.add_field(name="Pending", value="\n".join(lines)[:1024], inline=False)
         if resolved:
             lines = [
                 f"[{ticker}] {headline} \u2014 landed {format_pct(float(magnitude))}"
-                for ticker, headline, magnitude in resolved
+                + (" (rumor died)" if fizzled else "")
+                for ticker, headline, magnitude, fizzled in resolved
             ]
             embed.add_field(name="Recently resolved", value="\n".join(lines)[:1024], inline=False)
         if not pending and not resolved:
@@ -458,6 +506,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ticker="Instrument ticker",
         quantity="Number of shares",
         league="Trade from your season league stake instead of your main portfolio",
+        slippage="Max slippage vs the mark, in percent (e.g. 2.5)",
     )
     async def buy(
         interaction: discord.Interaction,
@@ -466,25 +515,33 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         # notional_minor into an uncaught NumericValueOutOfRange.
         quantity: app_commands.Range[int, 1, 1_000_000_000],
         league: bool = False,
+        slippage: app_commands.Range[float, 0.01, 100.0] | None = None,
     ) -> None:
-        await _do_trade(interaction, ticker, "BUY", quantity, league)
+        await _do_trade(interaction, ticker, "BUY", quantity, league, slippage)
 
     @tree.command(name="sell", description="Sell shares of an instrument")
     @app_commands.describe(
         ticker="Instrument ticker",
         quantity="Number of shares",
         league="Trade from your season league stake instead of your main portfolio",
+        slippage="Max slippage vs the mark, in percent (e.g. 2.5)",
     )
     async def sell(
         interaction: discord.Interaction,
         ticker: str,
         quantity: app_commands.Range[int, 1, 1_000_000_000],
         league: bool = False,
+        slippage: app_commands.Range[float, 0.01, 100.0] | None = None,
     ) -> None:
-        await _do_trade(interaction, ticker, "SELL", quantity, league)
+        await _do_trade(interaction, ticker, "SELL", quantity, league, slippage)
 
     async def _do_trade(
-        interaction: discord.Interaction, ticker: str, side: str, quantity: int, league: bool
+        interaction: discord.Interaction,
+        ticker: str,
+        side: str,
+        quantity: int,
+        league: bool,
+        slippage: float | None,
     ) -> None:
         async with db.connection() as conn:
             await bootstrap_user(conn, interaction.user.id)
@@ -507,6 +564,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     quantity=quantity,
                     interaction_id=str(interaction.id),
                     season_id=season_id,
+                    max_slippage=(
+                        None if slippage is None else Decimal(str(slippage)) / 100
+                    ),
                 )
             except InsufficientFundsError:
                 await interaction.response.send_message(
@@ -768,6 +828,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         stop: float | None,
         hours: float | None,
         league: bool,
+        display: int | None,
     ) -> None:
         if limit is None and stop is None:
             await interaction.response.send_message(
@@ -801,6 +862,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     ),
                     interaction_id=str(interaction.id),
                     stop_price=None if stop is None else Decimal(str(stop)),
+                    display_qty=display,
                 )
             except (TradingError, ValueError) as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
@@ -819,9 +881,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
         else:
             price_part = f"@ {format_price(result.limit_price or 0)}"
+        iceberg = (
+            f" (iceberg — showing {result.display_qty:,})"
+            if result.display_qty is not None
+            else ""
+        )
         await interaction.response.send_message(
             f"Order **#{result.order_id}** resting: {result.side} "
-            f"**{result.quantity}** {result.ticker} {price_part} "
+            f"**{result.quantity}** {result.ticker} {price_part}{iceberg} "
             f"({expiry}). Fills when the market reaches it."
         )
 
@@ -833,6 +900,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         stop="Trigger once the mark rises to this price",
         hours="Auto-expire after this many hours (omit for GTC)",
         league="Place the order in your league portfolio",
+        display="Iceberg: show only this many shares in the book",
     )
     async def order_buy(
         interaction: discord.Interaction,
@@ -843,9 +911,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         stop: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
         hours: app_commands.Range[float, 0.02, 8760.0] | None = None,
         league: bool = False,
+        display: app_commands.Range[int, 1, 1_000_000_000] | None = None,
     ) -> None:
         await _place_order(
-            interaction, ticker, "BUY", quantity, limit, stop, hours, league
+            interaction, ticker, "BUY", quantity, limit, stop, hours, league, display
         )
 
     @order_group.command(
@@ -859,6 +928,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         stop="Trigger once the mark falls to this price (stop-loss)",
         hours="Auto-expire after this many hours (omit for GTC)",
         league="Place the order in your league portfolio",
+        display="Iceberg: show only this many shares in the book",
     )
     async def order_sell(
         interaction: discord.Interaction,
@@ -868,9 +938,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         stop: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
         hours: app_commands.Range[float, 0.02, 8760.0] | None = None,
         league: bool = False,
+        display: app_commands.Range[int, 1, 1_000_000_000] | None = None,
     ) -> None:
         await _place_order(
-            interaction, ticker, "SELL", quantity, limit, stop, hours, league
+            interaction, ticker, "SELL", quantity, limit, stop, hours, league, display
         )
 
     @order_group.command(name="list", description="Show your resting orders")
@@ -903,9 +974,15 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             else:
                 price = f"@ {format_price(r['limit_price'])}"
             triggered = " [TRIGGERED]" if r["triggered_tick"] is not None else ""
+            iceberg = (
+                f" [iceberg->{min(r['display_qty'], remaining):,}]"
+                if r["display_qty"] is not None
+                else ""
+            )
             return (
                 f"#{r['id']:<4} {r['side']:<4} {remaining:>5} {r['ticker']:<6} "
-                f"{price:>24} (mark {format_price(r['quoted_price'])}){triggered}"
+                f"{price:>24} (mark {format_price(r['quoted_price'])})"
+                f"{triggered}{iceberg}"
             )
 
         lines = [_order_line(r) for r in rows]
@@ -1406,6 +1483,87 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.response.send_message(
             f"Season {season_id} closed.", ephemeral=True
         )
+
+    @admin_group.command(
+        name="instrument-add",
+        description="List a new instrument (sector-median params; never joins SBX-40)",
+    )
+    @app_commands.describe(
+        ticker="New ticker (<=10 chars, A-Z/0-9)",
+        name="Display name",
+        sector="Sector key, e.g. TECH",
+        base_price="Listing price in dollars",
+        sigma="Per-tick idiosyncratic vol (default: sector median)",
+        beta="Market-factor loading (default: sector median)",
+        gamma="Sector-factor loading (default: sector median)",
+        liquidity="Notional depth for impact scaling (default: sector median)",
+    )
+    async def admin_instrument_add(
+        interaction: discord.Interaction,
+        ticker: str,
+        name: str,
+        sector: str,
+        base_price: app_commands.Range[float, 0.0001, 1_000_000_000.0],
+        sigma: float | None = None,
+        beta: float | None = None,
+        gamma: float | None = None,
+        liquidity: float | None = None,
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            try:
+                instrument_id = await add_instrument(
+                    conn,
+                    ticker=ticker,
+                    name=name,
+                    sector_key=sector,
+                    base_price=base_price,
+                    sigma=sigma,
+                    beta=beta,
+                    gamma=gamma,
+                    liquidity=liquidity,
+                )
+            except (ValueError, TradingError) as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Listed **{ticker.upper()}** ({name}) at {format_price(Decimal(str(base_price)))} "
+            f"— instrument id {instrument_id}, active next tick.",
+            ephemeral=True,
+        )
+
+    @admin_group.command(
+        name="delist",
+        description="Delist an instrument: settles all positions/orders/shorts at the final mark",
+    )
+    @app_commands.describe(ticker="Instrument ticker")
+    async def admin_delist(interaction: discord.Interaction, ticker: str) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            try:
+                report = await delist_instrument(conn, ticker)
+            except (ValueError, TradingError) as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        lines = [
+            f"**{report.ticker}** delisted at mark {format_price(report.mark_price)}"
+            + (f" (tick {report.tick_index})" if report.tick_index is not None else ""),
+            f"Long positions settled: {report.positions_settled}",
+            f"Shorts covered: {report.shorts_covered}",
+            f"Bounded shorts settled: {report.bounded_shorts_settled}",
+            f"Open orders cancelled: {report.orders_cancelled}",
+            f"Pending events resolved: {report.events_resolved}",
+        ]
+        if report.fund_paid_minor or report.mm_absorbed_minor:
+            lines.append(
+                f"Cover shortfalls: fund paid {format_money(report.fund_paid_minor)}, "
+                f"MM absorbed {format_money(report.mm_absorbed_minor)}"
+            )
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     tree.add_command(admin_group)
 

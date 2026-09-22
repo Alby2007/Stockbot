@@ -37,6 +37,8 @@ from stockbot.market import engine
 from stockbot.market.data import (
     assert_feature_enabled,
     assert_market_open,
+    event_halt_lead_ticks,
+    event_halted,
     flow_config,
     half_spread_for,
     participation_cap,
@@ -47,14 +49,16 @@ from stockbot.market.data import (
 from stockbot.seasons.service import get_active_entry
 from stockbot.shorts.errors import ShortNotFoundError
 from stockbot.trading.errors import (
+    EventHaltedError,
     InstrumentHaltedError,
     InsufficientDepthError,
     NotInLeagueError,
     UnknownInstrumentError,
 )
 from stockbot.trading.service import (
-    FEE_BPS,
     _to_minor_units,
+    record_volume,
+    taker_fee_bps,
     update_candle_with_fill,
 )
 
@@ -109,11 +113,14 @@ async def _resolve_account(
 
 
 async def _lock_instrument(conn: AsyncConnection, ticker: str) -> dict[str, Any]:
+    """Lock + halt gates for OPENING a bounded short -- the only caller.
+    Covering keeps its own ungated path: closes stay legal in a halt."""
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
             SELECT id, base_price, impact, liquidity, adv, lambda_impact, max_impact,
                    is_active, circuit_halted_until_tick, short_knockout_pct,
+                   vol_state, flow_skew, next_halting_event_tick,
                    COALESCE(sigma_eff, sigma) AS sigma,
                    next_event_tick, last_halt_end_tick
             FROM instruments
@@ -127,6 +134,12 @@ async def _lock_instrument(conn: AsyncConnection, ticker: str) -> dict[str, Any]
         raise UnknownInstrumentError(ticker)
     if row["circuit_halted_until_tick"] is not None:
         raise InstrumentHaltedError(ticker)
+    if event_halted(
+        row["next_halting_event_tick"],
+        await _current_tick(conn),
+        await event_halt_lead_ticks(conn),
+    ):
+        raise EventHaltedError(ticker, int(row["next_halting_event_tick"]))
     return row
 
 
@@ -181,21 +194,29 @@ async def open_bounded_short(
             **await session_config(conn),
             **await flow_config(conn),
         }
+        liq_eff = engine.effective_liquidity(
+            float(instrument["liquidity"]),
+            float(instrument["adv"]),
+            spread_cfg,
+            float(instrument["vol_state"]),
+        )
+        half_spread = half_spread_for(instrument, tick, spread_cfg)
+        half_spread *= engine.flow_skew_mult(
+            -base_price * quantity, float(instrument["flow_skew"]), spread_cfg
+        )
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=float(instrument["impact"]),
             signed_notional=-base_price * quantity,  # sell-side pressure
-            liquidity=engine.effective_liquidity(
-                float(instrument["liquidity"]), float(instrument["adv"]), spread_cfg
-            ),
+            liquidity=liq_eff,
             lambda_impact=float(instrument["lambda_impact"]),
             max_impact=float(instrument["max_impact"]),
-            half_spread=half_spread_for(instrument, tick, spread_cfg),
+            half_spread=half_spread,
             tick_size=engine.tick_size(base_price, spread_cfg),
         )
         fill_price = Decimal(str(round(fill_price_f, 6)))
         await _assert_depth(
-            conn, ticker, fill_price, quantity, float(instrument["liquidity"])
+            conn, ticker, fill_price, quantity, liq_eff
         )
         knockout_pct = Decimal(str(instrument["short_knockout_pct"]))
         knockout_price = (fill_price * (1 + knockout_pct)).quantize(
@@ -203,8 +224,11 @@ async def open_bounded_short(
         )
 
         collateral_minor = _to_minor_units(fill_price * quantity * knockout_pct)
+        # Taker fee at the user's volume tier (Plan E) -- MM is the
+        # counterparty, so no maker rebate applies.
+        fee_bps = await taker_fee_bps(conn, user_id)
         fee_minor = _to_minor_units(
-            (fill_price * quantity * FEE_BPS / 10_000).quantize(
+            (fill_price * quantity * fee_bps / 10_000).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
         )
@@ -243,6 +267,7 @@ async def open_bounded_short(
             delta_impact=impact_after - float(instrument["impact"]),
             signed_notional_minor=-_to_minor_units(fill_price * quantity),
         )
+        await record_volume(conn, user_id, _to_minor_units(fill_price * quantity))
 
         async with conn.cursor() as cur:
             await cur.execute(
@@ -299,7 +324,7 @@ async def cover_bounded_short(
                 """
                 SELECT bs.id, bs.user_id, bs.instrument_id, bs.quantity, bs.entry_price,
                        bs.collateral_minor, i.ticker, i.base_price, i.impact,
-                       i.liquidity, i.adv,
+                       i.liquidity, i.adv, i.vol_state, i.flow_skew,
                        i.lambda_impact, i.max_impact, i.is_active, bs.season_id,
                        COALESCE(i.sigma_eff, i.sigma) AS sigma,
                        i.next_event_tick, i.last_halt_end_tick
@@ -322,16 +347,24 @@ async def cover_bounded_short(
             **await session_config(conn),
             **await flow_config(conn),
         }
+        liq_eff = engine.effective_liquidity(
+            float(short["liquidity"]),
+            float(short["adv"]),
+            spread_cfg,
+            float(short["vol_state"]),
+        )
+        half_spread = half_spread_for(short, tick, spread_cfg)
+        half_spread *= engine.flow_skew_mult(
+            base_price * quantity, float(short["flow_skew"]), spread_cfg
+        )
         fill_price_f, impact_after = engine.apply_trade_impact(
             base_price=base_price,
             impact_before=float(short["impact"]),
             signed_notional=base_price * quantity,  # buy-side pressure
-            liquidity=engine.effective_liquidity(
-                float(short["liquidity"]), float(short["adv"]), spread_cfg
-            ),
+            liquidity=liq_eff,
             lambda_impact=float(short["lambda_impact"]),
             max_impact=float(short["max_impact"]),
-            half_spread=half_spread_for(short, tick, spread_cfg),
+            half_spread=half_spread,
             tick_size=engine.tick_size(base_price, spread_cfg),
         )
         close_price = Decimal(str(round(fill_price_f, 6)))
@@ -340,7 +373,7 @@ async def cover_bounded_short(
             str(short["ticker"]),
             close_price,
             quantity,
-            float(short["liquidity"]),
+            liq_eff,
         )
 
         entry_price = Decimal(short["entry_price"])
@@ -371,6 +404,7 @@ async def cover_bounded_short(
             delta_impact=impact_after - float(short["impact"]),
             signed_notional_minor=_to_minor_units(close_price * quantity),
         )
+        await record_volume(conn, user_id, _to_minor_units(close_price * quantity))
 
         async with conn.cursor() as cur:
             await cur.execute(

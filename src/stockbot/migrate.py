@@ -12,15 +12,29 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 import psycopg
 
-MIGRATIONS_DIR = Path(__file__).resolve().parent.parent.parent / "migrations"
+# Resolved from the package location for repo/dev checkouts; in the Docker
+# image the package is pip-installed under site-packages so the repo layout
+# doesn't exist -- the Dockerfile sets MIGRATIONS_DIR=/app/migrations.
+MIGRATIONS_DIR = Path(
+    os.environ.get("MIGRATIONS_DIR")
+    or Path(__file__).resolve().parent.parent.parent / "migrations"
+)
 
 
 def _migration_files() -> list[Path]:
+    if not MIGRATIONS_DIR.is_dir():
+        # Loud failure, not a silent no-op: "No pending migrations" must
+        # mean the DB is current, not that the directory is missing.
+        raise FileNotFoundError(
+            f"migrations directory not found: {MIGRATIONS_DIR} "
+            "(set MIGRATIONS_DIR)"
+        )
     return sorted(MIGRATIONS_DIR.glob("*.sql"), key=lambda p: p.name)
 
 

@@ -14,15 +14,20 @@ migration 0013's `instruments_engine_params_sane` CHECK.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
 
+import psycopg
 from psycopg import AsyncConnection
+from psycopg.rows import dict_row
 
 from stockbot.ledger.service import (
     get_system_account_id,
     get_user_account_id,
     post_transfer,
 )
+from stockbot.margin.service import _fund_balance, _record_fund_flow
 from stockbot.trading.errors import UnknownInstrumentError
 
 # Inclusive (min, max) bounds per tunable parameter, mirrored by the
@@ -143,6 +148,13 @@ CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "dividend.max_yield": (0.0, 1.0),
     "dividend.min_yield": (0.0, 1.0),
     "dividend.payer_pct": (0.0, 100.0),  # percent of instruments, not a fraction
+    "earnings.est_sigma": (0.0, 1.0),
+    "event.halt_lead_ticks": (0.0, 120.0),
+    "fee.maker_rebate_bps": (0.0, 1e4),
+    "fee.tier1_bps": (0.0, 1e4),
+    "fee.tier1_volume": (0.0, 1e15),
+    "fee.tier2_bps": (0.0, 1e4),
+    "fee.tier2_volume": (0.0, 1e15),
     "impact.participation_cap": (1e-6, 1.0),
     "margin.borrow_fee_bps_per_tick": (0.0, 1e6),
     "margin.borrow_util_k": (0.0, 1e6),
@@ -155,6 +167,7 @@ CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "order.max_fill_failures": (1, 1e6),
     "order.stop_cascade_max_iters": (1, 1e4),
     "orders.enabled": (0, 1),
+    "session.auction_ticks": (0, 240),
     "session.closed_ticks": (0, 1440),
     "session.open_impact_reset": (0.0, 1.0),
     "session.open_ticks": (0, 1440),
@@ -182,9 +195,15 @@ CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "flow.cross_impact_coeff": (0.0, 1.0),
     "flow.max_fundamental_move": (0.0, 1.0),
     "flow.permanent_frac": (0.0, 1.0),
+    "flow.skew_coeff": (0.0, 10.0),
+    "flow.skew_decay": (0.0, 0.9999),
+    "flow.skew_max": (0.0, 100.0),
+    "flow.skew_norm": (1e-9, 1.0),
+    "flow.vol_liq_coeff": (0.0, 10.0),
     "mom.innov_frac": (0.0, 10.0),
     "mom.max_frac": (0.0, 10.0),
     "mom.rho": (0.0, 0.999999),
+    "news.fizzle_pct": (0.0, 0.9),
     "trading.enabled": (0, 1),
     "vol.account_flow_cap": (0.0, 1.0),
     "vol.clip_max": (0.01, 100.0),
@@ -282,3 +301,487 @@ async def recalc_balances(conn: AsyncConnection) -> int:
             """
         )
         return cur.rowcount
+
+
+# --- Instrument lifecycle (Plan F) -----------------------------------------
+
+_TICKER_RE = re.compile(r"^[A-Z0-9]{1,10}$")
+
+# Params pulled from sector medians when not given at list time. Interpolated
+# into _sector_medians' SQL, so this tuple doubles as the allow-list there.
+_MEDIAN_COLUMNS = (
+    "drift",
+    "sigma",
+    "beta",
+    "gamma",
+    "kappa",
+    "fundamental_sigma",
+    "liquidity",
+    "lambda_impact",
+    "tau_ticks",
+    "max_impact",
+    "init_margin_pct",
+    "maint_margin_pct",
+    "short_knockout_pct",
+    "float_shares",
+)
+
+# Params an admin can override at list time (validated against PARAM_BOUNDS).
+_LISTABLE_OVERRIDES = ("sigma", "beta", "gamma", "liquidity")
+
+
+async def _sector_medians(conn: AsyncConnection, sector_id: int) -> dict[str, float]:
+    """Per-column medians over the sector's live STOCK rows, falling back to
+    the whole market if the sector is empty (fresh sector, or everything in
+    it delisted). Column names come from _MEDIAN_COLUMNS, not user input."""
+    cols = ", ".join(
+        f"percentile_cont(0.5) WITHIN GROUP (ORDER BY {c}) AS {c}"
+        for c in _MEDIAN_COLUMNS
+    )
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            f"SELECT {cols} FROM instruments "  # noqa: S608
+            "WHERE kind = 'STOCK' AND is_active AND sector_id = %s",
+            (sector_id,),
+        )
+        row = await cur.fetchone()
+        if row is None or row["sigma"] is None:
+            await cur.execute(
+                f"SELECT {cols} FROM instruments "  # noqa: S608
+                "WHERE kind = 'STOCK' AND is_active"
+            )
+            row = await cur.fetchone()
+    assert row is not None and row["sigma"] is not None, "no listed instruments to copy"
+    return {k: float(v) for k, v in row.items()}
+
+
+async def add_instrument(
+    conn: AsyncConnection,
+    *,
+    ticker: str,
+    name: str,
+    sector_key: str,
+    base_price: float,
+    sigma: float | None = None,
+    beta: float | None = None,
+    gamma: float | None = None,
+    liquidity: float | None = None,
+) -> int:
+    """List a new instrument. Unspecified engine params default to the
+    sector's medians (market-wide for an empty sector). New listings never
+    join the SBX-40 basket -- index_member stays FALSE (0031). Candles and
+    the earnings/dividend schedulers pick it up on the next open tick."""
+    ticker = ticker.strip().upper()
+    if not _TICKER_RE.fullmatch(ticker):
+        raise ValueError(f"ticker {ticker!r} must be 1-10 chars of A-Z/0-9")
+    if not name.strip():
+        raise ValueError("name is required")
+    if not math.isfinite(base_price) or base_price <= 0:
+        raise ValueError(f"base_price must be positive and finite; got {base_price}")
+    overrides = {"sigma": sigma, "beta": beta, "gamma": gamma, "liquidity": liquidity}
+    params: dict[str, float] = {}
+    for key, value in overrides.items():
+        if value is None:
+            continue
+        lo, hi = PARAM_BOUNDS[key]
+        if not math.isfinite(value) or not lo <= value <= hi:
+            raise ValueError(f"{key} must be within [{lo}, {hi}]; got {value}")
+        params[key] = value
+
+    async with conn.transaction():
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT id, key FROM sectors WHERE upper(key) = upper(%s)",
+                (sector_key.strip(),),
+            )
+            sector = await cur.fetchone()
+        if sector is None:
+            raise ValueError(f"unknown sector {sector_key!r}")
+        if sector["key"] == "index":
+            raise ValueError("cannot list into the index sector")
+        sector_id = int(sector["id"])
+
+        defaults = await _sector_medians(conn, sector_id)
+        defaults.update(params)
+        p = defaults
+        # Warm-start adv at the neutral reference (adv_mult = 1.0): a
+        # zero-adv listing would open at the adv_mult_min floor (~half
+        # depth) until the sliding window filled.
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT value FROM config WHERE key = 'flow.adv_ref_frac'"
+            )
+            ref_row = await cur.fetchone()
+        adv_seed = p["liquidity"] * (float(ref_row[0]) if ref_row else 2.5e-8)
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO instruments (
+                        ticker, name, sector_id, kind,
+                        drift, sigma, beta, gamma, kappa, fundamental_sigma,
+                        liquidity, lambda_impact, tau_ticks, max_impact,
+                        fundamental_value, base_price, impact, quoted_price,
+                        init_margin_pct, maint_margin_pct, float_shares,
+                        index_member, short_knockout_pct, adv
+                    ) VALUES (
+                        %s, %s, %s, 'STOCK',
+                        %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, 0, %s,
+                        %s, %s, %s,
+                        FALSE, %s, %s
+                    )
+                    RETURNING id
+                    """,
+                    (
+                        ticker,
+                        name.strip(),
+                        sector_id,
+                        p["drift"],
+                        p["sigma"],
+                        p["beta"],
+                        p["gamma"],
+                        p["kappa"],
+                        p["fundamental_sigma"],
+                        p["liquidity"],
+                        p["lambda_impact"],
+                        p["tau_ticks"],
+                        p["max_impact"],
+                        base_price,
+                        base_price,
+                        base_price,
+                        p["init_margin_pct"],
+                        p["maint_margin_pct"],
+                        round(p["float_shares"]),
+                        p["short_knockout_pct"],
+                        adv_seed,
+                    ),
+                )
+                row = await cur.fetchone()
+        except psycopg.errors.UniqueViolation:
+            raise ValueError(f"ticker {ticker} is already listed") from None
+    assert row is not None
+    return int(row[0])
+
+
+@dataclass(frozen=True)
+class DelistReport:
+    ticker: str
+    mark_price: Decimal
+    tick_index: int | None
+    positions_settled: int
+    shorts_covered: int
+    bounded_shorts_settled: int
+    orders_cancelled: int
+    events_resolved: int
+    fund_paid_minor: int
+    mm_absorbed_minor: int
+
+
+async def delist_instrument(conn: AsyncConnection, ticker: str) -> DelistReport:
+    """Delist an instrument and settle every exposure at the final mark,
+    in one transaction. Settlement is immediate: halted or closed-market
+    delists use the current quoted_price rather than waiting for an open
+    tick (a halted book is already frozen at that mark, and waiting would
+    strand the cleanup on the session clock).
+
+    Money flow mirrors _liquidate_leg minus impact/spread/fees -- this is
+    a fixed-mark settlement, not a trade through depth. MARKET_MAKER pays
+    longs the mark; shorts pay the cover with the insurance fund and then
+    MM absorbing any shortfall. Borrow fees (SINK) and accrued dividends
+    (MM) rank ahead of the cover leg. Bounded shorts settle at intrinsic
+    value, open orders cancel, and pending events resolve as no-ops.
+    """
+    ticker = ticker.strip().upper()
+    async with conn.transaction():
+        async with conn.cursor(row_factory=dict_row) as cur:
+            # Lock ordering: instruments before accounts, sorted by id.
+            # The INDEX row rides along for the divisor adjustment.
+            await cur.execute(
+                """
+                SELECT id, ticker, kind, is_active, quoted_price,
+                       index_member, index_divisor, base_price
+                FROM instruments
+                WHERE ticker = %s OR kind = 'INDEX'
+                ORDER BY id
+                FOR UPDATE
+                """,
+                (ticker,),
+            )
+            locked = await cur.fetchall()
+        target = next((r for r in locked if r["ticker"] == ticker), None)
+        index = next((r for r in locked if r["kind"] == "INDEX"), None)
+        if target is None:
+            raise UnknownInstrumentError(ticker)
+        if not target["is_active"]:
+            raise ValueError(f"{ticker} is already delisted")
+        iid = int(target["id"])
+        mark = Decimal(target["quoted_price"])
+
+        # Index continuity (0031): a member leaving the basket shifts the
+        # level unless the divisor is re-based -- the same mechanic real
+        # index providers use on fast-track deletions. Refuse to empty the
+        # basket outright (a zero level would hit the positive-prices CHECK
+        # on the next tick).
+        if target["index_member"]:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT COALESCE(SUM(i.float_shares * i.quoted_price), 0)
+                    FROM instruments i
+                    WHERE i.kind = 'STOCK' AND i.index_member AND i.is_active
+                      AND i.id <> %s
+                    """,
+                    (iid,),
+                )
+                basket_row = await cur.fetchone()
+            basket_after = float(basket_row[0]) if basket_row else 0.0
+            if basket_after <= 0:
+                raise ValueError("cannot delist the last index constituent")
+            assert index is not None and index["index_divisor"] is not None
+            divisor_new = Decimal(str(basket_after)) / Decimal(index["base_price"])
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE instruments SET index_divisor = %s WHERE id = %s",
+                    (divisor_new, int(index["id"])),
+                )
+
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT MAX(tick_index) FROM market_ticks")
+            tick_row = await cur.fetchone()
+            tick = int(tick_row[0]) if tick_row and tick_row[0] is not None else None
+
+            await cur.execute(
+                "UPDATE orders SET status = 'CANCELLED' "
+                "WHERE instrument_id = %s AND status = 'OPEN'",
+                (iid,),
+            )
+            orders_cancelled = cur.rowcount
+            # resolve_due_events doesn't check is_active -- left pending, a
+            # DIVIDEND would keep rescheduling onto a dead instrument.
+            await cur.execute(
+                "UPDATE events SET resolved = TRUE "
+                "WHERE instrument_id = %s AND NOT resolved",
+                (iid,),
+            )
+            events_resolved = cur.rowcount
+            # Stale flow rows would sit until the next tick consumed them;
+            # the instrument never steps again.
+            await cur.execute(
+                "DELETE FROM pending_flow WHERE instrument_id = %s", (iid,)
+            )
+
+        mm_id = await get_system_account_id(conn, "MARKET_MAKER")
+        sink_id = await get_system_account_id(conn, "SINK")
+        fund_id = await get_system_account_id(conn, "INSURANCE_FUND")
+
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT p.id, p.quantity, p.borrow_fees_accrued, p.dividends_accrued,
+                       a.id AS account_id, a.balance
+                FROM positions p
+                JOIN accounts a ON a.user_id = p.user_id
+                  AND a.season_id IS NOT DISTINCT FROM p.season_id
+                  AND a.kind <> 'SYSTEM'
+                WHERE p.instrument_id = %s AND p.quantity <> 0
+                ORDER BY p.id
+                FOR UPDATE OF p
+                """,
+                (iid,),
+            )
+            positions = await cur.fetchall()
+            await cur.execute(
+                "SELECT COUNT(*) AS n FROM positions "
+                "WHERE instrument_id = %s AND quantity <> 0",
+                (iid,),
+            )
+            total_row = await cur.fetchone()
+            total_positions = int(total_row["n"]) if total_row else 0
+        if len(positions) != total_positions:
+            raise ValueError(
+                f"{ticker}: {total_positions - len(positions)} position(s) "
+                "have no matching account -- refusing to strand them"
+            )
+
+        settled = covered = 0
+        fund_paid = mm_absorbed = 0
+        for pos in positions:
+            qty = int(pos["quantity"])
+            account_id = int(pos["account_id"])
+            cash = int(pos["balance"])
+            if qty > 0:
+                payout = int(
+                    (Decimal(qty) * mark * 100).quantize(Decimal("1"), ROUND_HALF_UP)
+                )
+                if payout > 0:
+                    await post_transfer(
+                        conn,
+                        from_account_id=mm_id,
+                        to_account_id=account_id,
+                        amount=payout,
+                        reason="DELIST_PAYOUT",
+                        memo=ticker,
+                    )
+                settled += 1
+            else:
+                # Carry debts rank ahead of the cover leg: borrow fees to
+                # SINK, accrued dividends to MARKET_MAKER, both limited by
+                # cash on hand (unpaid accrual dies with the position, same
+                # as the liquidation path).
+                fee_minor = int(
+                    Decimal(pos["borrow_fees_accrued"]).quantize(
+                        Decimal("1"), ROUND_HALF_UP
+                    )
+                )
+                paid = min(fee_minor, cash)
+                if paid > 0:
+                    await post_transfer(
+                        conn,
+                        from_account_id=account_id,
+                        to_account_id=sink_id,
+                        amount=paid,
+                        reason="BORROW_FEE",
+                        memo=ticker,
+                    )
+                    cash -= paid
+                div_minor = int(
+                    Decimal(pos["dividends_accrued"]).quantize(
+                        Decimal("1"), ROUND_HALF_UP
+                    )
+                )
+                paid = min(div_minor, cash)
+                if paid > 0:
+                    await post_transfer(
+                        conn,
+                        from_account_id=account_id,
+                        to_account_id=mm_id,
+                        amount=paid,
+                        reason="DIVIDEND",
+                        memo=ticker,
+                    )
+                    cash -= paid
+                cost_minor = int(
+                    (Decimal(-qty) * mark * 100).quantize(Decimal("1"), ROUND_HALF_UP)
+                )
+                user_pays = min(cost_minor, cash)
+                if user_pays > 0:
+                    await post_transfer(
+                        conn,
+                        from_account_id=account_id,
+                        to_account_id=mm_id,
+                        amount=user_pays,
+                        reason="DELIST_COVER",
+                        memo=ticker,
+                    )
+                shortfall = cost_minor - user_pays
+                if shortfall > 0:
+                    pays = min(await _fund_balance(conn, fund_id), shortfall)
+                    if pays > 0:
+                        await post_transfer(
+                            conn,
+                            from_account_id=fund_id,
+                            to_account_id=mm_id,
+                            amount=pays,
+                            reason="DELIST_COVER_FUND",
+                            memo=ticker,
+                        )
+                        await _record_fund_flow(
+                            conn, -pays, "COVER_SHORTFALL", None, tick
+                        )
+                        fund_paid += pays
+                    residual = shortfall - pays
+                    if residual > 0:
+                        # MM absorbs the rest -- the cover it was owed just
+                        # isn't paid. Recorded like a liquidation ADL.
+                        await _record_fund_flow(
+                            conn, 0, "ADL", None, tick, mm_absorbed_minor=residual
+                        )
+                        mm_absorbed += residual
+                covered += 1
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE positions
+                    SET quantity = 0, avg_cost = 0, borrow_fees_accrued = 0,
+                        dividends_accrued = 0, updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (int(pos["id"]),),
+                )
+
+        # Bounded shorts settle at intrinsic value: collateral + Q*(entry -
+        # mark), floored at 0 -- the same formula a voluntary cover or a
+        # knockout computes, at the final mark.
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT bs.id, bs.quantity, bs.entry_price, bs.collateral_minor,
+                       a.id AS account_id
+                FROM bounded_shorts bs
+                JOIN accounts a ON a.user_id = bs.user_id
+                  AND a.season_id IS NOT DISTINCT FROM bs.season_id
+                  AND a.kind <> 'SYSTEM'
+                WHERE bs.instrument_id = %s AND bs.status = 'OPEN'
+                ORDER BY bs.id
+                FOR UPDATE OF bs
+                """,
+                (iid,),
+            )
+            bshorts = await cur.fetchall()
+        for bs in bshorts:
+            intrinsic = (
+                Decimal(int(bs["collateral_minor"]))
+                + Decimal(int(bs["quantity"]))
+                * (Decimal(bs["entry_price"]) - mark)
+                * 100
+            ).quantize(Decimal("1"), ROUND_HALF_UP)
+            payout = max(0, int(intrinsic))
+            if payout > 0:
+                await post_transfer(
+                    conn,
+                    from_account_id=mm_id,
+                    to_account_id=int(bs["account_id"]),
+                    amount=payout,
+                    reason="BSHORT_PAYOUT",
+                    memo=ticker,
+                )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE bounded_shorts
+                    SET status = 'DELISTED', closed_tick = %s,
+                        close_price = %s, payout_minor = %s
+                    WHERE id = %s
+                    """,
+                    (tick, mark, payout, int(bs["id"])),
+                )
+
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE instruments SET
+                    is_active = FALSE,
+                    delisted_tick = %s,
+                    circuit_halted_until_tick = NULL,
+                    next_event_tick = NULL,
+                    next_halting_event_tick = NULL,
+                    short_interest_pct = 0
+                WHERE id = %s
+                """,
+                (tick, iid),
+            )
+
+    return DelistReport(
+        ticker=ticker,
+        mark_price=mark,
+        tick_index=tick,
+        positions_settled=settled,
+        shorts_covered=covered,
+        bounded_shorts_settled=len(bshorts),
+        orders_cancelled=orders_cancelled,
+        events_resolved=events_resolved,
+        fund_paid_minor=fund_paid,
+        mm_absorbed_minor=mm_absorbed,
+    )

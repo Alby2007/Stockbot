@@ -266,12 +266,40 @@ silently drops the change). H4 ADV: `instruments.adv` is a sliding-
 window SMA of per-tick notional volume (candles volume*close over
 `flow.adv_window_ticks`), updated once per tick after all fill paths
 by adding the newest tick's notional and subtracting the window-edge
-tick's. `engine.effective_liquidity` scales liquidity for IMPACT only
-by clip(adv/(L·flow.adv_ref_frac), mult_min, mult_max) — dead tape
-halves L (2x impact), frenzied doubles it; the participation cap and
-_assert_depth stay on static liquidity (finding 7's death-spiral
-guard). adv_ref_frac ≈ 2.5e-8 was measured as the sim's mean
-ADV/liquidity ratio so the multiplier centers near 1.
+tick's. `engine.effective_liquidity` scales liquidity by
+clip(adv/(L·flow.adv_ref_frac), mult_min, mult_max) — dead tape
+halves L (2x impact), frenzied doubles it — and (Plan A) by
+`(1/max(1, vol_state)) ** flow.vol_liq_coeff`: storm regimes thin the
+book, calm tapes never deepen past the ADV term. adv_ref_frac ≈ 2.5e-8
+was measured as the sim's mean ADV/liquidity ratio so the multiplier
+centers near 1. adv is WARM-STARTED, not zero-seeded: 0032 backfills
+existing rows to `liquidity·adv_ref_frac` (neutral mult = 1.0) and
+`add_instrument` seeds the same — a cold start otherwise sits at the
+adv_mult_min floor (~half depth) for the whole 7,200-tick window.
+
+Flow-responsive MM notes (Plan A, migration 0026): the participation
+cap binds on EFFECTIVE liquidity everywhere now (execute_trade,
+_assert_depth, pass-2 order sizing, book_depth MM rungs) — storms
+shrink both impact liquidity AND the per-tick fill budget, replacing
+finding 7's static-cap guard (the death spiral it prevented is now
+bounded by vol.clip_max: liq_eff >= L·adv_min/4). Forced liquidation
+still bypasses the cap entirely. `instruments.flow_skew` is an EWMA
+(decay `flow.skew_decay`, innovation 1-decay) of each instrument's
+bounded OWN flow written per tick by apply_tick — own flow only, not
+cross-impact (peer sympathy isn't this name's tape). Every MM fill
+path multiplies its half-spread by `engine.flow_skew_mult(signed,
+skew, cfg)`: the side matching the tape pays up to
+flow.skew_coeff·(skew/flow.skew_norm) extra, contra side discounts
+(floor 0, ceiling flow.skew_max). /stock's bid/ask and book_depth
+quote legs are asymmetric via `engine.quote_ticks_skewed` (bid leg =
+sell-side half, ask leg = buy-side half). Margin liquidation legs pay
+the skew + storm liquidity like any MM fill but are never capped.
+adv is warm-started to the ref ratio (mult 1) — see the H4 note — but
+tests sizing fills against the cap should still pin `adv` explicitly
+(= liquidity·2.5e-8) so they don't break if the window's real flow has
+already moved it; sustained-buy tests must recompute size per fill
+because the whale's own flow raises vol_state and shrinks the cap
+mid-loop (see _cap_size_qty in test_vol_regimes.py).
 
 Momentum/book notes (Phase I): `instruments.drift_state` is an AR(1)
 additive drift regime (I1) -- `step_instrument` now makes THREE sampler
@@ -290,9 +318,123 @@ comparisons must restore drift_state too (same trap as vol_state in
 test_tick.py). I2: `book_depth()` in market/data.py renders the /stock
 book -- real LIMIT + triggered levels (season_id IS NULL only; league
 books are a separate book entirely), best-first, padded outward with
-synthetic MM rungs sized at participation_cap*liquidity/mark/levels per
-rung. Untriggered stops are invisible to the matcher and so to the
-book.
+synthetic MM rungs sized at
+participation_cap*effective_liquidity/mark/levels per rung (Plan A:
+storm-thinned effective liquidity, not static). Untriggered stops are
+invisible to the matcher and so to the book.
+
+Fee notes (Plan E, migration 0027): `_apply_fill` prices the fee off
+`maker_taker` — MAKER legs pay 0 and TAKER legs split their tiered fee
+into a MAKER_REBATE transfer (counterparty account = the maker's) plus
+the TRADE_FEE SINK remainder; `trades.maker_rebate_minor` records the
+split. MM fills (maker_taker NULL) and liquidation legs keep the flat
+FEE_BPS — liquidation is a safety net, not a fee tier user. Taker rate
+is `taker_fee_bps(user_id)` — lifetime `users.total_traded_minor` across
+main+league accounts vs `fee.tier{1,2}_volume` → `fee.tier{1,2}_bps`,
+read BEFORE the fill's volume accrues so the crossing fill itself pays
+the old rate. `record_volume` accrues notional per fill; bounded shorts
+call it directly (they settle outside _apply_fill). Rebate is clamped
+to the taker's own bps — the maker can never be paid more than was
+collected (at clamp, fee_transfer_id is NULL and SINK sees nothing).
+`/balance` shows the tier.
+
+Information notes (Plan D, migration 0028): `events.estimate` is the
+public street consensus for an EARNINGS event — drawn at scheduling
+(`schedule_initial_earnings` and the rolling reschedule both draw
+`N(0, earnings.est_sigma)` AFTER the timing draw, ordered by
+instrument id) and shown on `/calendar`. At resolution the pre-existing
+`N(0, EARNINGS_SHOCK_SIGMA)` draw is now the SURPRISE term: realized
+`magnitude = estimate + surprise` is stored back onto the resolved row —
+earnings move on surprise-vs-consensus, and `/calendar` tells you what's
+priced in. `news.fizzle_pct` (default 0.25, bounds 0–0.9): in
+`maybe_create_news` the fizzle uniform is drawn BEFORE the magnitude
+normal (unconditional draw count) — a fizzled rumor keeps its headline
+and resolution timing, magnitude is shrunk 10× (not zeroed — a fizzle
+should read like a tiny real move, not a detectable null), and
+`events.fizzled` records it for post-resolution `/news` labeling
+("rumor died"); pre-resolution reads never select the flag.
+`analyst_tools` holders get a bucketed desk-read ("minor/sizable/major")
+on pending `/news` magnitude — it leaks size but can't distinguish a
+fizzle from a small real move, which is the intended edge.
+
+Execution notes (Plan B, migration 0029): `execute_trade` takes an
+optional `max_slippage` fraction — the fill is rejected
+(SlippageExceededError, carrying the would-be fill and mark) when
+|fill/mark − 1| exceeds it; the mark is base·exp(impact_before), i.e.
+the pre-fill displayed mark, not the submit-time quote. Only `/buy`
+`/sell` pass it (`slippage:` percent option); matching and liquidation
+paths leave it unset — resting orders have their own limit checks and
+forced flows must fill. `orders.display_qty` (NULL = fully displayed)
+caps the size the `/stock` ladder shows per level — the aggregation is
+`SUM(LEAST(display_qty, remaining))` so the visible slice refills as
+fills drain it, while the matcher works real remaining quantity.
+`DepthLevel.cumulative` is the running displayed-size total per side;
+the `/stock` render shows size/price/cum per side with an "inside"
+divider under the top row. `display_qty` is validated 1..quantity at
+placement and by a column CHECK.
+
+Session-auction & event-halt notes (Plan C, migration 0030):
+`session.auction_ticks` (0 disables) -- a real window: on EACH of the
+last N open ticks (`ticks_until_close <= N`)
+`match_orders(closing_auction=True)` runs `_auction_clear` per book
+instead of the continuous loop and skips the MM fallback entirely.
+Clearing price = the candidate maximizing executable volume over the
+union of resting limits + the snapped open_mark; ties break toward
+open_mark then lower. A maximizing price outside `cross.collar_pct` of
+the open mark is clamped to the collar boundary (grid-snapped, then one
+tick back toward the mark if nearest-grid rounding overshot the
+boundary), not abandoned. All pairs print at the SAME price through
+`_settle_cross` (maker/taker + rebate still apply -- the earlier order
+is the maker even though nobody "takes"). Stops triggered by the print
+can clear in a later cascade-loop auction iteration. Per-tick auction
+fill count persists to `market_ticks.auction_fills` (0032).
+`instruments.next_halting_event_tick` = MIN resolve_tick over
+unresolved EARNINGS only, maintained by refresh_next_event_ticks in the
+same UPDATE as next_event_tick (dividends are mechanical, news is
+unscheduled -- neither halts). `event_halted(tick, now, lead)` +
+`event_halt_lead_ticks()` in market/data.py are the shared gate:
+`event.halt_lead_ticks` (0 disables). execute_trade applies the same
+risk-reducing exemption as circuit halts (EventHaltedError only when
+the fill grows exposure); place_order rejects outright (consistent with
+closed-market placement); shorts' `_lock_instrument` gates opens while
+cover stays ungated. In match_orders, pass-1 skips event-halted books
+entirely (frozen book, like circuit halts) while pass-2 lets
+execute_trade decide per fill -- a resting order that reduces risk can
+still MM-fill inside the window, and EventHaltedError joins the
+transient (no-strike) catch. The gate self-opens on resolution: the
+aggregate rolls to the next earnings ~30d out.
+
+Lifecycle notes (Plan F, migration 0031): `instruments.index_member` is
+the fixed SBX-40 basket -- the tick's index level is computed from live
+rows (`kind != 'INDEX' AND index_member` among the is_active set), so
+without the flag a listing would silently join the index and a delisted
+member would silently leave a hole. Seeded STOCK rows got TRUE; listings
+stay FALSE in v1. `admin/service.py` owns both ends:
+`add_instrument` defaults unspecified params to the sector's medians
+(`percentile_cont`, market-wide fallback for an empty sector), validates
+overrides against PARAM_BOUNDS, and refuses the `index` sector (stored
+lowercase -- sector lookup is case-insensitive because of it).
+`delist_instrument` settles at the current quoted_price IMMEDIATELY in
+one transaction -- halted/closed-market delists don't wait for an open
+tick (a halted book is already frozen at that mark anyway). The sweep:
+cancel OPEN orders (all scopes), mark unresolved events resolved
+(required, not cosmetic -- `resolve_due_events` never checks is_active,
+so a pending DIVIDEND would otherwise keep rescheduling onto a dead
+instrument), delete pending_flow rows, then positions: longs get
+MM->account 'DELIST_PAYOUT' of qty*mark; shorts pay carry debts first
+(borrow_fees -> SINK, dividends -> MM, cash-limited like liquidation)
+then the cover (account -> MM 'DELIST_COVER', shortfall -> fund pays
+'COVER_SHORTFALL' flow, residual -> 'ADL' mm_absorbed). Bounded shorts
+settle at intrinsic (collateral + Q*(entry-mark), floored 0) under a new
+'DELISTED' status -- NOT 'KNOCKED_OUT' (that status means wiped).
+Positions are zeroed, not deleted (matches the upsert convention). No
+fee, spread, or impact anywhere in the sweep -- it's settlement, not a
+trade through depth. Member delists re-base `index_divisor =
+basket_after / index.base_price` for level continuity (the real index
+mechanic); delisting the last constituent is refused outright since an
+empty basket would produce level 0 and trip the positive-prices CHECK
+next tick. `/admin instrument-add` and `/admin delist` expose both; the
+delist report counts every settlement path.
 
 Margin design notes: cash stays >= 0 (the USER/LEAGUE balance CHECK is
 preserved -- short proceeds credit to cash and are spendable; leverage is
@@ -491,3 +633,11 @@ docker logs stockbot-market-1    # "acquired singleton advisory lock..."
 
 Tests need a real Postgres (`TEST_DATABASE_URL`) — no SQLite fallback, by
 design (row-locking/concurrency behavior can't be expressed there).
+
+Ops gotcha: `migrate.py`/`doctor.py` resolve `MIGRATIONS_DIR` from
+`__file__` (repo layout) — inside the Docker image the package is
+pip-installed under site-packages, so the Dockerfile sets
+`MIGRATIONS_DIR=/app/migrations`. Both tools now fail loudly when the
+dir is missing; before that guard the migrate service silently printed
+"No pending migrations" and exited 0 while the prod schema stalled
+several migrations behind the code.

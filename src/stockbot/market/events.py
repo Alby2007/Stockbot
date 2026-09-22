@@ -33,6 +33,7 @@ from stockbot.market.engine import TICKS_PER_DAY
 EARNINGS_INTERVAL_TICKS = 30 * TICKS_PER_DAY
 EARNINGS_JITTER_TICKS = 5 * TICKS_PER_DAY
 EARNINGS_SHOCK_SIGMA = 0.05
+EARNINGS_EST_SIGMA = 0.03
 
 # Lower bound for fundamental/base values after an ex-date drop, so a
 # dividend can never push the factor model into nonpositive prices.
@@ -75,18 +76,30 @@ async def schedule_initial_earnings(
         )
         instrument_ids = [row[0] for row in await cur.fetchall()]
 
+    est_sigma = await _config_float(conn, "earnings.est_sigma", EARNINGS_EST_SIGMA)
     for instrument_id in instrument_ids:
         # Offset >= 1 so a freshly scheduled earnings date can never resolve
         # on the same tick it was created.
         offset = int(rng.integers(1, EARNINGS_INTERVAL_TICKS))
+        # Street consensus (Plan D): the public estimate for the pending
+        # report -- the resolution jump is centered HERE, not at 0.
+        estimate = float(rng.normal(0, est_sigma))
         async with conn.cursor() as cur:
             await cur.execute(
                 """
-                INSERT INTO events (instrument_id, kind, scheduled_tick, resolve_tick)
-                VALUES (%s, 'EARNINGS', %s, %s)
+                INSERT INTO events
+                    (instrument_id, kind, scheduled_tick, resolve_tick, estimate)
+                VALUES (%s, 'EARNINGS', %s, %s, %s)
                 """,
-                (instrument_id, current_tick, current_tick + offset),
+                (instrument_id, current_tick, current_tick + offset, estimate),
             )
+
+
+async def _config_float(conn: AsyncConnection, key: str, default: float) -> float:
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT value FROM config WHERE key = %s", (key,))
+        row = await cur.fetchone()
+    return float(row[0]) if row else default
 
 
 async def _dividend_config(conn: AsyncConnection) -> dict[str, float]:
@@ -165,21 +178,34 @@ async def maybe_create_news(
     instruments: list[dict[str, Any]],
 ) -> None:
     """Roll the dice once per instrument for a fresh news hint this tick."""
+    fizzle_pct = await _config_float(conn, "news.fizzle_pct", 0.0)
     for inst in instruments:
         if rng.random() >= NEWS_CHANCE_PER_INSTRUMENT_PER_TICK:
             continue
         lag = int(rng.integers(NEWS_MIN_LAG_TICKS, NEWS_MAX_LAG_TICKS + 1))
+        # Plan D fizzle: drawn BEFORE the magnitude so the draw count is
+        # unconditional. Some fraction of rumors die -- the headline posts
+        # and resolves, but the effect is shrunk to ~nothing (nonzero so
+        # a fizzle isn't distinguishable from a tiny real move).
+        fizzle = rng.random()
         magnitude = float(rng.normal(0, NEWS_SHOCK_SIGMA))
+        fizzled = fizzle < fizzle_pct
+        if fizzled:
+            magnitude *= 0.1
         pool = NEWS_HEADLINES_POSITIVE if magnitude >= 0 else NEWS_HEADLINES_NEGATIVE
         headline = str(rng.choice(np.array(pool, dtype=object))).format(ticker=inst["ticker"])
         async with conn.cursor() as cur:
             await cur.execute(
                 """
                 INSERT INTO events
-                    (instrument_id, kind, scheduled_tick, resolve_tick, headline, magnitude)
-                VALUES (%s, 'NEWS', %s, %s, %s, %s)
+                    (instrument_id, kind, scheduled_tick, resolve_tick,
+                     headline, magnitude, fizzled)
+                VALUES (%s, 'NEWS', %s, %s, %s, %s, %s)
                 """,
-                (inst["id"], current_tick, current_tick + lag, headline, magnitude),
+                (
+                    inst["id"], current_tick, current_tick + lag,
+                    headline, magnitude, fizzled,
+                ),
             )
 
 
@@ -297,7 +323,7 @@ async def resolve_due_events(
         await cur.execute(
             """
             SELECT e.id, e.instrument_id, e.kind, e.magnitude,
-                   e.dividend_per_share, i.kind AS instrument_kind
+                   e.dividend_per_share, e.estimate, i.kind AS instrument_kind
             FROM events e
             JOIN instruments i ON i.id = e.instrument_id
             WHERE e.resolve_tick <= %s AND NOT e.resolved
@@ -340,7 +366,11 @@ async def resolve_due_events(
             continue
 
         if event["kind"] == "EARNINGS":
-            magnitude = float(rng.normal(0, EARNINGS_SHOCK_SIGMA))
+            # Plan D: earnings move on the SURPRISE vs. the public street
+            # estimate -- the pre-drawn N(0, sigma) is now the surprise
+            # term, centered on the consensus shown on /calendar.
+            surprise = float(rng.normal(0, EARNINGS_SHOCK_SIGMA))
+            magnitude = float(event["estimate"] or 0.0) + surprise
         else:
             magnitude = float(event["magnitude"])
 
@@ -356,14 +386,21 @@ async def resolve_due_events(
 
         if event["kind"] == "EARNINGS":
             jitter = int(rng.integers(-EARNINGS_JITTER_TICKS, EARNINGS_JITTER_TICKS + 1))
+            # Next report's street consensus, drawn in the same per-event
+            # order as schedule_initial_earnings (jitter, then estimate).
+            est_sigma = await _config_float(
+                conn, "earnings.est_sigma", EARNINGS_EST_SIGMA
+            )
+            next_estimate = float(rng.normal(0, est_sigma))
             next_resolve = current_tick + EARNINGS_INTERVAL_TICKS + jitter
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
-                    INSERT INTO events (instrument_id, kind, scheduled_tick, resolve_tick)
-                    VALUES (%s, 'EARNINGS', %s, %s)
+                    INSERT INTO events
+                        (instrument_id, kind, scheduled_tick, resolve_tick, estimate)
+                    VALUES (%s, 'EARNINGS', %s, %s, %s)
                     """,
-                    (instrument_id, current_tick, next_resolve),
+                    (instrument_id, current_tick, next_resolve, next_estimate),
                 )
 
     if stats is not None:
@@ -388,6 +425,15 @@ async def refresh_next_event_ticks(conn: AsyncConnection) -> None:
                 next_event_tick = (
                     SELECT MIN(e.resolve_tick) FROM events e
                     WHERE e.instrument_id = i.id AND NOT e.resolved
+                ),
+                -- Plan C: EARNINGS-only variant -- the scheduled,
+                -- material events a T1 halt precedes. Dividends are a
+                -- mechanical cash transfer and NEWS is unscheduled;
+                -- neither halts.
+                next_halting_event_tick = (
+                    SELECT MIN(e.resolve_tick) FROM events e
+                    WHERE e.instrument_id = i.id AND e.kind = 'EARNINGS'
+                      AND NOT e.resolved
                 ),
                 dividend_drift_offset = COALESCE((
                     SELECT SUM(e.drift_offset) FROM events e

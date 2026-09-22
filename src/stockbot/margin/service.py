@@ -305,16 +305,23 @@ async def _liquidate_leg(
         **await session_config(conn),
         **await flow_config(conn),
     }
+    half_spread = half_spread_for(position, tick_index, spread_cfg)
+    half_spread *= engine.flow_skew_mult(
+        signed, float(position["flow_skew"] or 0.0), spread_cfg
+    )
     fill_f, impact_after = engine.apply_trade_impact(
         base_price=base_price,
         impact_before=float(position["impact"]),
         signed_notional=signed,
         liquidity=engine.effective_liquidity(
-            float(position["liquidity"]), float(position["adv"]), spread_cfg
+            float(position["liquidity"]),
+            float(position["adv"]),
+            spread_cfg,
+            float(position["vol_state"] or 1.0),
         ),
         lambda_impact=float(position["lambda_impact"]),
         max_impact=float(position["max_impact"]),
-        half_spread=half_spread_for(position, tick_index, spread_cfg),
+        half_spread=half_spread,
         tick_size=engine.tick_size(base_price, spread_cfg),
     )
     fill = Decimal(str(round(fill_f, 6)))
@@ -553,6 +560,7 @@ async def _liquidate_account(
                        p.dividends_accrued,
                        i.ticker, i.base_price, i.impact, i.liquidity, i.adv,
                        i.lambda_impact, i.max_impact, i.quoted_price, i.maint_margin_pct,
+                       i.vol_state, i.flow_skew,
                        COALESCE(i.sigma_eff, i.sigma) AS sigma,
                        i.next_event_tick, i.last_halt_end_tick
                 FROM positions p
@@ -605,7 +613,7 @@ async def _liquidate_account(
                            p.dividends_accrued,
                            i.ticker, i.base_price, i.impact, i.liquidity, i.adv,
                            i.lambda_impact, i.max_impact, i.quoted_price,
-                           i.maint_margin_pct,
+                           i.maint_margin_pct, i.vol_state, i.flow_skew,
                            COALESCE(i.sigma_eff, i.sigma) AS sigma,
                            i.next_event_tick, i.last_halt_end_tick
                     FROM positions p
@@ -659,7 +667,10 @@ async def _liquidate_account(
             SELECT p.id, p.instrument_id, p.quantity, p.borrow_fees_accrued,
                    p.dividends_accrued,
                    i.ticker, i.base_price, i.impact, i.liquidity, i.adv,
-                   i.lambda_impact, i.max_impact, i.quoted_price, i.maint_margin_pct
+                   i.lambda_impact, i.max_impact, i.quoted_price, i.maint_margin_pct,
+                   i.vol_state, i.flow_skew,
+                   COALESCE(i.sigma_eff, i.sigma) AS sigma,
+                   i.next_event_tick, i.last_halt_end_tick
             FROM positions p
             JOIN instruments i ON i.id = p.instrument_id
             WHERE p.user_id = %s
