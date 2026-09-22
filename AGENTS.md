@@ -409,6 +409,16 @@ execute_trade decide per fill -- a resting order that reduces risk can
 still MM-fill inside the window, and EventHaltedError joins the
 transient (no-strike) catch. The gate self-opens on resolution: the
 aggregate rolls to the next earnings ~30d out.
+The two halt types deliberately differ on RESTING orders (intentional,
+not inherited): circuit/flow halts queue them like a real LULD pause --
+pass-1 skips AND pass-2 filters `circuit_halted_until_tick IS NULL`, so
+the book freezes outright -- while T1 event halts are lenient (pass-2
+reaches the position-aware gate). The asymmetry is bounded to resting
+orders: under EITHER halt a marketable reduce-only /sell still fills via
+execute_trade -- the escape hatch during an emergency is the deliberate
+marketable order, not a resting one. To unify later: drop the pass-2
+`circuit_halted_until_tick IS NULL` predicate and add
+InstrumentHaltedError to the transient catch.
 
 Lifecycle notes (Plan F, migration 0031): `instruments.index_member` is
 the fixed SBX-40 basket -- the tick's index level is computed from live
