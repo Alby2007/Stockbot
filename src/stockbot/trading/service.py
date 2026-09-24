@@ -138,6 +138,185 @@ async def update_candle_with_fill(
         )
 
 
+@dataclass(frozen=True)
+class TradeQuote:
+    """Read-only estimate of a marketable fill at the current mark --
+    what `execute_trade` would charge right now (spread + impact + taker
+    fee) without mutating anything. Feeds dollar-denominated sizing and
+    cost-visible messages; always a few ticks stale by fill time."""
+
+    quantity: int
+    fill_price: Decimal  # estimated per-share fill
+    notional_minor: int
+    fee_minor: int
+    mark_price: Decimal  # mark the quote priced off
+    unit_minor: int  # BUY: all-in per share; SELL: net proceeds per share
+
+
+async def quote_trade(
+    conn: AsyncConnection,
+    *,
+    user_id: int,
+    ticker: str,
+    side: Side,
+    quantity: int,
+) -> TradeQuote:
+    """Estimate a marketable fill for `quantity` shares of `ticker`.
+
+    Replicates `execute_trade`'s pricing (squeeze-boosted impact, flow-
+    skewed half-spread, tick grid, volume-tiered fee) minus the lock and
+    the writes, so quotes stay honest as the microstructure evolves.
+    """
+    if quantity <= 0:
+        raise ValueError("quantity must be positive")
+    ticker = ticker.upper()
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT id, base_price, impact, liquidity, adv, lambda_impact,
+                   max_impact, vol_state, flow_skew, is_active,
+                   short_interest_pct,
+                   COALESCE(sigma_eff, sigma) AS sigma,
+                   next_event_tick, last_halt_end_tick
+            FROM instruments
+            WHERE ticker = %s
+            """,
+            (ticker,),
+        )
+        instrument = await cur.fetchone()
+    if instrument is None or not instrument["is_active"]:
+        raise UnknownInstrumentError(ticker)
+
+    current_tick = await current_tick_index(conn)
+    base_price = float(instrument["base_price"])
+    impact_before = float(instrument["impact"])
+    lambda_impact = float(instrument["lambda_impact"])
+    signed_notional = base_price * quantity * (1 if side == "BUY" else -1)
+    if side == "BUY":
+        cfg = await margin.margin_config(conn)
+        si = Decimal(instrument["short_interest_pct"] or 0)
+        over = si - cfg["margin.squeeze_si_threshold"]
+        if over > 0:
+            lambda_impact *= float(
+                1 + cfg["margin.squeeze_lambda_boost"] * over
+            )
+    spread_cfg = {
+        **await spread_config(conn),
+        **await session_config(conn),
+        **await flow_config(conn),
+    }
+    half_spread = half_spread_for(instrument, current_tick, spread_cfg)
+    half_spread *= engine.flow_skew_mult(
+        signed_notional, float(instrument["flow_skew"]), spread_cfg
+    )
+    liq_eff = engine.effective_liquidity(
+        float(instrument["liquidity"]),
+        float(instrument["adv"]),
+        spread_cfg,
+        float(instrument["vol_state"]),
+    )
+    fill_price_f, _ = engine.apply_trade_impact(
+        base_price=base_price,
+        impact_before=impact_before,
+        signed_notional=signed_notional,
+        liquidity=liq_eff,
+        lambda_impact=lambda_impact,
+        max_impact=float(instrument["max_impact"]),
+        half_spread=half_spread,
+        tick_size=engine.tick_size(base_price, spread_cfg),
+    )
+    fill_price = Decimal(str(round(fill_price_f, 6)))
+    notional_minor = _to_minor_units(fill_price * quantity)
+    fee_bps = await taker_fee_bps(conn, user_id)
+    fee_minor = int(
+        (Decimal(notional_minor) * fee_bps / 10_000).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+    )
+    fee_frac = float(fee_bps) / 10_000
+    fill_minor = float(fill_price) * 100
+    unit_minor = (
+        math.ceil(fill_minor * (1 + fee_frac))
+        if side == "BUY"
+        else max(1, int(fill_minor * (1 - fee_frac)))
+    )
+    mark = Decimal(str(round(base_price * math.exp(impact_before), 6)))
+    return TradeQuote(
+        quantity=quantity,
+        fill_price=fill_price,
+        notional_minor=notional_minor,
+        fee_minor=fee_minor,
+        mark_price=mark,
+        unit_minor=unit_minor,
+    )
+
+
+async def shares_for_dollars(
+    conn: AsyncConnection,
+    *,
+    user_id: int,
+    ticker: str,
+    side: Side,
+    dollars_minor: int,
+    anchor_price: Decimal | None = None,
+) -> int:
+    """Whole shares that ~`dollars_minor` moves. BUY: all-in cost stays
+    under the amount (dust remains as cash). SELL/short entries: net
+    proceeds approximate it. `anchor_price` (a resting order's limit or
+    stop level) prices the conversion off that level instead of the
+    estimated marketable fill. Returns 0 when one share is unaffordable.
+    """
+    if dollars_minor <= 0:
+        return 0
+    if anchor_price is not None:
+        anchor_minor = _to_minor_units(anchor_price)
+        fee_frac = float(await taker_fee_bps(conn, user_id)) / 10_000
+        unit = (
+            math.ceil(anchor_minor * (1 + fee_frac))
+            if side == "BUY"
+            else max(1, int(anchor_minor * (1 - fee_frac)))
+        )
+        return max(0, dollars_minor // unit)
+    one = await quote_trade(
+        conn, user_id=user_id, ticker=ticker, side=side, quantity=1
+    )
+    qty = dollars_minor // one.unit_minor
+    if qty <= 0:
+        return 0
+    # Refine once at size: the qty=1 quote can't see this order's own
+    # concave impact. min() keeps the result inside the first estimate.
+    quote = await quote_trade(
+        conn, user_id=user_id, ticker=ticker, side=side, quantity=qty
+    )
+    return int(min(qty, dollars_minor // quote.unit_minor))
+
+
+async def max_affordable_shares(
+    conn: AsyncConnection,
+    *,
+    user_id: int,
+    ticker: str,
+    cash_minor: int,
+) -> int:
+    """Largest BUY whose estimated all-in cost fits `cash_minor`. The
+    dollars path under-counts when own-impact pushes cost past the mark
+    estimate, so trim against the quote until it fits."""
+    qty = await shares_for_dollars(
+        conn, user_id=user_id, ticker=ticker, side="BUY", dollars_minor=cash_minor
+    )
+    for _ in range(6):
+        if qty <= 0:
+            return 0
+        quote = await quote_trade(
+            conn, user_id=user_id, ticker=ticker, side="BUY", quantity=qty
+        )
+        total = quote.notional_minor + quote.fee_minor
+        if total <= cash_minor:
+            return qty
+        qty = min(qty - 1, qty * cash_minor // total)
+    return 0
+
+
 async def _apply_fill(
     conn: AsyncConnection,
     *,

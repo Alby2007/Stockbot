@@ -184,7 +184,15 @@ service entry points raise `FeatureDisabledError` while
 `match_orders` in the tick just no-ops (checked via
 `data.feature_enabled_flag`, the non-raising variant). Trade rows carry
 fill provenance: `trades.half_spread` and `trades.impact_delta` — "why
-did this fill cost X" is a query. Shared `stockbot/logging.py` owns
+did this fill cost X" is a query. Sizing UX: every exposure command
+(`/buy` `/sell` `/short` `/order buy|sell`) accepts `quantity` OR
+`dollars` (`/buy`/`/sell` also `all_in`), resolved by
+`trading.service.shares_for_dollars`/`max_affordable_shares` via
+`quote_trade` — a read-only replica of `execute_trade`'s pricing
+(squeeze-boosted impact + flow-skewed spread + taker fee, no lock, no
+writes). Dollar sells cap at the held position (they never flip into a
+margin short); resting orders size at their anchor (limit, else stop),
+not the mark. Shared `stockbot/logging.py` owns
 handler setup for both service mains. Every registered command callback
 is wrapped once at the end of `register_commands`
 (`_instrument_commands`) -- one `cmd=… user=… iid=… ok=… ms=…` log line

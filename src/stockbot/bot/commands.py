@@ -17,6 +17,7 @@ from typing import Any
 
 import discord
 from discord import app_commands
+from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from stockbot import db
@@ -88,12 +89,117 @@ from stockbot.shorts.service import (
     open_bounded_short,
 )
 from stockbot.trading.errors import DuplicateInteractionError, TradingError
-from stockbot.trading.service import execute_trade, taker_fee_bps
+from stockbot.trading.service import (
+    execute_trade,
+    max_affordable_shares,
+    quote_trade,
+    shares_for_dollars,
+    taker_fee_bps,
+)
 
 log = logging.getLogger("stockbot.bot.commands")
 
 MIN_DISCORD_ACCOUNT_AGE = timedelta(days=30)
 MIN_BOT_ACCOUNT_AGE_BEFORE_FIRST_CLAIM = timedelta(hours=24)
+
+
+async def _held_shares(
+    conn: AsyncConnection, user_id: int, ticker: str, season_id: int | None
+) -> int:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT p.quantity
+            FROM positions p
+            JOIN instruments i ON i.id = p.instrument_id
+            WHERE p.user_id = %s AND i.ticker = %s
+              AND p.season_id IS NOT DISTINCT FROM %s
+            """,
+            (user_id, ticker.upper(), season_id),
+        )
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def _resolve_quantity(
+    conn: AsyncConnection,
+    *,
+    user_id: int,
+    ticker: str,
+    side: str,
+    account_id: int,
+    quantity: int | None,
+    dollars: float | None,
+    all_in: bool,
+    season_id: int | None,
+) -> tuple[int, bool]:
+    """Resolve the user's sizing input to a share count.
+
+    Returns (quantity, capped) -- capped means a dollar-sized SELL ran
+    into the position's size (the whole position went out the door).
+    Raises TradingError with a user-readable message on bad input."""
+    ticker = ticker.upper()
+    provided = (quantity is not None) + (dollars is not None) + bool(all_in)
+    if provided != 1:
+        raise TradingError(
+            "give exactly one of `quantity`, `dollars`, or `all_in`"
+        )
+    if quantity is not None:
+        return quantity, False
+    if all_in:
+        if side == "SELL":
+            held = await _held_shares(conn, user_id, ticker, season_id)
+            if held <= 0:
+                raise TradingError(f"you don't hold any {ticker}")
+            return held, True
+        cash = await get_balance(conn, account_id)
+        qty = await max_affordable_shares(
+            conn, user_id=user_id, ticker=ticker, cash_minor=cash
+        )
+        if qty <= 0:
+            raise TradingError(
+                f"your {format_money(cash)} can't cover one {ticker} share "
+                f"— check the mark with `/stock {ticker}`"
+            )
+        return qty, False
+    assert dollars is not None
+    dollars_minor = int(Decimal(str(dollars)) * 100)
+    if side == "SELL":
+        held = await _held_shares(conn, user_id, ticker, season_id)
+        if held <= 0:
+            raise TradingError(f"you don't hold any {ticker}")
+        qty = await shares_for_dollars(
+            conn,
+            user_id=user_id,
+            ticker=ticker,
+            side="SELL",
+            dollars_minor=dollars_minor,
+        )
+        if qty <= 0:
+            quote = await quote_trade(
+                conn, user_id=user_id, ticker=ticker, side="SELL", quantity=1
+            )
+            raise TradingError(
+                f"1 {ticker} share nets ~{format_money(quote.unit_minor)} "
+                "— too small an amount"
+            )
+        return min(qty, held), qty > held
+    qty = await shares_for_dollars(
+        conn,
+        user_id=user_id,
+        ticker=ticker,
+        side="BUY",
+        dollars_minor=dollars_minor,
+    )
+    if qty <= 0:
+        quote = await quote_trade(
+            conn, user_id=user_id, ticker=ticker, side="BUY", quantity=1
+        )
+        raise TradingError(
+            f"1 {ticker} share costs ~{format_money(quote.unit_minor)} "
+            "all-in — bump the amount"
+        )
+    return qty, False
 
 
 def register_commands(tree: app_commands.CommandTree) -> None:
@@ -200,6 +306,17 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 if snapshot is not None
                 else ([], [])
             )
+            quote10 = (
+                await quote_trade(
+                    conn,
+                    user_id=interaction.user.id,
+                    ticker=ticker,
+                    side="BUY",
+                    quantity=10,
+                )
+                if snapshot is not None
+                else None
+            )
         if snapshot is None:
             await interaction.response.send_message(
                 f"No instrument found for `{ticker.upper()}`.", ephemeral=True
@@ -243,6 +360,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     lines.append("`   ─── inside ── | ── inside ───    `")
             embed.add_field(
                 name="Book depth (~ = MM)", value="\n".join(lines), inline=False
+            )
+        if quote10 is not None:
+            embed.add_field(
+                name="Est. 10 shares",
+                value=f"~{format_money(quote10.notional_minor + quote10.fee_minor)} all-in",
             )
         embed.add_field(name="24h volume", value=f"{snapshot.day_volume:,} shares")
         embed.add_field(
@@ -525,6 +647,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @app_commands.describe(
         ticker="Instrument ticker",
         quantity="Number of shares",
+        dollars="Spend ~this many dollars instead of giving a share count",
+        all_in="Spend your entire cash balance on this instrument",
         league="Trade from your season league stake instead of your main portfolio",
         slippage="Max slippage vs the mark, in percent (e.g. 2.5)",
     )
@@ -533,38 +657,50 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ticker: str,
         # A bounded quantity keeps absurd inputs from overflowing BIGINT
         # notional_minor into an uncaught NumericValueOutOfRange.
-        quantity: app_commands.Range[int, 1, 1_000_000_000],
+        quantity: app_commands.Range[int, 1, 1_000_000_000] | None = None,
+        dollars: app_commands.Range[float, 0.01, 1_000_000_000.0] | None = None,
+        all_in: bool = False,
         league: bool = False,
         slippage: app_commands.Range[float, 0.01, 100.0] | None = None,
     ) -> None:
-        await _do_trade(interaction, ticker, "BUY", quantity, league, slippage)
+        await _do_trade(
+            interaction, ticker, "BUY", quantity, dollars, all_in, league, slippage
+        )
 
     @tree.command(name="sell", description="Sell shares of an instrument")
     @app_commands.describe(
         ticker="Instrument ticker",
         quantity="Number of shares",
+        dollars="Sell ~this many dollars' worth instead of giving a share count",
+        all_in="Sell your entire position",
         league="Trade from your season league stake instead of your main portfolio",
         slippage="Max slippage vs the mark, in percent (e.g. 2.5)",
     )
     async def sell(
         interaction: discord.Interaction,
         ticker: str,
-        quantity: app_commands.Range[int, 1, 1_000_000_000],
+        quantity: app_commands.Range[int, 1, 1_000_000_000] | None = None,
+        dollars: app_commands.Range[float, 0.01, 1_000_000_000.0] | None = None,
+        all_in: bool = False,
         league: bool = False,
         slippage: app_commands.Range[float, 0.01, 100.0] | None = None,
     ) -> None:
-        await _do_trade(interaction, ticker, "SELL", quantity, league, slippage)
+        await _do_trade(
+            interaction, ticker, "SELL", quantity, dollars, all_in, league, slippage
+        )
 
     async def _do_trade(
         interaction: discord.Interaction,
         ticker: str,
         side: str,
-        quantity: int,
+        quantity: int | None,
+        dollars: float | None,
+        all_in: bool,
         league: bool,
         slippage: float | None,
     ) -> None:
         async with db.connection() as conn:
-            await bootstrap_user(conn, interaction.user.id)
+            account_id = await bootstrap_user(conn, interaction.user.id)
             season_id: int | None = None
             if league:
                 entry = await get_active_entry(conn, interaction.user.id)
@@ -574,14 +710,29 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                         ephemeral=True,
                     )
                     return
-                season_id = entry[0]
+                season_id, account_id = entry
+            try:
+                qty, capped = await _resolve_quantity(
+                    conn,
+                    user_id=interaction.user.id,
+                    ticker=ticker,
+                    side=side,
+                    account_id=account_id,
+                    quantity=quantity,
+                    dollars=dollars,
+                    all_in=all_in,
+                    season_id=season_id,
+                )
+            except TradingError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
             try:
                 result = await execute_trade(
                     conn,
                     user_id=interaction.user.id,
                     ticker=ticker,
                     side=side,  # type: ignore[arg-type]
-                    quantity=quantity,
+                    quantity=qty,
                     interaction_id=str(interaction.id),
                     season_id=season_id,
                     max_slippage=(
@@ -589,20 +740,51 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     ),
                 )
             except InsufficientFundsError:
-                await interaction.response.send_message(
-                    "Insufficient funds for that trade.", ephemeral=True
-                )
+                # Show the math: what the size needs vs. the balance. On a
+                # SELL the shortfall is the fee leg, not the notional.
+                try:
+                    quote = await quote_trade(
+                        conn,
+                        user_id=interaction.user.id,
+                        ticker=ticker,
+                        side=side,  # type: ignore[arg-type]
+                        quantity=qty,
+                    )
+                    balance = await get_balance(conn, account_id)
+                    need = (
+                        quote.notional_minor + quote.fee_minor
+                        if side == "BUY"
+                        else quote.fee_minor
+                    )
+                    msg = (
+                        f"{qty:,} {ticker.upper()} needs "
+                        f"~{format_money(need)} cash "
+                        f"({'price+fee' if side == 'BUY' else 'fee'}) — "
+                        f"you have {format_money(balance)}."
+                    )
+                except (TradingError, ValueError):
+                    msg = "Insufficient funds for that trade."
+                await interaction.response.send_message(msg, ephemeral=True)
                 return
             except (TradingError, MarginError) as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
                 return
             legs = await check_and_liquidate(conn, interaction.user.id, season_id)
+            cash_after = await get_balance(conn, account_id)
 
         verb = "Bought" if side == "BUY" else "Sold"
+        moved = (
+            f"**{format_money(result.notional_minor + result.fee_minor)}** spent"
+            if side == "BUY"
+            else f"**{format_money(result.notional_minor - result.fee_minor)}** proceeds"
+        )
         suffix = f" ({legs} liquidation leg(s) fired)" if legs else ""
+        closed = " — position closed" if capped else ""
         await interaction.response.send_message(
-            f"{verb} **{result.quantity}** {result.ticker} @ {format_price(result.fill_price)} "
-            f"(fee {format_money(result.fee_minor)}){suffix}"
+            f"{verb} **{result.quantity:,}** {result.ticker} @ "
+            f"{format_price(result.fill_price)} — {moved} "
+            f"(fee {format_money(result.fee_minor)}). "
+            f"Cash: **{format_money(cash_after)}**{closed}{suffix}"
         )
 
     @tree.command(
@@ -612,16 +794,18 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @app_commands.describe(
         ticker="Instrument ticker",
         quantity="Number of shares to short",
+        dollars="Short ~this many dollars of notional instead of a share count",
         league="Use your season league stake instead of your main portfolio",
     )
     async def short(
         interaction: discord.Interaction,
         ticker: str,
-        quantity: app_commands.Range[int, 1, 1_000_000_000],
+        quantity: app_commands.Range[int, 1, 1_000_000_000] | None = None,
+        dollars: app_commands.Range[float, 0.01, 1_000_000_000.0] | None = None,
         league: bool = False,
     ) -> None:
         async with db.connection() as conn:
-            await bootstrap_user(conn, interaction.user.id)
+            account_id = await bootstrap_user(conn, interaction.user.id)
             season_id: int | None = None
             if league:
                 entry = await get_active_entry(conn, interaction.user.id)
@@ -631,7 +815,29 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                         ephemeral=True,
                     )
                     return
-                season_id = entry[0]
+                season_id, account_id = entry
+            if (quantity is not None) == (dollars is not None):
+                await interaction.response.send_message(
+                    "Give exactly one of `quantity` or `dollars`.", ephemeral=True
+                )
+                return
+            if dollars is not None:
+                qty = await shares_for_dollars(
+                    conn,
+                    user_id=interaction.user.id,
+                    ticker=ticker,
+                    side="SELL",
+                    dollars_minor=int(Decimal(str(dollars)) * 100),
+                )
+                if qty <= 0:
+                    await interaction.response.send_message(
+                        f"That amount shorts less than one {ticker.upper()} "
+                        "share — bump `dollars`.",
+                        ephemeral=True,
+                    )
+                    return
+                quantity = qty
+            assert quantity is not None
             try:
                 result = await open_bounded_short(
                     conn,
@@ -642,8 +848,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     season_id=season_id,
                 )
             except InsufficientFundsError:
+                bal = await get_balance(conn, account_id)
                 await interaction.response.send_message(
-                    "Insufficient funds for the collateral.", ephemeral=True
+                    f"Collateral for {quantity:,} {ticker.upper()} exceeds "
+                    f"your balance ({format_money(bal)}).",
+                    ephemeral=True,
                 )
                 return
             # MarginError: assert_spend_ok can block the fee spend.
@@ -843,7 +1052,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         interaction: discord.Interaction,
         ticker: str,
         side: str,
-        quantity: int,
+        quantity: int | None,
+        dollars: float | None,
         limit: float | None,
         stop: float | None,
         hours: float | None,
@@ -854,6 +1064,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             await interaction.response.send_message(
                 "Give a `limit` price, a `stop` price, or both (stop-limit).",
                 ephemeral=True,
+            )
+            return
+        if (quantity is not None) == (dollars is not None):
+            await interaction.response.send_message(
+                "Give exactly one of `quantity` or `dollars`.", ephemeral=True
             )
             return
         async with db.connection() as conn:
@@ -868,6 +1083,44 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     )
                     return
                 season_id = entry[0]
+            if dollars is not None:
+                # Size against the order's anchor: the limit for
+                # limit/stop-limit orders, the stop for pure stops.
+                anchor = Decimal(str(limit if limit is not None else stop))
+                qty = await shares_for_dollars(
+                    conn,
+                    user_id=interaction.user.id,
+                    ticker=ticker,
+                    side=side,  # type: ignore[arg-type]
+                    dollars_minor=int(Decimal(str(dollars)) * 100),
+                    anchor_price=anchor,
+                )
+                if qty <= 0:
+                    verb = "buys" if side == "BUY" else "sells"
+                    await interaction.response.send_message(
+                        f"~{format_money(int(Decimal(str(dollars)) * 100))} "
+                        f"{verb} less than one {ticker.upper()} share at "
+                        f"{format_price(anchor)} — bump `dollars`.",
+                        ephemeral=True,
+                    )
+                    return
+                capped = False
+                if side == "SELL":
+                    held = await _held_shares(
+                        conn, interaction.user.id, ticker, season_id
+                    )
+                    if held <= 0:
+                        await interaction.response.send_message(
+                            f"You don't hold any {ticker.upper()}.",
+                            ephemeral=True,
+                        )
+                        return
+                    capped = qty > held
+                    qty = min(qty, held)
+                quantity = qty
+            else:
+                capped = False
+            assert quantity is not None
             try:
                 result = await place_order(
                     conn,
@@ -906,9 +1159,22 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             if result.display_qty is not None
             else ""
         )
+        order_anchor = (
+            result.limit_price
+            if result.limit_price is not None
+            else result.stop_price
+        )
+        notional = (
+            f" — ~{format_money(result.quantity * int(order_anchor * 100))} "
+            f"{'cost' if result.side == 'BUY' else 'proceeds'} if it fills"
+            if order_anchor is not None
+            else ""
+        )
+        position_capped = " (capped at your position)" if capped else ""
         await interaction.response.send_message(
             f"Order **#{result.order_id}** resting: {result.side} "
-            f"**{result.quantity}** {result.ticker} {price_part}{iceberg} "
+            f"**{result.quantity:,}** {result.ticker} {price_part}{iceberg}"
+            f"{notional}{position_capped} "
             f"({expiry}). Fills when the market reaches it."
         )
 
@@ -916,6 +1182,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @app_commands.describe(
         ticker="Instrument ticker",
         quantity="Number of shares",
+        dollars="Size the order for ~this many dollars instead of a share count",
         limit="Max price you'll pay (omit for a pure stop order)",
         stop="Trigger once the mark rises to this price",
         hours="Auto-expire after this many hours (omit for GTC)",
@@ -925,7 +1192,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def order_buy(
         interaction: discord.Interaction,
         ticker: str,
-        quantity: app_commands.Range[int, 1, 1_000_000_000],
+        quantity: app_commands.Range[int, 1, 1_000_000_000] | None = None,
+        dollars: app_commands.Range[float, 0.01, 1_000_000_000.0] | None = None,
         # NUMERIC(18, 6) tops out just under 1e12; keep the bound inside it.
         limit: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
         stop: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
@@ -934,7 +1202,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         display: app_commands.Range[int, 1, 1_000_000_000] | None = None,
     ) -> None:
         await _place_order(
-            interaction, ticker, "BUY", quantity, limit, stop, hours, league, display
+            interaction, ticker, "BUY", quantity, dollars,
+            limit, stop, hours, league, display
         )
 
     @order_group.command(
@@ -944,6 +1213,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @app_commands.describe(
         ticker="Instrument ticker",
         quantity="Number of shares",
+        dollars="Size the order for ~this many dollars instead of a share count",
         limit="Min price you'll accept (omit for a pure stop order)",
         stop="Trigger once the mark falls to this price (stop-loss)",
         hours="Auto-expire after this many hours (omit for GTC)",
@@ -953,7 +1223,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def order_sell(
         interaction: discord.Interaction,
         ticker: str,
-        quantity: app_commands.Range[int, 1, 1_000_000_000],
+        quantity: app_commands.Range[int, 1, 1_000_000_000] | None = None,
+        dollars: app_commands.Range[float, 0.01, 1_000_000_000.0] | None = None,
         limit: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
         stop: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
         hours: app_commands.Range[float, 0.02, 8760.0] | None = None,
@@ -961,7 +1232,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         display: app_commands.Range[int, 1, 1_000_000_000] | None = None,
     ) -> None:
         await _place_order(
-            interaction, ticker, "SELL", quantity, limit, stop, hours, league, display
+            interaction, ticker, "SELL", quantity, dollars,
+            limit, stop, hours, league, display
         )
 
     @order_group.command(name="list", description="Show your resting orders")
@@ -1171,7 +1443,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.response.send_message(
             f"Entered **{season.name}** — your league stake is "
             f"**{format_money(season.stake_minor)}**. Trade it with "
-            "`/buy <ticker> <qty> league:True`."
+            "`/buy <ticker> quantity:<shares>` or `dollars:<$>` — add "
+            "`league:True`."
         )
 
     @league_group.command(name="standings", description="Show league standings")

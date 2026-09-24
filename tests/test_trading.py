@@ -16,7 +16,12 @@ from stockbot.trading.errors import (
     SlippageExceededError,
     UnknownInstrumentError,
 )
-from stockbot.trading.service import execute_trade
+from stockbot.trading.service import (
+    execute_trade,
+    max_affordable_shares,
+    quote_trade,
+    shares_for_dollars,
+)
 
 
 async def _first_ticker(conn: AsyncConnection) -> str:
@@ -248,3 +253,103 @@ async def test_slippage_cap_rejects_and_reports_the_would_be_fill(
         max_slippage=Decimal("1"),
     )
     assert result.quantity == 5
+
+
+async def test_quote_trade_prices_above_mark_for_buys_below_for_sells(
+    conn: AsyncConnection,
+) -> None:
+    """The estimate replicates the fill path: spread+impact push buys over
+    the mark and sells under it; the fee lands on top of the notional."""
+    await bootstrap_user(conn, 1011)
+    ticker = await _first_ticker(conn)
+
+    buy = await quote_trade(conn, user_id=1011, ticker=ticker, side="BUY", quantity=10)
+    sell = await quote_trade(conn, user_id=1011, ticker=ticker, side="SELL", quantity=10)
+
+    assert buy.fill_price > buy.mark_price
+    assert sell.fill_price < sell.mark_price
+    assert buy.notional_minor == int(buy.fill_price * 10 * 100)
+    assert buy.fee_minor > 0
+    # BUY unit is the all-in per-share cost; SELL unit is net proceeds.
+    assert buy.unit_minor >= int(buy.notional_minor / 10)
+    assert sell.unit_minor <= int(sell.notional_minor / 10)
+
+
+async def test_shares_for_dollars_floors_and_the_trade_executes(
+    conn: AsyncConnection,
+) -> None:
+    """dollar sizing -> whole shares whose estimated all-in cost fits the
+    amount, and the resolved quantity fills for real."""
+    account_id = await bootstrap_user(conn, 1012)
+    await _give_cash(conn, account_id, 1_000_000)  # $10,000
+    ticker = await _first_ticker(conn)
+
+    dollars = 200_000  # $2,000
+    qty = await shares_for_dollars(
+        conn, user_id=1012, ticker=ticker, side="BUY", dollars_minor=dollars
+    )
+    assert qty >= 1
+    quote = await quote_trade(
+        conn, user_id=1012, ticker=ticker, side="BUY", quantity=qty
+    )
+    assert quote.notional_minor + quote.fee_minor <= dollars
+
+    balance_before = await get_balance(conn, account_id)
+    result = await execute_trade(
+        conn, user_id=1012, ticker=ticker, side="BUY", quantity=qty
+    )
+    assert result.quantity == qty
+    spent = balance_before - await get_balance(conn, account_id)
+    assert spent <= dollars
+
+
+async def test_shares_for_dollars_too_small_returns_zero(conn: AsyncConnection) -> None:
+    await bootstrap_user(conn, 1013)
+    ticker = await _first_ticker(conn)
+    qty = await shares_for_dollars(
+        conn, user_id=1013, ticker=ticker, side="BUY", dollars_minor=50
+    )
+    assert qty == 0
+
+
+async def test_shares_for_dollars_anchor_prices_off_the_limit(
+    conn: AsyncConnection,
+) -> None:
+    """Resting orders size at their anchor (limit/stop), not the mark:
+    $500 at a $50 limit buys floor(500/50.05) = 9 shares at the taker
+    fee tier."""
+    await bootstrap_user(conn, 1014)
+    ticker = await _first_ticker(conn)
+    qty = await shares_for_dollars(
+        conn,
+        user_id=1014,
+        ticker=ticker,
+        side="BUY",
+        dollars_minor=50_000,  # $500
+        anchor_price=Decimal("50"),
+    )
+    # 50 * (1 + fee) > 50 -> qty < 10; 50*(1+0.001)=50.05 -> floor(500/50.05)=9
+    assert qty == 9
+
+
+async def test_max_affordable_shares_fits_the_balance(conn: AsyncConnection) -> None:
+    """all_in resolves to a size whose quoted all-in cost fits the cash
+    balance and then actually executes without tripping funds."""
+    account_id = await bootstrap_user(conn, 1015)
+    await _give_cash(conn, account_id, 300_000)  # $3,000
+    ticker = await _first_ticker(conn)
+
+    cash = await get_balance(conn, account_id)
+    qty = await max_affordable_shares(
+        conn, user_id=1015, ticker=ticker, cash_minor=cash
+    )
+    assert qty >= 1
+    quote = await quote_trade(
+        conn, user_id=1015, ticker=ticker, side="BUY", quantity=qty
+    )
+    assert quote.notional_minor + quote.fee_minor <= cash
+
+    result = await execute_trade(
+        conn, user_id=1015, ticker=ticker, side="BUY", quantity=qty
+    )
+    assert result.notional_minor + result.fee_minor <= cash
