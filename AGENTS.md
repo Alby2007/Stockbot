@@ -123,6 +123,10 @@ sqrt(closed_ticks * `session.overnight_var_frac`) (default 0.125 ->
 var_dt=60, ~an hour of trading), while clock-time terms (base drift,
 mean reversion, impact decay) keep the full closed_ticks. Without the
 split ~85% of instruments pinned the 4.5% breaker every reopen.
+Mean reversion uses the exact OU decay `log_dev*(1-exp(-kappa*dt))`
+(not linear `kappa*log_dev*dt`) -- at dt=480 the linear pull is ~9x the
+deviation and overshoots FV into a halt; the decay form converges onto
+FV so the reopen's reversion move is bounded by the deviation itself.
 "Now" = phase of `MAX(tick_index)`;
 `assert_market_open` (market/data.py) gates `execute_trade`,
 `place_order`, and both bounded-short endpoints with `MarketClosedError`

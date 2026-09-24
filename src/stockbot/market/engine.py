@@ -225,7 +225,10 @@ def step_instrument(
     )
 
     idiosyncratic = float(rng.standard_t(STUDENT_T_DF)) * STUDENT_T_SCALE
-    mean_reversion = inst.kappa * float(np.log(inst.fundamental_value / inst.base_price)) * dt
+    # Exact OU decay (-expm1(-k*dt) == 1 - exp(-k*dt) ~= k*dt at dt=1):
+    # a linear k*dt pull at dt=closed_ticks overshoots FV ~9x per reopen.
+    log_dev = float(np.log(inst.fundamental_value / inst.base_price))
+    mean_reversion = log_dev * float(-np.expm1(-inst.kappa * dt))
     delta_log_price = (
         inst.drift * dt
         + drift_state * vdt

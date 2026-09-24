@@ -80,6 +80,23 @@ def test_mean_reversion_pulls_price_toward_fundamental() -> None:
     assert result.base_price < inst.fundamental_value
 
 
+def test_mean_reversion_converges_not_overshoots_at_gap_dt() -> None:
+    # The overnight step uses dt=closed_ticks. A linear kappa*dt pull would
+    # apply ~9x the deviation (kappa*480 >> 1) and blow past FV into a
+    # breaker halt every reopen; the exact OU decay converges onto FV.
+    inst = _base_instrument(
+        sigma=0.0, fundamental_sigma=0.0, kappa=0.019,
+        base_price=98.0, fundamental_value=100.0, drift=0.0,
+    )
+    rng = np.random.default_rng(0)
+    result = engine.step_instrument(
+        rng, inst, market_factor=0.0, sector_factor=0.0, dt=480.0, var_dt=60.0
+    )
+    assert not result.circuit_breached
+    assert result.base_price < inst.fundamental_value  # converges, never crosses
+    assert result.base_price > 99.9  # exp(-0.019*480) ~ 1e-4 of the gap left
+
+
 def test_circuit_breaker_clamps_extreme_moves() -> None:
     # A deliberately huge idiosyncratic vol should still be clamped to the cap.
     inst = _base_instrument(sigma=10.0, fundamental_sigma=0.0, kappa=0.0)
