@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from psycopg import AsyncConnection
 
 from stockbot.ledger.service import get_system_account_id, post_transfer
 
 STARTING_GRANT = 10_000  # minor units; placeholder one-time starting balance
+
+
+@dataclass(frozen=True)
+class BootstrapResult:
+    account_id: int
+    created: bool
 
 
 async def create_user_account(conn: AsyncConnection, user_id: int) -> tuple[int, bool]:
@@ -40,7 +48,7 @@ async def create_user_account(conn: AsyncConnection, user_id: int) -> tuple[int,
     return int(row[0]), created
 
 
-async def bootstrap_user(conn: AsyncConnection, user_id: int) -> int:
+async def bootstrap_user(conn: AsyncConnection, user_id: int) -> BootstrapResult:
     """Create a user's account if needed and grant the one-time starting balance.
 
     Safe to call more than once: the starting grant is only issued by the
@@ -48,6 +56,9 @@ async def bootstrap_user(conn: AsyncConnection, user_id: int) -> int:
     transaction -- no bare statements before the first `conn.transaction()`
     (a bare statement would open an implicit transaction and silently
     demote every later block to a savepoint that never commits).
+
+    Returns `BootstrapResult(account_id, created)` -- `created` is how
+    callers tell first-use from repeat (N3: the welcome message).
     """
     async with conn.transaction():
         account_id, created = await create_user_account(conn, user_id)
@@ -60,4 +71,4 @@ async def bootstrap_user(conn: AsyncConnection, user_id: int) -> int:
                 amount=STARTING_GRANT,
                 reason="STARTING_GRANT",
             )
-    return account_id
+    return BootstrapResult(account_id, created)

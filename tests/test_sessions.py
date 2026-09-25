@@ -343,7 +343,7 @@ async def test_closing_auction_clears_uniform_and_skips_mm(
     an MM-fillable resting order waits through the close and fills on
     the next open tick instead."""
     for uid in (7010, 7011, 7012):
-        account = await bootstrap_user(conn, uid)
+        account = (await bootstrap_user(conn, uid)).account_id
         await post_transfer(
             conn,
             from_account_id=await get_system_account_id(conn, "FAUCET"),
@@ -455,7 +455,7 @@ async def test_closing_auction_window_spans_n_ticks(
     OPEN because pass 2 is skipped inside the window."""
     from stockbot.market.data import session_parts
 
-    account = await bootstrap_user(conn, 7030)
+    account = (await bootstrap_user(conn, 7030)).account_id
     await post_transfer(
         conn,
         from_account_id=await get_system_account_id(conn, "FAUCET"),
@@ -509,7 +509,7 @@ async def test_event_halt_blocks_exposure_but_not_closing(
     from stockbot.orders.service import match_orders
     from stockbot.shorts.service import open_bounded_short
 
-    account = await bootstrap_user(conn, 7020)
+    account = (await bootstrap_user(conn, 7020)).account_id
     await post_transfer(
         conn,
         from_account_id=await get_system_account_id(conn, "FAUCET"),
@@ -517,7 +517,7 @@ async def test_event_halt_blocks_exposure_but_not_closing(
         amount=10_000_000,
         reason="TEST_TOPUP",
     )
-    account2 = await bootstrap_user(conn, 7021)
+    account2 = (await bootstrap_user(conn, 7021)).account_id
     await post_transfer(
         conn,
         from_account_id=await get_system_account_id(conn, "FAUCET"),
@@ -655,7 +655,7 @@ async def test_auction_tick_keeps_event_halt_risk_reducing_path(
     from stockbot.market import events as events_mod
     from stockbot.market.data import session_parts
 
-    account = await bootstrap_user(conn, 7040)
+    account = (await bootstrap_user(conn, 7040)).account_id
     await post_transfer(
         conn,
         from_account_id=await get_system_account_id(conn, "FAUCET"),

@@ -18,7 +18,7 @@ from stockbot.orders.service import place_order
 
 
 async def _fund(conn: AsyncConnection, user_id: int, amount_minor: int) -> int:
-    account_id = await bootstrap_user(conn, user_id)
+    account_id = (await bootstrap_user(conn, user_id)).account_id
     faucet = await get_system_account_id(conn, "FAUCET")
     await post_transfer(
         conn,

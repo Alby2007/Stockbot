@@ -13,12 +13,14 @@ from stockbot.ledger.service import get_balance
 
 
 async def test_bootstrap_grants_exactly_once(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 9001)
-    assert await get_balance(conn, account_id) == STARTING_GRANT
+    first = await bootstrap_user(conn, 9001)
+    assert first.created
+    assert await get_balance(conn, first.account_id) == STARTING_GRANT
 
     again = await bootstrap_user(conn, 9001)
-    assert again == account_id
-    assert await get_balance(conn, account_id) == STARTING_GRANT
+    assert not again.created
+    assert again.account_id == first.account_id
+    assert await get_balance(conn, first.account_id) == STARTING_GRANT
 
 
 async def test_create_user_account_reports_created(conn: AsyncConnection) -> None:

@@ -194,7 +194,7 @@ async def join_season(conn: AsyncConnection, user_id: int, season_id: int | None
             if locked[0] == "CLOSED":
                 raise SeasonNotOpenError(season.id, str(locked[0]))
 
-        account_id = await bootstrap_user(conn, user_id)
+        account_id = (await bootstrap_user(conn, user_id)).account_id
 
         async with conn.cursor() as cur:
             await cur.execute(

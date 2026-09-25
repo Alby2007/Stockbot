@@ -11,7 +11,7 @@ import discord
 
 from stockbot import db
 from stockbot.bot.chart_view import CHART_CID_PREFIX, handle_chart_component
-from stockbot.bot.commands import register_commands
+from stockbot.bot.commands import guild_welcome_message, register_commands
 from stockbot.bot.notify import DeliveryForbidden, poll_once
 from stockbot.config import get_settings
 from stockbot.logging import setup_logging
@@ -51,8 +51,13 @@ class StockBotTree(discord.app_commands.CommandTree["StockBotClient"]):
 
 class StockBotClient(discord.Client):
     def __init__(self) -> None:
-        # Slash-command-only surface: no privileged intents required.
-        super().__init__(intents=discord.Intents.none())
+        # Slash-command-only surface: no privileged intents. `guilds` is
+        # the one standard intent we take -- without it Discord never
+        # sends GUILD_CREATE and on_guild_join can't fire (it also makes
+        # the heartbeat's guild count real instead of always-zero).
+        intents = discord.Intents.none()
+        intents.guilds = True
+        super().__init__(intents=intents)
         self.tree = StockBotTree(self)
         register_commands(self.tree)
         self._notify_stats: dict[str, int] = {}
@@ -129,6 +134,26 @@ class StockBotClient(discord.Client):
                         )
                 except discord.HTTPException:
                     pass
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        """Post the tour once wherever we're allowed to speak. Permissions
+        are probed by trying (guild.me isn't reliably cached without the
+        privileged members intent); cap attempts so a locked-down guild
+        costs us a handful of 403s, not a channel sweep."""
+        candidates = (
+            [guild.system_channel] if guild.system_channel is not None else []
+        ) + [c for c in guild.text_channels if c != guild.system_channel]
+        for channel in candidates[:3]:
+            try:
+                await channel.send(guild_welcome_message())
+                log.info("posted welcome in guild %s", guild.id)
+                return
+            except discord.Forbidden:
+                continue
+            except discord.HTTPException:
+                log.warning("welcome post failed in guild %s", guild.id)
+                return
+        log.info("no writable channel for welcome in guild %s", guild.id)
 
     async def on_ready(self) -> None:
         if getattr(self, "_heartbeat_task", None) is None:

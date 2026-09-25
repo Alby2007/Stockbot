@@ -217,7 +217,7 @@ async def test_listing_stays_out_of_index_and_trades_next_tick(
 
 
 async def test_delist_pays_longs_at_final_mark(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 8001)
+    account_id = (await bootstrap_user(conn, 8001)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     ticker = await _first_ticker(conn)
     await execute_trade(conn, user_id=8001, ticker=ticker, side="BUY", quantity=10)
@@ -248,7 +248,7 @@ async def test_delist_pays_longs_at_final_mark(conn: AsyncConnection) -> None:
 async def test_delist_covers_short_and_settles_carry_debts_first(
     conn: AsyncConnection,
 ) -> None:
-    account_id = await bootstrap_user(conn, 8002)
+    account_id = (await bootstrap_user(conn, 8002)).account_id
     await _give_cash(conn, account_id, 10_000_000)
     await _grant_tier(conn, 8002)
     ticker = await _first_ticker(conn)
@@ -288,7 +288,7 @@ async def test_delist_covers_short_and_settles_carry_debts_first(
 
 
 async def test_delist_short_shortfall_uses_fund_then_mm(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 8003)
+    account_id = (await bootstrap_user(conn, 8003)).account_id
     await _give_cash(conn, account_id, 40_000_000)  # $400k equity
     await _grant_tier(conn, 8003, tier=3)
     ticker = await _first_ticker(conn)
@@ -332,7 +332,7 @@ async def test_delist_short_shortfall_uses_fund_then_mm(conn: AsyncConnection) -
 
 
 async def test_delist_bounded_short_settles_at_intrinsic(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 8004)
+    account_id = (await bootstrap_user(conn, 8004)).account_id
     await _give_cash(conn, account_id, 10_000_000)
     ticker = await _first_ticker(conn)
     entry_mark = await _quoted(conn, ticker)
@@ -370,7 +370,7 @@ async def test_delist_bounded_short_settles_at_intrinsic(conn: AsyncConnection) 
 async def test_delist_bounded_short_past_knockout_pays_zero(
     conn: AsyncConnection,
 ) -> None:
-    account_id = await bootstrap_user(conn, 8005)
+    account_id = (await bootstrap_user(conn, 8005)).account_id
     await _give_cash(conn, account_id, 10_000_000)
     ticker = await _first_ticker(conn)
     short = await open_bounded_short(conn, user_id=8005, ticker=ticker, quantity=5)
@@ -399,7 +399,7 @@ async def test_delist_bounded_short_past_knockout_pays_zero(
 async def test_delist_cancels_orders_and_resolves_events(
     conn: AsyncConnection,
 ) -> None:
-    account_id = await bootstrap_user(conn, 8006)
+    account_id = (await bootstrap_user(conn, 8006)).account_id
     await _give_cash(conn, account_id, 10_000_000)
     ticker = await _first_ticker(conn)
     mark = await _quoted(conn, ticker)
@@ -488,7 +488,7 @@ async def test_delisted_instrument_never_steps_again(conn: AsyncConnection) -> N
 
 
 async def test_delist_while_halted_settles_immediately(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 8008)
+    account_id = (await bootstrap_user(conn, 8008)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     ticker = await _first_ticker(conn)
     await execute_trade(conn, user_id=8008, ticker=ticker, side="BUY", quantity=3)
@@ -573,7 +573,7 @@ async def test_delist_unknown_and_inactive_tickers_rejected(
 
 async def test_ledger_audit_clean_after_delist(conn: AsyncConnection) -> None:
     """The whole settlement path posts through the ledger: sum-zero holds."""
-    account_id = await bootstrap_user(conn, 8009)
+    account_id = (await bootstrap_user(conn, 8009)).account_id
     await _give_cash(conn, account_id, 10_000_000)
     await _grant_tier(conn, 8009)
     ticker = await _first_ticker(conn)

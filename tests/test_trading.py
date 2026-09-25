@@ -43,7 +43,7 @@ async def _give_cash(conn: AsyncConnection, account_id: int, amount: int) -> Non
 
 
 async def test_buy_moves_cash_creates_position_and_pays_a_fee(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 1001)
+    account_id = (await bootstrap_user(conn, 1001)).account_id
     await _give_cash(conn, account_id, 1_000_000)  # $10,000
     ticker = await _first_ticker(conn)
 
@@ -66,7 +66,7 @@ async def test_buy_moves_cash_creates_position_and_pays_a_fee(conn: AsyncConnect
 
 
 async def test_buy_pushes_price_up_via_impact(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 1002)
+    account_id = (await bootstrap_user(conn, 1002)).account_id
     await _give_cash(conn, account_id, 100_000_000)
     ticker = await _first_ticker(conn)
 
@@ -97,7 +97,7 @@ async def test_sell_without_position_requires_margin_tier(conn: AsyncConnection)
 
 
 async def test_buy_then_sell_all_returns_cash_minus_two_fees(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 1004)
+    account_id = (await bootstrap_user(conn, 1004)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     ticker = await _first_ticker(conn)
 
@@ -118,7 +118,7 @@ async def test_buy_then_sell_all_returns_cash_minus_two_fees(conn: AsyncConnecti
 
 
 async def test_insufficient_funds_rejects_buy_atomically(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 1005)  # only the starting grant, no top-up
+    account_id = (await bootstrap_user(conn, 1005)).account_id  # only the starting grant, no top-up
     ticker = await _first_ticker(conn)
     balance_before = await get_balance(conn, account_id)
 
@@ -140,7 +140,7 @@ async def test_unknown_ticker_is_rejected(conn: AsyncConnection) -> None:
 
 
 async def test_halted_instrument_is_rejected(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 1007)
+    account_id = (await bootstrap_user(conn, 1007)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     ticker = await _first_ticker(conn)
     async with conn.cursor() as cur:
@@ -154,7 +154,7 @@ async def test_halted_instrument_is_rejected(conn: AsyncConnection) -> None:
 async def test_duplicate_interaction_id_is_a_replay_not_a_double_trade(
     conn: AsyncConnection,
 ) -> None:
-    account_id = await bootstrap_user(conn, 1008)
+    account_id = (await bootstrap_user(conn, 1008)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     ticker = await _first_ticker(conn)
 
@@ -188,7 +188,7 @@ async def test_duplicate_interaction_id_is_a_replay_not_a_double_trade(
 async def test_trade_prints_onto_the_latest_candle(conn: AsyncConnection) -> None:
     """Fills between ticks extend the latest candle's high/low and volume --
     otherwise intra-tick trades are invisible to /chart and volume stays 0."""
-    account_id = await bootstrap_user(conn, 1009)
+    account_id = (await bootstrap_user(conn, 1009)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     ticker = await _first_ticker(conn)
     tick_index = await apply_tick(conn, "candle-print-seed")
@@ -219,7 +219,7 @@ async def test_slippage_cap_rejects_and_reports_the_would_be_fill(
     rejects every fill (spread+impact always deviate from the mark), and
     the error carries the would-be fill for the reply. A 100% bound is
     today's behavior: fills unconditionally."""
-    account_id = await bootstrap_user(conn, 1010)
+    account_id = (await bootstrap_user(conn, 1010)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     ticker = await _first_ticker(conn)
     balance_before = await get_balance(conn, account_id)
@@ -280,7 +280,7 @@ async def test_shares_for_dollars_floors_and_the_trade_executes(
 ) -> None:
     """dollar sizing -> whole shares whose estimated all-in cost fits the
     amount, and the resolved quantity fills for real."""
-    account_id = await bootstrap_user(conn, 1012)
+    account_id = (await bootstrap_user(conn, 1012)).account_id
     await _give_cash(conn, account_id, 1_000_000)  # $10,000
     ticker = await _first_ticker(conn)
 
@@ -335,7 +335,7 @@ async def test_shares_for_dollars_anchor_prices_off_the_limit(
 async def test_max_affordable_shares_fits_the_balance(conn: AsyncConnection) -> None:
     """all_in resolves to a size whose quoted all-in cost fits the cash
     balance and then actually executes without tripping funds."""
-    account_id = await bootstrap_user(conn, 1015)
+    account_id = (await bootstrap_user(conn, 1015)).account_id
     await _give_cash(conn, account_id, 300_000)  # $3,000
     ticker = await _first_ticker(conn)
 

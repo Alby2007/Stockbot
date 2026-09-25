@@ -87,7 +87,7 @@ async def test_ledger_audit_is_healthy_on_a_clean_ledger(conn: AsyncConnection) 
 async def test_ledger_audit_flags_accounts_whose_balance_drifted(conn: AsyncConnection) -> None:
     """accounts.balance is a cache over ledger_entries; a write that bypasses
     post_transfer must show up here even though the global sum stays 0."""
-    account_id = await bootstrap_user(conn, 4002)
+    account_id = (await bootstrap_user(conn, 4002)).account_id
     await claim_daily(conn, 4002)
     async with conn.cursor() as cur:
         await cur.execute(
@@ -118,7 +118,7 @@ async def test_set_config_rejects_unknown_out_of_range_and_nonfinite(
 
 
 async def test_admin_adjust_posts_ledger_entries(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 4003)
+    account_id = (await bootstrap_user(conn, 4003)).account_id
     before = await get_balance(conn, account_id)
     await admin_adjust(
         conn, user_id=4003, amount=500, memo="test credit", admin_id=1
@@ -153,7 +153,7 @@ async def test_admin_cancel_order_cancels_any_open_order(
 
 
 async def test_recalc_balances_repairs_cache_drift(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 4005)
+    account_id = (await bootstrap_user(conn, 4005)).account_id
     async with conn.cursor() as cur:
         await cur.execute(
             "UPDATE accounts SET balance = balance + 1 WHERE id = %s", (account_id,)

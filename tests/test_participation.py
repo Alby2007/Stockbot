@@ -98,7 +98,7 @@ async def _order_row(conn: AsyncConnection, order_id: int) -> dict:
 async def test_market_order_over_cap_rejected(conn: AsyncConnection) -> None:
     """A single marketable fill bigger than cap*liquidity raises
     InsufficientDepthError and leaves no trace."""
-    account_id = await bootstrap_user(conn, 5001)
+    account_id = (await bootstrap_user(conn, 5001)).account_id
     await _fund(conn, 5001, 100_000_000)  # $1M -- funds aren't the blocker
     ticker, liquidity = await _ticker_by_liquidity(conn, smallest=True)
     mark = await _quoted(conn, ticker)

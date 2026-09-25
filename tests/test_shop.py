@@ -28,7 +28,7 @@ async def test_default_slot_count_is_base(conn: AsyncConnection) -> None:
 
 
 async def test_buying_a_slot_increases_slot_count_and_costs_money(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 3002)
+    account_id = (await bootstrap_user(conn, 3002)).account_id
     await _give_cash(conn, 3002, 100_000)
     balance_before = await get_balance(conn, account_id)
 
@@ -86,7 +86,7 @@ async def test_insufficient_funds_for_shop_purchase(conn: AsyncConnection) -> No
 async def test_replayed_shop_buy_is_a_noop_not_a_double_charge(conn: AsyncConnection) -> None:
     """A redelivered Discord interaction (client retry) carries the same id;
     the second attempt must be a no-op, not a second charge."""
-    account_id = await bootstrap_user(conn, 3009)
+    account_id = (await bootstrap_user(conn, 3009)).account_id
     await _give_cash(conn, 3009, 1_000_000)
 
     await buy_item(conn, 3009, "slot", interaction_id="shop-interaction-1")
@@ -100,7 +100,7 @@ async def test_replayed_shop_buy_is_a_noop_not_a_double_charge(conn: AsyncConnec
 
 
 async def test_buying_beyond_slot_count_is_rejected(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 3008)
+    account_id = (await bootstrap_user(conn, 3008)).account_id
     await _give_cash(conn, 3008, 10_000_000)
 
     async with conn.cursor() as cur:

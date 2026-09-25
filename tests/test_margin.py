@@ -87,7 +87,7 @@ async def test_shorting_requires_margin_tier(conn: AsyncConnection) -> None:
 async def test_short_open_credits_proceeds_and_marks_negative(
     conn: AsyncConnection,
 ) -> None:
-    account_id = await bootstrap_user(conn, 2002)
+    account_id = (await bootstrap_user(conn, 2002)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     await _grant_tier(conn, 2002)
     ticker = await _first_ticker(conn)
@@ -109,7 +109,7 @@ async def test_short_open_credits_proceeds_and_marks_negative(
 
 
 async def test_initial_margin_blocks_oversized_short(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 2003)
+    account_id = (await bootstrap_user(conn, 2003)).account_id
     await _grant_tier(conn, 2003)
     ticker = await _first_ticker(conn)
     cash = await get_balance(conn, account_id)
@@ -123,7 +123,7 @@ async def test_initial_margin_blocks_oversized_short(conn: AsyncConnection) -> N
 
 
 async def test_cover_short_via_buy(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 2004)
+    account_id = (await bootstrap_user(conn, 2004)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     await _grant_tier(conn, 2004)
     ticker = await _first_ticker(conn)
@@ -138,7 +138,7 @@ async def test_cover_short_via_buy(conn: AsyncConnection) -> None:
 async def test_borrow_fees_accrue_and_settle_on_cover(
     conn: AsyncConnection,
 ) -> None:
-    account_id = await bootstrap_user(conn, 2005)
+    account_id = (await bootstrap_user(conn, 2005)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     await _grant_tier(conn, 2005)
     ticker = await _first_ticker(conn)
@@ -304,7 +304,7 @@ async def test_short_interest_cap(conn: AsyncConnection) -> None:
 
 
 async def test_squeeze_boosts_buy_impact(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 2010)
+    account_id = (await bootstrap_user(conn, 2010)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     ticker = await _first_ticker(conn)
     # Tick rounding quantizes the impact delta to ~tick/price, which at a
@@ -348,7 +348,7 @@ async def test_squeeze_boosts_buy_impact(conn: AsyncConnection) -> None:
 
 
 async def test_spend_gate_blocks_shop_when_margined(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 2011)
+    account_id = (await bootstrap_user(conn, 2011)).account_id
     await _grant_tier(conn, 2011)
     ticker = await _first_ticker(conn)
     await _levered_short(conn, 2011, ticker)
@@ -385,7 +385,7 @@ async def test_sbx40_index_tracks_components(conn: AsyncConnection) -> None:
     assert abs(float(quoted) - expected) / expected < 0.01  # within ~1% (impact only)
 
     # and it trades like a normal instrument
-    account_id = await bootstrap_user(conn, 2012)
+    account_id = (await bootstrap_user(conn, 2012)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     await execute_trade(
         conn, user_id=2012, ticker="SBX40", side="BUY", quantity=1
@@ -397,7 +397,7 @@ async def test_sbx40_index_tracks_components(conn: AsyncConnection) -> None:
 async def test_margin_tier_purchase_unlocks_and_scales(conn: AsyncConnection) -> None:
     await bootstrap_user(conn, 2013)
     assert await margin_tier(conn, 2013, None) == 0
-    account_id = await bootstrap_user(conn, 2013)
+    account_id = (await bootstrap_user(conn, 2013)).account_id
     await _give_cash(conn, account_id, 10_000_000)
     await buy_item(conn, 2013, "margin_tier")
     assert await margin_tier(conn, 2013, None) == 1
@@ -410,7 +410,7 @@ async def test_margin_tier_purchase_unlocks_and_scales(conn: AsyncConnection) ->
 
 
 async def test_refresh_short_interest(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 2014)
+    account_id = (await bootstrap_user(conn, 2014)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     await _grant_tier(conn, 2014)
     ticker = await _first_ticker(conn)
@@ -466,7 +466,7 @@ async def test_borrow_fees_accrue_with_zero_si_cap(conn: AsyncConnection) -> Non
     """margin.max_short_interest_pct = 0 must not NULL the utilization
     divisor -- fees still accrue instead of crashing on Decimal(None)
     at the next cover."""
-    account_id = await bootstrap_user(conn, 2016)
+    account_id = (await bootstrap_user(conn, 2016)).account_id
     await _give_cash(conn, account_id, 1_000_000)
     await _grant_tier(conn, 2016)
     ticker = await _first_ticker(conn)

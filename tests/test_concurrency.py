@@ -80,13 +80,16 @@ async def test_concurrent_bootstrap_grants_once(real_conn: AsyncConnection) -> N
     decides who created the user, and only the winner grants."""
     other = await _real_conn()
     try:
-        account_a, account_b = await asyncio.gather(
+        res_a, res_b = await asyncio.gather(
             bootstrap_user(real_conn, _RACE_USER),
             bootstrap_user(other, _RACE_USER),
         )
     finally:
         await other.close()
-    assert account_a == account_b
+    assert res_a.account_id == res_b.account_id
+    # At most one winner even under the race (both False on re-runs where
+    # the fixed user id already committed).
+    assert not (res_a.created and res_b.created)
 
     async with real_conn.cursor() as cur:
         await cur.execute(
@@ -94,7 +97,7 @@ async def test_concurrent_bootstrap_grants_once(real_conn: AsyncConnection) -> N
             SELECT COUNT(*) FROM ledger_entries
             WHERE account_id = %s AND reason = 'STARTING_GRANT' AND amount > 0
             """,
-            (account_a,),
+            (res_a.account_id,),
         )
         assert (await cur.fetchone())[0] == 1
 

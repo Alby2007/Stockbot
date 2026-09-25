@@ -782,3 +782,33 @@ same-day comparison would be comparing an account to itself.
 `/history` reads `trades` scoped to `season_id IS NULL` — league fills
 never appear in the main-portfolio history, matching every other
 main/league split in the codebase.
+
+**Phase N3 done** (`BootstrapResult`, `/start`, `on_guild_join`):
+`bootstrap_user` now returns `BootstrapResult(account_id, created)`
+instead of a bare int — `created` comes from the `INSERT ... ON CONFLICT
+DO NOTHING` rowcount on the `users` row, so it's exactly-once and
+race-safe (two concurrent first-uses serialize on the unique index; only
+the winner sees `created=True` and issues the grant). Callers that need
+the account must use `.account_id`; ensure-existence callers just
+discard the result. `create_user_account` returns `(account_id,
+created)` the same way.
+
+`created` drives first-use onboarding: `_welcome_suffix(created)` is
+appended to whichever public response the account-creating command
+produces (it's on every success path in `commands.py` — the flag is
+exactly-once so the welcome can't double-fire, and a user whose first
+command is `/liquidations` still gets it). It deliberately mentions the
+24h first-claim gate so a day-one `/claim` rejection doesn't read like
+a bug. `/start` is the explicit tour — bootstraps the account, then an
+embed covering grant, market/stock/chart, buy/sell/orders, the claim
+gates, bounded shorts + `margin_tier`, and leagues.
+
+`on_guild_join` posts `guild_welcome_message()` once per guild. This
+needed the one intent change since launch: `Intents.none()` +
+`intents.guilds = True` — `guilds` is non-privileged (privileged ones
+stay off: no members, presences, or message_content), and without it
+Discord never sends GUILD_CREATE. Side benefit: the heartbeat's
+`guilds` count is real now. Channel choice is probe-by-send (system
+channel, then text channels, max 3 attempts) because `guild.me` isn't
+reliably cached without the members intent; `Forbidden` moves to the
+next candidate, other HTTP errors stop.

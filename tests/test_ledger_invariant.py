@@ -40,7 +40,9 @@ async def test_ledger_sum_is_always_zero_under_fuzzing(conn: AsyncConnection, se
     rng = random.Random(seed)
     num_users = 8
     user_ids = list(range(1_000 + seed * 100, 1_000 + seed * 100 + num_users))
-    account_ids = [await bootstrap_user(conn, uid) for uid in user_ids]
+    account_ids = [
+        (await bootstrap_user(conn, uid)).account_id for uid in user_ids
+    ]
 
     sink_id = await get_system_account_id(conn, "SINK")
 
@@ -97,8 +99,8 @@ async def test_ledger_sum_is_always_zero_under_fuzzing(conn: AsyncConnection, se
 
 
 async def test_overdraft_is_rejected_and_atomic(conn: AsyncConnection) -> None:
-    payer = await bootstrap_user(conn, 42)
-    payee = await bootstrap_user(conn, 43)
+    payer = (await bootstrap_user(conn, 42)).account_id
+    payee = (await bootstrap_user(conn, 43)).account_id
 
     balance_before = await get_balance(conn, payer)
     payee_balance_before = await get_balance(conn, payee)
@@ -122,9 +124,9 @@ async def test_round_trip_is_loss_making_once_a_fee_applies(conn: AsyncConnectio
     """A wash-trade defense sanity check at the ledger level: moving money out
     and back via a sink fee always leaves the account strictly poorer.
     """
-    account_id = await bootstrap_user(conn, 99)
+    account_id = (await bootstrap_user(conn, 99)).account_id
     sink_id = await get_system_account_id(conn, "SINK")
-    other_id = await bootstrap_user(conn, 100)
+    other_id = (await bootstrap_user(conn, 100)).account_id
 
     start_balance = await get_balance(conn, account_id)
     fee = 10
@@ -153,7 +155,7 @@ async def test_round_trip_is_loss_making_once_a_fee_applies(conn: AsyncConnectio
 
 
 async def test_ledger_entries_are_immutable(conn: AsyncConnection) -> None:
-    account_id = await bootstrap_user(conn, 7)
+    account_id = (await bootstrap_user(conn, 7)).account_id
     faucet_id = await get_system_account_id(conn, "FAUCET")
     await post_transfer(
         conn, from_account_id=faucet_id, to_account_id=account_id, amount=1, reason="TEST"
