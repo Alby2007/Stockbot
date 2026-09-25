@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 
+def _money(minor_units: int) -> str:
+    """Local copy of bot.format.format_money -- the domain layer can't
+    import the bot package (it sits above it), and raw minor units in
+    user-facing messages were an N4 bug."""
+    return f"${minor_units / 100:,.2f}"
+
+
 class MarginError(Exception):
     """Base class for margin-related rejections."""
 
@@ -19,7 +26,10 @@ class InsufficientMarginError(MarginError):
     def __init__(self, equity_minor: int, required_minor: int) -> None:
         self.equity_minor = equity_minor
         self.required_minor = required_minor
-        super().__init__(f"insufficient margin: equity {equity_minor} < required {required_minor}")
+        super().__init__(
+            f"insufficient margin: equity {_money(equity_minor)} < "
+            f"required {_money(required_minor)}"
+        )
 
 
 class ShortInterestLimitError(MarginError):
@@ -36,7 +46,10 @@ class PositionLimitError(MarginError):
     def __init__(self, gross_minor: int, cap_minor: int) -> None:
         self.gross_minor = gross_minor
         self.cap_minor = cap_minor
-        super().__init__(f"gross notional {gross_minor} exceeds leverage cap {cap_minor}")
+        super().__init__(
+            f"gross notional {_money(gross_minor)} exceeds leverage cap "
+            f"{_money(cap_minor)}"
+        )
 
 
 class MarginSpendBlockedError(MarginError):
@@ -46,6 +59,6 @@ class MarginSpendBlockedError(MarginError):
         self.equity_after_minor = equity_after_minor
         self.maint_req_minor = maint_req_minor
         super().__init__(
-            f"spend blocked: equity {equity_after_minor} would be below "
-            f"maintenance margin {maint_req_minor}"
+            f"spend blocked: equity {_money(equity_after_minor)} would be "
+            f"below maintenance margin {_money(maint_req_minor)}"
         )

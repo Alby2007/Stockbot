@@ -812,3 +812,30 @@ Discord never sends GUILD_CREATE. Side benefit: the heartbeat's
 channel, then text channels, max 3 attempts) because `guild.me` isn't
 reliably cached without the members intent; `Forbidden` moves to the
 next candidate, other HTTP errors stop.
+
+**Phase N4 done** (margin error formatting + explicit oversell opt-in):
+`margin/errors.py` renders minor units as dollars via a local `_money`
+(the domain layer can't import `bot.format` — it sits below it). The
+oversell gate: `/sell` and `/order sell` take `short: bool`. A market
+sell with `qty > max(held, 0)` and no flag stops at a holdings-aware
+ephemeral before `execute_trade`; with it, the request reaches the
+normal margin gates (tier-0 → `MarginNotUnlockedError`). `all_in`
+sells can never oversell; dollar-sized sells only uncap at the
+position when the flag is set. For resting orders the gate lives at
+fill time, not placement: `orders.allow_short` (0037, default FALSE)
+makes `_match_once` clamp a SELL's fillable size to a per-user
+`sellable` pool (position floored at 0, shared across the user's asks
+in the book, decremented per settle — pass 1 crosses, the closing
+auction's `_volume_at` supply, and pass-2 MM fills all respect it).
+An unbacked ask is *skipped*, never counted as a `fill_failure` —
+position-dependent, same category as `_LimitBreach`. `place_order`
+gains `allow_short`; `_place_order`'s dollars-sizing stops capping at
+holdings when `short: True`, and the resting-order confirmation notes
+unbacked shares. `execute_trade`'s own semantics are unchanged —
+direct service callers (liquidation, seeds, tests) can still open
+shorts; only the user-facing entry points gate. `/admin` is hidden
+from non-admin slash pickers via `default_permissions` (the `_is_admin`
+runtime check stays — Discord's filter is a display hint). Empty
+states got pointers (`/portfolio`→`/market`, `/order list`→`/order`,
+`/shorts`→`/short`, `/liquidations`→`/margin`) and `/market` `/movers`
+`/order list` `/shorts` `/liquidations` gained column headers.

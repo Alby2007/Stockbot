@@ -169,6 +169,7 @@ async def _resolve_quantity(
     dollars: float | None,
     all_in: bool,
     season_id: int | None,
+    allow_short: bool = False,
 ) -> tuple[int, bool]:
     """Resolve the user's sizing input to a share count.
 
@@ -203,7 +204,7 @@ async def _resolve_quantity(
     dollars_minor = int(Decimal(str(dollars)) * 100)
     if side == "SELL":
         held = await _held_shares(conn, user_id, ticker, season_id)
-        if held <= 0:
+        if held <= 0 and not allow_short:
             raise TradingError(f"you don't hold any {ticker}")
         qty = await shares_for_dollars(
             conn,
@@ -220,6 +221,10 @@ async def _resolve_quantity(
                 f"1 {ticker} share nets ~{format_money(quote.unit_minor)} "
                 "— too small an amount"
             )
+        if allow_short:
+            # Opted in to margin shorting: a dollar-sized sell means the
+            # whole amount, not just the held part.
+            return qty, False
         return min(qty, held), qty > held
     qty = await shares_for_dollars(
         conn,
@@ -423,7 +428,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 until = ticks_until_open(cur_tick, open_ticks, closed_ticks, offset)
                 status = f"Session: **CLOSED** — reopens in ~{until} min\n"
 
-        lines = []
+        lines = ["ticker  sector           price       24h"]
         for s in sorted(snapshots, key=lambda s: (s.sector_key, s.ticker)):
             marker = " (halted)" if s.is_halted else ""
             change = format_pct(s.day_change_pct) if s.day_change_pct is not None else "   n/a"
@@ -612,7 +617,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             return
 
         def _lines(items: list[InstrumentSnapshot]) -> str:
-            return "\n".join(
+            return "ticker      price       24h\n" + "\n".join(
                 f"{s.ticker:<6} {format_price(s.quoted_price):>10} "
                 f"{format_pct(s.day_change_pct):>9}"  # type: ignore[arg-type]
                 for s in items
@@ -810,6 +815,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             title=f"{interaction.user.display_name}'s {'league' if league else ''} portfolio"
         )
         embed.description = "```\n" + "\n".join(lines) + "\n```"
+        if not positions:
+            embed.set_footer(
+                text=(
+                    "No league positions — /league standings shows the board."
+                    if league
+                    else "No positions yet — /market shows what's tradeable."
+                )
+            )
         await interaction.response.send_message(
             content=_welcome_suffix(created) or None, embed=embed
         )
@@ -967,6 +980,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         all_in="Sell your entire position",
         league="Trade from your season league stake instead of your main portfolio",
         slippage="Max slippage vs the mark, in percent (e.g. 2.5)",
+        short="Opt in to selling past your position (opens a margin short)",
     )
     async def sell(
         interaction: discord.Interaction,
@@ -976,9 +990,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         all_in: bool = False,
         league: bool = False,
         slippage: app_commands.Range[float, 0.01, 100.0] | None = None,
+        short: bool = False,
     ) -> None:
         await _do_trade(
-            interaction, ticker, "SELL", quantity, dollars, all_in, league, slippage
+            interaction, ticker, "SELL", quantity, dollars, all_in, league,
+            slippage, short,
         )
 
     async def _do_trade(
@@ -990,6 +1006,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         all_in: bool,
         league: bool,
         slippage: float | None,
+        short: bool = False,
     ) -> None:
         async with db.connection() as conn:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
@@ -1015,10 +1032,31 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     dollars=dollars,
                     all_in=all_in,
                     season_id=season_id,
+                    allow_short=short,
                 )
             except TradingError as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
                 return
+            if side == "SELL" and not short:
+                # N4.2: a sell that would push the position below zero is a
+                # margin short in disguise -- refuse with a holdings-aware
+                # message unless the user opted in with `short: True`.
+                held = await _held_shares(
+                    conn, interaction.user.id, ticker, season_id
+                )
+                if qty > max(held, 0):
+                    pos_note = (
+                        f"You hold **{held:,}** {ticker.upper()} — "
+                        if held > 0
+                        else f"You're already short **{-held:,}** {ticker.upper()} — "
+                    )
+                    await interaction.response.send_message(
+                        f"{pos_note}selling {qty:,} would open a margin "
+                        "short. Re-run with `short: True` to confirm "
+                        "(needs a margin tier from `/shop`).",
+                        ephemeral=True,
+                    )
+                    return
             try:
                 result = await execute_trade(
                     conn,
@@ -1183,10 +1221,13 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
         if not rows:
             await interaction.response.send_message(
-                "No open bounded shorts.", ephemeral=True
+                "No open bounded shorts — `/short <ticker>` opens one.",
+                ephemeral=True,
             )
             return
-        lines = []
+        lines = [
+            "id    ticker      qty          entry            KO       P&L"
+        ]
         for s in rows:
             pnl_pct = float(s["entry_price"]) / float(s["quoted_price"]) - 1
             lines.append(
@@ -1337,11 +1378,16 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             created = (await bootstrap_user(conn, interaction.user.id)).created
             rows = await list_liquidations(conn, interaction.user.id)
         if not rows:
-            await interaction.response.send_message("No liquidations.", ephemeral=True)
+            await interaction.response.send_message(
+                "No liquidations — `/margin` shows your current health.",
+                ephemeral=True,
+            )
             return
         lines = [
+            "id    ticker  side      qty           fill      penalty"
+        ] + [
             f"#{r['id']:<4} {r['ticker']:<6} {r['side']:<4} {r['quantity_closed']:>6} @ "
-            f"{format_price(r['fill_price']):>10}  penalty {format_money(r['penalty_minor'])}"
+            f"{format_price(r['fill_price']):>10}  {format_money(r['penalty_minor']):>9}"
             for r in rows
         ]
         embed = discord.Embed(title="Liquidations")
@@ -1365,6 +1411,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         hours: float | None,
         league: bool,
         display: int | None,
+        short: bool = False,
     ) -> None:
         if limit is None and stop is None:
             await interaction.response.send_message(
@@ -1411,13 +1458,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     )
                     return
                 capped = False
-                if side == "SELL":
+                if side == "SELL" and not short:
                     held = await _held_shares(
                         conn, interaction.user.id, ticker, season_id
                     )
                     if held <= 0:
                         await interaction.response.send_message(
-                            f"You don't hold any {ticker.upper()}.",
+                            f"You don't hold any {ticker.upper()}. "
+                            "Pass `short: True` to sell past your position.",
                             ephemeral=True,
                         )
                         return
@@ -1426,6 +1474,12 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 quantity = qty
             else:
                 capped = False
+            unbacked = 0
+            if side == "SELL" and not short:
+                held = await _held_shares(
+                    conn, interaction.user.id, ticker, season_id
+                )
+                unbacked = max(0, quantity or 0) - max(held, 0)
             assert quantity is not None
             try:
                 result = await place_order(
@@ -1442,6 +1496,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     interaction_id=str(interaction.id),
                     stop_price=None if stop is None else Decimal(str(stop)),
                     display_qty=display,
+                    allow_short=short,
                 )
             except (TradingError, ValueError) as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
@@ -1477,10 +1532,16 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             else ""
         )
         position_capped = " (capped at your position)" if capped else ""
+        unbacked_note = (
+            f" — {unbacked:,} share(s) rest unbacked and can't fill unless "
+            "you buy more or re-place with `short: True`"
+            if unbacked > 0
+            else ""
+        )
         await interaction.response.send_message(
             f"Order **#{result.order_id}** resting: {result.side} "
             f"**{result.quantity:,}** {result.ticker} {price_part}{iceberg}"
-            f"{notional}{position_capped} "
+            f"{notional}{position_capped}{unbacked_note} "
             f"({expiry}). Fills when the market reaches it."
             + _welcome_suffix(created)
         )
@@ -1526,6 +1587,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         hours="Auto-expire after this many hours (omit for GTC)",
         league="Place the order in your league portfolio",
         display="Iceberg: show only this many shares in the book",
+        short="Opt in to selling past your position (opens a margin short)",
     )
     async def order_sell(
         interaction: discord.Interaction,
@@ -1537,10 +1599,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         hours: app_commands.Range[float, 0.02, 8760.0] | None = None,
         league: bool = False,
         display: app_commands.Range[int, 1, 1_000_000_000] | None = None,
+        short: bool = False,
     ) -> None:
         await _place_order(
             interaction, ticker, "SELL", quantity, dollars,
-            limit, stop, hours, league, display
+            limit, stop, hours, league, display, short,
         )
 
     @order_group.command(name="list", description="Show your resting orders")
@@ -1559,7 +1622,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 season_id = entry[0]
             rows = await list_open_orders(conn, interaction.user.id, season_id)
         if not rows:
-            await interaction.response.send_message("No open orders.", ephemeral=True)
+            await interaction.response.send_message(
+                "No open orders — `/order buy` or `/order sell` to rest one.",
+                ephemeral=True,
+            )
             return
         def _order_line(r: dict[str, Any]) -> str:
             remaining = r["quantity"] - r["filled_quantity"]
@@ -1584,7 +1650,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"{triggered}{iceberg}"
             )
 
-        lines = [_order_line(r) for r in rows]
+        lines = [
+            "id    side    qty ticker                     price"
+        ] + [_order_line(r) for r in rows]
         embed = discord.Embed(title="Open orders")
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(
@@ -1797,7 +1865,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
     tree.add_command(league_group)
 
-    admin_group = app_commands.Group(name="admin", description="Bot admin tools")
+    # default_permissions hides the whole group from the slash picker
+    # for non-admins (N4.5); _is_admin stays as the runtime gate --
+    # Discord's permission filter is a display hint, not authorization.
+    admin_group = app_commands.Group(
+        name="admin",
+        description="Bot admin tools",
+        default_permissions=discord.Permissions(administrator=True),
+    )
 
     def _is_admin(interaction: discord.Interaction) -> bool:
         return interaction.user.id in get_settings().admin_user_ids

@@ -110,6 +110,7 @@ async def place_order(
     interaction_id: str | None = None,
     stop_price: Decimal | None = None,
     display_qty: int | None = None,
+    allow_short: bool = False,
 ) -> OrderResult:
     """Validate and rest an order. Marketability/margin are re-checked at
     fill time; placement only rejects structurally bad orders.
@@ -119,6 +120,10 @@ async def place_order(
     `display_qty` caps the size shown in the /stock depth ladder (an
     iceberg): the matcher still works the real remaining quantity, and
     the visible slice refills until the order drains.
+
+    `allow_short` is the N4 oversell opt-in: a SELL without it is
+    clamped to the seller's position at fill time (the unbacked part
+    stays OPEN) instead of silently opening a margin short.
     """
     if quantity <= 0:
         raise ValueError("quantity must be positive")
@@ -196,8 +201,8 @@ async def place_order(
             INSERT INTO orders
                 (user_id, instrument_id, season_id, side, quantity,
                  limit_price, opened_tick, expires_tick, order_type, stop_price,
-                 display_qty)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 display_qty, allow_short)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -212,6 +217,7 @@ async def place_order(
                 order_type,
                 stop_price,
                 display_qty,
+                allow_short,
             ),
         )
         order_row = await cur.fetchone()
@@ -291,6 +297,22 @@ async def _account_for_order(conn: AsyncConnection, order: dict[str, Any]) -> in
     if row is None:
         raise NotInLeagueError(user_id, int(season_id))
     return int(row[0])
+
+
+async def _sellable_qty(conn: AsyncConnection, order: dict[str, Any]) -> int:
+    """Shares a SELL order may move without opening or growing a margin
+    short: the position floored at 0 (N4.2, `orders.allow_short`)."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT quantity FROM positions
+            WHERE user_id = %s AND instrument_id = %s
+              AND season_id IS NOT DISTINCT FROM %s
+            """,
+            (order["user_id"], order["instrument_id"], order["season_id"]),
+        )
+        row = await cur.fetchone()
+    return max(0, int(row[0])) if row else 0
 
 
 async def _settle_cross(
@@ -622,6 +644,7 @@ async def _auction_clear(
     tick_index: int,
     flow_halt_ticks: int,
     spread_cfg: dict[str, float],
+    sellable: dict[int, int],
     stats: dict[str, int] | None,
 ) -> int:
     """Closing auction (Plan C): clear one book at a single uniform price.
@@ -668,8 +691,15 @@ async def _auction_clear(
             for b in bids
             if _eff(b, Decimal("Infinity")) >= price
         )
+        # N4.2: unbacked asks (no allow_short) can only supply what the
+        # seller holds -- `sellable` is a per-user pool, so this still
+        # overestimates slightly when one user rests several asks, but
+        # settle-time clamping keeps that cosmetic, never a short.
         supply = sum(
-            remaining[int(a["id"])]
+            min(
+                remaining[int(a["id"])],
+                sellable.get(int(a["user_id"]), remaining[int(a["id"])]),
+            )
             for a in asks
             if _eff(a, Decimal(0)) <= price
         )
@@ -728,6 +758,12 @@ async def _auction_clear(
                 i += 1
             continue
         quantity = min(remaining[int(bid["id"])], remaining[int(ask["id"])])
+        if not ask["allow_short"]:
+            quantity = min(quantity, sellable.get(int(ask["user_id"]), 0))
+            if quantity <= 0:
+                # Unbacked seller -- nothing to clear against; next ask.
+                j += 1
+                continue
         try:
             async with conn.transaction():
                 mark, _impact, halted = await _settle_cross(
@@ -756,6 +792,8 @@ async def _auction_clear(
             stats["auction_fills"] = stats.get("auction_fills", 0) + 1
         remaining[int(bid["id"])] -= quantity
         remaining[int(ask["id"])] -= quantity
+        if int(ask["user_id"]) in sellable:
+            sellable[int(ask["user_id"])] -= quantity
         if remaining[int(bid["id"])] == 0:
             i += 1
         if remaining[int(ask["id"])] == 0:
@@ -789,7 +827,7 @@ async def _match_once(
             """
             SELECT o.id, o.user_id, o.season_id, o.side, o.quantity,
                    o.filled_quantity, o.limit_price, o.order_type,
-                   o.opened_tick,
+                   o.opened_tick, o.allow_short,
                    o.instrument_id, i.ticker, i.base_price, i.impact,
                    i.quoted_price, i.liquidity, i.lambda_impact, i.max_impact,
                    i.next_halting_event_tick,
@@ -845,6 +883,15 @@ async def _match_once(
             int(o["id"]): int(o["quantity"]) - int(o["filled_quantity"])
             for o in bids + asks
         }
+        # N4.2: a SELL without allow_short can only move shares the
+        # seller actually holds. Pool per user (all their asks share one
+        # position), decremented as crosses settle; a buy leg filling
+        # first can't be seen here, so this is a conservative floor.
+        sellable: dict[int, int] = {}
+        for a in asks:
+            uid = int(a["user_id"])
+            if not a["allow_short"] and uid not in sellable:
+                sellable[uid] = await _sellable_qty(conn, a)
         # Tick-open anchor for the collar: `mark` drifts as crosses print,
         # so comparing each new cross to the live mark lets pairs ratchet
         # the price collar-width at a time. Anchor to the mark this
@@ -865,6 +912,7 @@ async def _match_once(
                 tick_index=tick_index,
                 flow_halt_ticks=flow_halt_ticks,
                 spread_cfg=spread_cfg,
+                sellable=sellable,
                 stats=stats,
             )
             continue
@@ -908,6 +956,15 @@ async def _match_once(
                     j += 1
                 continue
             quantity = min(remaining[int(bid["id"])], remaining[int(ask["id"])])
+            if not ask["allow_short"]:
+                quantity = min(quantity, sellable.get(int(ask["user_id"]), 0))
+                if quantity <= 0:
+                    # Nothing this seller can part with -- the ask is
+                    # unbacked, not stale; it stays OPEN and the next
+                    # seller gets a shot (position-dependent, like
+                    # _LimitBreach: never counts as a fill failure).
+                    j += 1
+                    continue
             try:
                 async with conn.transaction():
                     mark, _impact, halted = await _settle_cross(
@@ -935,6 +992,8 @@ async def _match_once(
                 stats["crosses"] += 1
             remaining[int(bid["id"])] -= quantity
             remaining[int(ask["id"])] -= quantity
+            if int(ask["user_id"]) in sellable:
+                sellable[int(ask["user_id"])] -= quantity
             if remaining[int(bid["id"])] == 0:
                 i += 1
             if remaining[int(ask["id"])] == 0:
@@ -959,7 +1018,8 @@ async def _match_once(
         await cur.execute(
             """
             SELECT o.id, o.user_id, o.season_id, o.side, o.quantity,
-                   o.filled_quantity, o.limit_price, o.order_type, i.ticker,
+                   o.filled_quantity, o.limit_price, o.order_type,
+                   o.allow_short, o.instrument_id, i.ticker,
                    i.base_price,
                    i.impact, i.liquidity, i.adv, i.lambda_impact, i.max_impact,
                    i.vol_state, i.flow_skew,
@@ -1018,6 +1078,15 @@ async def _match_once(
         cap_qty = int(cap * liq_eff / fill_full)
         budget = cap_qty - depth_used.get(int(order["id"]), 0)
         trade_qty = min(remaining_qty, budget)
+        if (
+            trade_qty >= 1
+            and order["side"] == "SELL"
+            and not order["allow_short"]
+        ):
+            # N4.2: an unbacked SELL can only move shares the seller
+            # holds -- the rest stays resting (position-dependent skip,
+            # never a fill_failure).
+            trade_qty = min(trade_qty, await _sellable_qty(conn, order))
         if trade_qty < 1:
             continue
         # Executable price check at the actual size: the fill path includes

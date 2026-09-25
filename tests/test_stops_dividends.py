@@ -283,6 +283,8 @@ async def test_stop_cascade_is_bounded(conn: AsyncConnection) -> None:
     # single-fill mark move the engine allows, ~lambda*sqrt(0.1). B's stop
     # sits just under, so only a post-A mark crosses it.
     qty_a = max(1, int(Decimal(str(liquidity)) * Decimal("0.10") / mark))
+    # Both stops sell past the position (user 6005 holds nothing) -- they
+    # intend to short, so they carry the N4 opt-in flag.
     stop_a = await place_order(
         conn,
         user_id=6005,
@@ -291,6 +293,7 @@ async def test_stop_cascade_is_bounded(conn: AsyncConnection) -> None:
         quantity=qty_a,
         limit_price=None,
         stop_price=(mark * Decimal("1.5")).quantize(Decimal("0.000001")),
+        allow_short=True,
     )
     # B's stop sits halfway through the mark move A's fill should cause
     # (lambda*sqrt(participation)), so it only triggers after A prints.
@@ -305,6 +308,7 @@ async def test_stop_cascade_is_bounded(conn: AsyncConnection) -> None:
         stop_price=(mark * Decimal(str(1 - expected_drop * 0.5))).quantize(
             Decimal("0.000001")
         ),
+        allow_short=True,
     )
 
     await match_orders(conn, 6)
