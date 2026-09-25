@@ -839,3 +839,20 @@ runtime check stays — Discord's filter is a display hint). Empty
 states got pointers (`/portfolio`→`/market`, `/order list`→`/order`,
 `/shorts`→`/short`, `/liquidations`→`/margin`) and `/market` `/movers`
 `/order list` `/shorts` `/liquidations` gained column headers.
+
+**Phase N5 done** (`bot/autocomplete.py` + `@app_commands.autocomplete`
+wiring): `ticker_autocomplete` (ticker-prefix matches first, name-prefix
+fills to 25 — the matcher returns ALL prefix hits uncapped so the
+fallback can still find real matches; the 25-cap is applied at choice
+time), `sector_autocomplete` (for `/admin instrument-add` — its `ticker`
+is deliberately NOT autocompleted since it's a new symbol),
+`shop_item_autocomplete` (`shop_items.key`), `short_autocomplete` +
+`order_autocomplete` (both scoped to `interaction.user.id`'s OPEN rows —
+pickers never leak other users' ids; `#id` or ticker text both filter),
+`admin_order_autocomplete` (unscoped — `/admin order-cancel` exists to
+fix other people's orders), `tunable_param_autocomplete` (the
+`TUNABLE_PARAMS` allow-list). Cursor-vs-input shadowing gotcha: the
+callbacks use `cursor` for psycopg cursors and `cur` for the typed
+string — mypy treats a reassigned name as one type. `/stock`'s Mark
+field reads "Mark (mid)" whenever bid/ask are shown so the mark isn't
+mistaken for a tradeable price.

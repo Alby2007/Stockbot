@@ -34,6 +34,15 @@ from stockbot.admin.service import (
     set_config,
     tune_instrument,
 )
+from stockbot.bot.autocomplete import (
+    admin_order_autocomplete,
+    order_autocomplete,
+    sector_autocomplete,
+    shop_item_autocomplete,
+    short_autocomplete,
+    ticker_autocomplete,
+    tunable_param_autocomplete,
+)
 from stockbot.bot.chart_view import (
     TIMEFRAME_SPANS,
     build_chart_view,
@@ -445,6 +454,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
     @tree.command(name="stock", description="Show detail for one instrument")
     @app_commands.describe(ticker="Instrument ticker, e.g. NORT")
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def stock(interaction: discord.Interaction, ticker: str) -> None:
         async with db.connection() as conn:
             snapshot = await get_instrument_snapshot(conn, ticker)
@@ -472,7 +482,17 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
         embed = discord.Embed(title=f"{snapshot.ticker} \u2014 {snapshot.name}")
         embed.add_field(name="Sector", value=snapshot.sector_name)
-        embed.add_field(name="Mark", value=format_price(snapshot.quoted_price))
+        # "Mark (mid)" reads better once bid/ask are on screen: the mark
+        # IS the mid, and saying so keeps users from reading it as a
+        # tradeable price.
+        embed.add_field(
+            name=(
+                "Mark (mid)"
+                if snapshot.bid is not None and snapshot.ask is not None
+                else "Mark"
+            ),
+            value=format_price(snapshot.quoted_price),
+        )
         if snapshot.bid is not None and snapshot.ask is not None:
             embed.add_field(
                 name="Bid / Ask",
@@ -544,6 +564,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             app_commands.Choice(name="Ticks", value="ticks"),
         ],
     )
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def chart(
         interaction: discord.Interaction,
         ticker: str,
@@ -957,6 +978,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         league="Trade from your season league stake instead of your main portfolio",
         slippage="Max slippage vs the mark, in percent (e.g. 2.5)",
     )
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def buy(
         interaction: discord.Interaction,
         ticker: str,
@@ -982,6 +1004,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         slippage="Max slippage vs the mark, in percent (e.g. 2.5)",
         short="Opt in to selling past your position (opens a margin short)",
     )
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def sell(
         interaction: discord.Interaction,
         ticker: str,
@@ -1129,6 +1152,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         dollars="Short ~this many dollars of notional instead of a share count",
         league="Use your season league stake instead of your main portfolio",
     )
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def short(
         interaction: discord.Interaction,
         ticker: str,
@@ -1245,6 +1269,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
     @tree.command(name="cover", description="Close a bounded short at market")
     @app_commands.describe(short_id="Bounded short id from /shorts")
+    @app_commands.autocomplete(short_id=short_autocomplete)
     async def cover(interaction: discord.Interaction, short_id: int) -> None:
         async with db.connection() as conn:
             created = (await bootstrap_user(conn, interaction.user.id)).created
@@ -1557,6 +1582,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         league="Place the order in your league portfolio",
         display="Iceberg: show only this many shares in the book",
     )
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def order_buy(
         interaction: discord.Interaction,
         ticker: str,
@@ -1589,6 +1615,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         display="Iceberg: show only this many shares in the book",
         short="Opt in to selling past your position (opens a margin short)",
     )
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def order_sell(
         interaction: discord.Interaction,
         ticker: str,
@@ -1661,6 +1688,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
     @order_group.command(name="cancel", description="Cancel a resting order")
     @app_commands.describe(order_id="Order id from /order list")
+    @app_commands.autocomplete(order_id=order_autocomplete)
     async def order_cancel(interaction: discord.Interaction, order_id: int) -> None:
         async with db.connection() as conn:
             created = (await bootstrap_user(conn, interaction.user.id)).created
@@ -1724,6 +1752,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
     @shop_group.command(name="buy", description="Buy an item from the shop")
     @app_commands.describe(item="Item key, e.g. slot, analyst_tools, theme_sunrise")
+    @app_commands.autocomplete(item=shop_item_autocomplete)
     async def shop_buy(interaction: discord.Interaction, item: str) -> None:
         async with db.connection() as conn:
             created = (await bootstrap_user(conn, interaction.user.id)).created
@@ -1882,6 +1911,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ticker="Instrument ticker",
         param=f"One of: {', '.join(TUNABLE_PARAMS)}",
         value="New value",
+    )
+    @app_commands.autocomplete(
+        ticker=ticker_autocomplete, param=tunable_param_autocomplete
     )
     async def admin_tune(
         interaction: discord.Interaction, ticker: str, param: str, value: float
@@ -2079,6 +2111,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         name="order-cancel", description="Force-cancel any OPEN order (zombie repair)"
     )
     @app_commands.describe(order_id="Order id")
+    @app_commands.autocomplete(order_id=admin_order_autocomplete)
     async def admin_order_cancel(interaction: discord.Interaction, order_id: int) -> None:
         if not _is_admin(interaction):
             await interaction.response.send_message("Not authorized.", ephemeral=True)
@@ -2183,6 +2216,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         gamma="Sector-factor loading (default: sector median)",
         liquidity="Notional depth for impact scaling (default: sector median)",
     )
+    @app_commands.autocomplete(sector=sector_autocomplete)
     async def admin_instrument_add(
         interaction: discord.Interaction,
         ticker: str,
@@ -2224,6 +2258,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         description="Delist an instrument: settles all positions/orders/shorts at the final mark",
     )
     @app_commands.describe(ticker="Instrument ticker")
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def admin_delist(interaction: discord.Interaction, ticker: str) -> None:
         if not _is_admin(interaction):
             await interaction.response.send_message("Not authorized.", ephemeral=True)
