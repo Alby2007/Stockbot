@@ -749,3 +749,36 @@ so a full table scan every 5s stays cheap (partial index on
 into the poller's SELECT via a JOIN), not write time — an opted-out
 user's rows are never touched (not retried, not dead-lettered, `attempts`
 stays 0), so opting back in surfaces the backlog instead of losing it.
+
+**Phase N2 done** (`src/stockbot/status/service.py`,
+`migrations/0036_net_worth_snapshots.sql`): `/leaderboard`, `/history`,
+`/compare`, `/profile`. Net worth for a main portfolio is the same shape
+as `margin.compute_health`'s equity (cash + mark-to-market positions +
+bounded-short liquidation value − accrued borrow fees/dividends), but
+`_NET_WORTH_EXPR`/`_NET_WORTH_JOINS` compute it for *every* USER account
+at once (one query, not N) — `kind = 'USER'` alone excludes both LEAGUE
+and SYSTEM accounts (the 0009 CHECK ties `kind='USER'` to
+`season_id IS NULL`, so there's no separate season_id filter to forget).
+Ranks are `ROW_NUMBER()` (sequential, tie-broken by user_id), not `RANK()`
+— the plan's "rank 14 of 212" phrasing means a position, not a tied
+placement. `leaderboard()` is a whole-table read every call, called out
+in its own docstring as the thing to replace with a materialized
+`leaderboard_snapshots` table if it ever gets hot; not worth the
+complexity yet.
+
+"24h change" needed net worth *history*, which nothing tracked (unlike
+instruments, whose `day_change_pct` reads `candles` directly — a user's
+past net worth can't be reconstructed after the fact, since positions
+mutate in place with no version history). `net_worth_snapshots` fixes
+that the same way `seasons.equity_snapshots` does for league accounts:
+one `INSERT ... SELECT` over every USER account at the day boundary,
+called from `market/tick.py` right next to `seasons.on_tick` in both the
+OPEN and CLOSED branches (same unconditional-call-with-internal-modulo-
+guard pattern, so it's a no-op most ticks). `day_change_pct` compares
+against the latest snapshot strictly before *today's* day_index, and
+returns `None` (never a synthetic 0%) when there isn't one yet — a
+same-day comparison would be comparing an account to itself.
+
+`/history` reads `trades` scoped to `season_id IS NULL` — league fills
+never appear in the main-portfolio history, matching every other
+main/league split in the codebase.

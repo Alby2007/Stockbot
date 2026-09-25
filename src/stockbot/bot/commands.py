@@ -93,6 +93,7 @@ from stockbot.shorts.service import (
     list_open_shorts,
     open_bounded_short,
 )
+from stockbot.status import service as status_svc
 from stockbot.trading.errors import DuplicateInteractionError, TradingError
 from stockbot.trading.service import (
     execute_trade,
@@ -692,6 +693,117 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             title=f"{interaction.user.display_name}'s {'league' if league else ''} portfolio"
         )
         embed.description = "```\n" + "\n".join(lines) + "\n```"
+        await interaction.response.send_message(embed=embed)
+
+    @tree.command(
+        name="leaderboard", description="Top net worth across the whole server economy"
+    )
+    async def leaderboard_cmd(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            rows = await status_svc.leaderboard(conn)
+        if not rows:
+            await interaction.response.send_message("No accounts yet.", ephemeral=True)
+            return
+        lines = [
+            f"{r.rank:>3}. <@{r.user_id}>  {format_money(r.equity_minor):>14}"
+            for r in rows[:15]
+        ]
+        caller = next((r for r in rows if r.user_id == interaction.user.id), None)
+        embed = discord.Embed(title="Leaderboard \u2014 net worth")
+        embed.description = "\n".join(lines)
+        if caller is not None and caller.rank > 15:
+            embed.set_footer(
+                text=f"You: rank {caller.rank} of {caller.total} "
+                f"\u2014 {format_money(caller.equity_minor)}"
+            )
+        await interaction.response.send_message(embed=embed)
+
+    @tree.command(name="history", description="Show your recent trades")
+    async def history(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            trades = await status_svc.recent_trades(conn, interaction.user.id)
+        if not trades:
+            await interaction.response.send_message(
+                "No trades yet. Try `/market` to see what's tradeable.", ephemeral=True
+            )
+            return
+        lines = [
+            f"{t['side']:<4} {t['quantity']:>6} {t['ticker']:<6} @ "
+            f"{format_price(t['fill_price']):>10}  fee {format_money(t['fee_minor']):>8}  "
+            f"tick {t['tick_index']}"
+            + (f" ({t['maker_taker'].lower()})" if t["maker_taker"] else "")
+            for t in trades
+        ]
+        embed = discord.Embed(title="Recent trades")
+        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        await interaction.response.send_message(embed=embed)
+
+    @tree.command(name="compare", description="Head-to-head comparison with another user")
+    @app_commands.describe(user="Discord user to compare against")
+    async def compare(interaction: discord.Interaction, user: discord.User) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            tick = await current_tick_index(conn) or 0
+            me = await status_svc.compare_stats(conn, interaction.user.id, tick)
+            them = await status_svc.compare_stats(conn, user.id, tick)
+
+        def _fmt(stat: status_svc.CompareStats) -> str:
+            change = (
+                format_pct(stat.day_change_pct)
+                if stat.day_change_pct is not None
+                else "n/a"
+            )
+            record = (
+                f"{stat.seasons_entered} season(s), best rank {stat.best_rank}"
+                if stat.seasons_entered
+                else "no league history"
+            )
+            return (
+                f"Net worth: {format_money(stat.net_worth_minor)}\n"
+                f"24h change: {change}\n"
+                f"Positions: {stat.position_count}\n"
+                f"Lifetime volume: {format_money(stat.lifetime_volume_minor)}\n"
+                f"League: {record}"
+            )
+
+        embed = discord.Embed(
+            title=f"{interaction.user.display_name} vs {user.display_name}"
+        )
+        embed.add_field(name=interaction.user.display_name, value=_fmt(me))
+        embed.add_field(name=user.display_name, value=_fmt(them))
+        await interaction.response.send_message(embed=embed)
+
+    @tree.command(
+        name="profile", description="Your account summary: net worth, rank, trophies"
+    )
+    async def profile(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            stats = await status_svc.profile_stats(conn, interaction.user.id)
+        assert stats is not None
+        embed = discord.Embed(title=f"{interaction.user.display_name}'s profile")
+        embed.add_field(
+            name="Account age", value=f"{stats.account_age_days:.1f} day(s)"
+        )
+        embed.add_field(name="Net worth", value=format_money(stats.net_worth_minor))
+        embed.add_field(
+            name="Rank",
+            value=(
+                f"{stats.rank} of {stats.total_users}" if stats.rank else "unranked"
+            ),
+        )
+        embed.add_field(
+            name="Lifetime volume", value=format_money(stats.lifetime_volume_minor)
+        )
+        if stats.trophies:
+            embed.add_field(name="Trophies", value="\n".join(stats.trophies), inline=False)
+        if stats.active_season_equity_minor is not None:
+            embed.add_field(
+                name="Active season equity",
+                value=format_money(stats.active_season_equity_minor),
+            )
         await interaction.response.send_message(embed=embed)
 
     @tree.command(name="buy", description="Buy shares of an instrument")
