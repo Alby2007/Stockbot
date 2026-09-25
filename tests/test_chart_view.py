@@ -14,8 +14,10 @@ from stockbot.bot.chart_view import (
     build_chart_view,
     encode_cid,
     handle_chart_component,
+    load_chart_prefs,
     next_window,
     parse_cid,
+    save_chart_prefs,
 )
 
 
@@ -228,3 +230,27 @@ async def test_handler_dedups_concurrent_dispatch() -> None:
     with pytest.raises(RuntimeError, match="pool is not initialized"):
         await task
     assert 42 not in _INFLIGHT
+
+
+async def test_chart_prefs_roundtrip(conn: AsyncConnection) -> None:
+    assert await load_chart_prefs(conn, 999_001) is None
+    await save_chart_prefs(conn, 999_001, 60, "ticks")
+    assert await load_chart_prefs(conn, 999_001) == (60, "ticks")
+
+
+async def test_chart_prefs_upsert_overwrites(conn: AsyncConnection) -> None:
+    await save_chart_prefs(conn, 999_002, 60, "ticks")
+    await save_chart_prefs(conn, 999_002, 4800, "time")
+    assert await load_chart_prefs(conn, 999_002) == (4800, "time")
+
+
+async def test_chart_prefs_span_clamps_on_load(conn: AsyncConnection) -> None:
+    """A stored span outside current zoom bounds re-clamps on read --
+    bound changes can't strand a saved preference."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO chart_prefs (user_id, span, axis) "
+            "VALUES (%s, %s, 'time')",
+            (999_003, MAX_SPAN * 4),
+        )
+    assert await load_chart_prefs(conn, 999_003) == (MAX_SPAN, "time")

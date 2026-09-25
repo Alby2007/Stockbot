@@ -136,6 +136,43 @@ async def _distance_from_last_open(
     return int(row[0]) if row else 0
 
 
+async def load_chart_prefs(
+    conn: AsyncConnection, user_id: int
+) -> tuple[int, str] | None:
+    """The user's saved chart view: (span, axis). span is re-clamped to
+    the current zoom bounds on read -- a bound change can't strand a
+    stored value. None when the user has never customized a chart."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT span, axis FROM chart_prefs WHERE user_id = %s",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    span = min(MAX_SPAN, max(MIN_SPAN, int(row[0])))
+    return span, str(row[1])
+
+
+async def save_chart_prefs(
+    conn: AsyncConnection, user_id: int, span: int, axis: str
+) -> None:
+    """Remember the resolved view -- called on every chart interaction,
+    so the last click IS the preference."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            INSERT INTO chart_prefs (user_id, span, axis)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE
+            SET span = EXCLUDED.span,
+                axis = EXCLUDED.axis,
+                updated_at = now()
+            """,
+            (user_id, span, axis),
+        )
+
+
 async def next_window(
     conn: AsyncConnection, action: str, iid: int, end: int, span: int
 ) -> tuple[int, int]:
@@ -263,6 +300,10 @@ async def _handle(interaction: discord.Interaction) -> None:
             axis = "ticks" if axis == "time" else "time"
         else:
             new_end, new_span = await next_window(conn, action, iid, end, span)
+        # The click teaches the clicker's default view -- the next bare
+        # /chart opens at this span+axis. Pan position isn't saved:
+        # charts always open anchored at the latest tick.
+        await save_chart_prefs(conn, interaction.user.id, new_span, axis)
         result = await render_candle_chart(
             conn, iid, ticker, end=new_end, span=new_span, axis=axis
         )

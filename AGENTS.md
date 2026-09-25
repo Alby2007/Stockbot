@@ -150,7 +150,13 @@ label by the bucket's last tick, day boundaries get a `Mon DD` label so a
 compressed close reads as an overnight gap) or `ticks` (raw tick_index);
 legacy 5-field cids parse as `time` so old chart messages keep working.
 The `ax` action toggles the axis in place; `/chart` also takes an `axis`
-choice. Two paths reach
+choice. Per-user view prefs live in `chart_prefs` (0034) keyed by the
+Discord snowflake (no FK -- chart viewing isn't gated on an account):
+`save_chart_prefs` upserts the resolved (span, axis) on EVERY button
+interaction and on explicit `/chart` args, `load_chart_prefs` feeds
+`/chart` when its args are absent (params are Optional so "picked" is
+distinguishable from "defaulted"). `end` is deliberately not saved --
+charts always open anchored at the latest tick. Two paths reach
 `handle_chart_component`: the live View's item callback and
 `StockBotClient.on_interaction` (discord.py fires BOTH for one click on
 the SAME Interaction object -- the `_INFLIGHT` id set claims the first

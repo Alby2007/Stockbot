@@ -34,7 +34,12 @@ from stockbot.admin.service import (
     set_config,
     tune_instrument,
 )
-from stockbot.bot.chart_view import TIMEFRAME_SPANS, build_chart_view
+from stockbot.bot.chart_view import (
+    TIMEFRAME_SPANS,
+    build_chart_view,
+    load_chart_prefs,
+    save_chart_prefs,
+)
 from stockbot.bot.charts import render_candle_chart
 from stockbot.bot.format import format_money, format_pct, format_price
 from stockbot.claims.errors import AlreadyClaimedTodayError
@@ -382,8 +387,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @tree.command(name="chart", description="Show an interactive price chart")
     @app_commands.describe(
         ticker="Instrument ticker, e.g. NORT",
-        timeframe="Window to show (default 4h; the buttons pan/zoom after)",
-        axis="X-axis labels (default real time; toggleable on the chart)",
+        timeframe="Window (default: your saved view, else 4h)",
+        axis="X-axis labels (default: your saved view, else real time)",
     )
     @app_commands.choices(
         timeframe=[
@@ -400,15 +405,12 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def chart(
         interaction: discord.Interaction,
         ticker: str,
-        timeframe: str = "4h",
-        axis: str = "time",
+        timeframe: str | None = None,
+        axis: str | None = None,
     ) -> None:
         # Defer up front: the render is slow enough to risk blowing the 3s
         # response window on a cold pool.
         await interaction.response.defer()
-        span = TIMEFRAME_SPANS.get(timeframe, 240)
-        if axis not in ("time", "ticks"):
-            axis = "time"
         async with db.connection() as conn:
             snapshot = await get_instrument_snapshot(conn, ticker)
             if snapshot is None:
@@ -416,8 +418,24 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     f"No instrument found for `{ticker.upper()}`.", ephemeral=True
                 )
                 return
+            # Explicit args win and become the new saved view; absent
+            # args fall back to saved prefs, then system defaults.
+            prefs = await load_chart_prefs(conn, interaction.user.id)
+            if timeframe is None:
+                span = prefs[0] if prefs else 240
+            else:
+                span = TIMEFRAME_SPANS.get(timeframe, 240)
+            if axis is None:
+                resolved_axis = prefs[1] if prefs else "time"
+            else:
+                resolved_axis = axis if axis in ("time", "ticks") else "time"
+            if timeframe is not None or axis is not None:
+                await save_chart_prefs(
+                    conn, interaction.user.id, span, resolved_axis
+                )
             result = await render_candle_chart(
-                conn, snapshot.id, snapshot.ticker, span=span, axis=axis
+                conn, snapshot.id, snapshot.ticker,
+                span=span, axis=resolved_axis,
             )
 
         if result is None:
@@ -429,7 +447,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         file = discord.File(buf, filename=filename)
         embed = discord.Embed(title=f"{snapshot.ticker} \u2014 {snapshot.name}")
         embed.set_image(url=f"attachment://{filename}")
-        if axis == "time" and end_ts is not None:
+        if resolved_axis == "time" and end_ts is not None:
             ending = end_ts.astimezone(UTC).strftime("%b %d %H:%M UTC")
         else:
             ending = str(end)
@@ -439,7 +457,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.followup.send(
             embed=embed,
             file=file,
-            view=build_chart_view(snapshot.id, end, span, axis),
+            view=build_chart_view(snapshot.id, end, span, resolved_axis),
         )
 
     @tree.command(name="movers", description="Show today's biggest gainers and losers")
