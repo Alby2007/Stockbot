@@ -105,6 +105,18 @@ async def test_limit_buy_fills_when_mark_dips(conn: AsyncConnection) -> None:
     assert await _order_status(conn, low.order_id) == "OPEN"
     assert await _position_qty(conn, 3002, ticker) == 1
 
+    # N1 outbox: the MM-fallback fill notifies (taker, since MM is the
+    # counterparty); the still-OPEN order does not.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT payload FROM notifications "
+            "WHERE kind = 'ORDER_FILLED' AND user_id = 3002"
+        )
+        rows = await cur.fetchall()
+    assert len(rows) == 1
+    assert rows[0][0]["order_id"] == high.order_id
+    assert rows[0][0]["maker"] is False
+
 
 async def test_limit_sell_fills_when_mark_rises(conn: AsyncConnection) -> None:
     await bootstrap_user(conn, 3003)

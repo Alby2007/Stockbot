@@ -227,6 +227,27 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"taker fee {fee_bps}bps (makers earn a rebate on crosses)"
         )
 
+    @tree.command(
+        name="notify",
+        description="Toggle DM notifications for liquidations, knockouts, fills, league results",
+    )
+    @app_commands.describe(enabled="On or off")
+    async def notify(interaction: discord.Interaction, enabled: bool) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE users SET dm_notifications = %s WHERE id = %s",
+                    (enabled, interaction.user.id),
+                )
+        await interaction.response.send_message(
+            "DM notifications are now **on**."
+            if enabled
+            else "DM notifications are now **off**. Events still happen — "
+            "you just won't hear about them until you turn this back on.",
+            ephemeral=True,
+        )
+
     @tree.command(name="claim", description="Claim your daily faucet grant")
     async def claim(interaction: discord.Interaction) -> None:
         user = interaction.user

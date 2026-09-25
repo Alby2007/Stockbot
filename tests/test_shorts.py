@@ -117,6 +117,18 @@ async def test_knockout_forfeits_collateral(conn: AsyncConnection) -> None:
         STARTING_GRANT - result.collateral_minor - result.fee_minor
     )
 
+    # N1 outbox: one KNOCKOUT notification, same transaction as the sweep.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT kind, payload FROM notifications WHERE user_id = 6"
+        )
+        rows = await cur.fetchall()
+    assert len(rows) == 1
+    kind, payload = rows[0]
+    assert kind == "KNOCKOUT"
+    assert payload["ticker"] == "NORT"
+    assert payload["tick_index"] == 5
+
 
 async def test_apply_tick_runs_knockout_sweep(conn: AsyncConnection) -> None:
     """End-to-end: a real tick knocks out a short whose barrier is breached."""

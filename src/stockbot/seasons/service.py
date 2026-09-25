@@ -20,6 +20,7 @@ snapshots, and closes finished seasons (scores, ranks, prizes, sweeps).
 
 from __future__ import annotations
 
+import json
 import math
 import statistics
 from dataclasses import dataclass
@@ -614,8 +615,27 @@ async def _close_season_claimed(conn: AsyncConnection, season_id: int) -> None:
                 """,
                 (scores[uid], rank, prize, season_id, uid),
             )
+            await cur.execute(
+                """
+                INSERT INTO notifications (user_id, kind, payload)
+                VALUES (%s, 'SEASON_RESULT', %s)
+                """,
+                (
+                    uid,
+                    json.dumps(
+                        {
+                            "tick_index": tick,
+                            "season_name": season.name,
+                            "rank": rank,
+                            "score": scores[uid],
+                            "prize": prize,
+                        }
+                    ),
+                ),
+            )
 
-    # Unqualified entrants still get their final score recorded (NULL).
+    # Unqualified entrants still get their final score recorded (NULL)
+    # and a result DM -- "you didn't qualify" beats silence.
     for entry in entries:
         uid = int(entry["user_id"])
         if uid in rank_by_user:
@@ -627,6 +647,24 @@ async def _close_season_claimed(conn: AsyncConnection, season_id: int) -> None:
                 WHERE season_id = %s AND user_id = %s
                 """,
                 (scores[uid], season_id, uid),
+            )
+            await cur.execute(
+                """
+                INSERT INTO notifications (user_id, kind, payload)
+                VALUES (%s, 'SEASON_RESULT', %s)
+                """,
+                (
+                    uid,
+                    json.dumps(
+                        {
+                            "tick_index": tick,
+                            "season_name": season.name,
+                            "rank": None,
+                            "score": None,
+                            "prize": 0,
+                        }
+                    ),
+                ),
             )
 
     # League wealth never leaves the league: sweep whatever is left to SINK.

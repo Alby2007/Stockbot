@@ -20,6 +20,7 @@ authoritative.
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
@@ -407,7 +408,7 @@ async def _settle_cross(
                 instrument_id,
             ),
         )
-        for order in (bid, ask):
+        for order, is_maker in ((bid, bid_maker), (ask, not bid_maker)):
             await cur.execute(
                 """
                 UPDATE orders
@@ -420,14 +421,37 @@ async def _settle_cross(
                         ELSE filled_tick END,
                     fill_price = %s
                 WHERE id = %s AND status = 'OPEN'
+                RETURNING status, side, user_id
                 """,
                 (quantity, quantity, quantity, tick_index, cross_price, order["id"]),
             )
-            if cur.rowcount == 0:
+            updated = await cur.fetchone()
+            if updated is None:
                 # A cancel committed between the book snapshot and this
                 # write: without the re-check the fill would overwrite
                 # 'CANCELLED'. Roll back the whole cross via the savepoint.
                 raise ValueError(f"order {order['id']} is no longer open")
+            if updated[0] == "FILLED":
+                await cur.execute(
+                    """
+                    INSERT INTO notifications (user_id, kind, payload)
+                    VALUES (%s, 'ORDER_FILLED', %s)
+                    """,
+                    (
+                        int(updated[2]),
+                        json.dumps(
+                            {
+                                "tick_index": tick_index,
+                                "order_id": int(order["id"]),
+                                "ticker": ticker,
+                                "side": updated[1],
+                                "qty": order["quantity"],
+                                "fill": float(cross_price),
+                                "maker": is_maker,
+                            }
+                        ),
+                    ),
+                )
 
     await update_candle_with_fill(conn, instrument_id, cross_price, quantity)
     # Flow attribution: the cross's mark move charges to the taker (the
@@ -1060,16 +1084,41 @@ async def _match_once(
                                 ELSE filled_tick END,
                             fill_price = %s
                         WHERE id = %s AND status = 'OPEN'
+                        RETURNING status, quantity
                         """,
                         (trade_qty, trade_qty, trade_qty, tick_index,
                          result.fill_price, order["id"]),
                     )
-                    if cur.rowcount == 0:
+                    updated = await cur.fetchone()
+                    if updated is None:
                         # Cancelled between the candidate snapshot and this
                         # write -- roll the fill back rather than overwrite
                         # 'CANCELLED'.
                         raise ValueError(
                             f"order {order['id']} is no longer open"
+                        )
+                    if updated[0] == "FILLED":
+                        # MM fallback: the order's counterparty is always
+                        # the market maker -- this side is always taker.
+                        await cur.execute(
+                            """
+                            INSERT INTO notifications (user_id, kind, payload)
+                            VALUES (%s, 'ORDER_FILLED', %s)
+                            """,
+                            (
+                                int(order["user_id"]),
+                                json.dumps(
+                                    {
+                                        "tick_index": tick_index,
+                                        "order_id": int(order["id"]),
+                                        "ticker": str(order["ticker"]),
+                                        "side": order["side"],
+                                        "qty": int(updated[1]),
+                                        "fill": float(result.fill_price),
+                                        "maker": False,
+                                    }
+                                ),
+                            ),
                         )
                 depth_used[int(order["id"])] = (
                     depth_used.get(int(order["id"]), 0) + trade_qty

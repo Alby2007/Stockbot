@@ -12,6 +12,7 @@ import discord
 from stockbot import db
 from stockbot.bot.chart_view import CHART_CID_PREFIX, handle_chart_component
 from stockbot.bot.commands import register_commands
+from stockbot.bot.notify import DeliveryForbidden, poll_once
 from stockbot.config import get_settings
 from stockbot.logging import setup_logging
 from stockbot.observability import write_heartbeat
@@ -20,6 +21,7 @@ setup_logging("bot")
 log = logging.getLogger("stockbot.bot")
 
 HEARTBEAT_INTERVAL_SECONDS = 30
+NOTIFY_POLL_INTERVAL_SECONDS = 5
 
 
 class StockBotTree(discord.app_commands.CommandTree["StockBotClient"]):
@@ -53,6 +55,7 @@ class StockBotClient(discord.Client):
         super().__init__(intents=discord.Intents.none())
         self.tree = StockBotTree(self)
         register_commands(self.tree)
+        self._notify_stats: dict[str, int] = {}
 
     async def setup_hook(self) -> None:
         await self.tree.sync()
@@ -70,11 +73,36 @@ class StockBotClient(discord.Client):
                         {
                             "gateway_latency_s": round(self.latency, 3),
                             "guilds": len(self.guilds),
+                            "notify": self._notify_stats,
                         },
                     )
             except Exception:
                 log.exception("heartbeat write failed")
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+    async def _deliver_dm(self, user_id: int, message: str) -> None:
+        try:
+            user = self.get_user(user_id) or await self.fetch_user(user_id)
+            await user.send(message)
+        except discord.Forbidden as exc:
+            raise DeliveryForbidden(str(exc)) from exc
+        except discord.NotFound:
+            # Deleted/unreachable Discord account -- same treatment as
+            # Forbidden, there's no one to ever deliver this to.
+            raise DeliveryForbidden("user not found") from None
+
+    async def _notify_loop(self) -> None:
+        """Transactional-outbox poller: one poll = one committed
+        transaction, so a mid-poll crash never double-sends (unsent rows
+        just stay unsent) or double-marks (sent rows are already
+        committed sent before the next poll can see them)."""
+        while True:
+            try:
+                async with db.connection() as conn, conn.transaction():
+                    self._notify_stats = await poll_once(conn, self._deliver_dm)
+            except Exception:
+                log.exception("notification poll failed")
+            await asyncio.sleep(NOTIFY_POLL_INTERVAL_SECONDS)
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         # Post-restart fallback for chart buttons: live Views get the click
@@ -105,6 +133,8 @@ class StockBotClient(discord.Client):
     async def on_ready(self) -> None:
         if getattr(self, "_heartbeat_task", None) is None:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        if getattr(self, "_notify_task", None) is None:
+            self._notify_task = asyncio.create_task(self._notify_loop())
 
 
 async def run() -> None:

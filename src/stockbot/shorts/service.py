@@ -18,6 +18,7 @@ Money flow:
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
@@ -431,7 +432,7 @@ async def sweep_knockouts(conn: AsyncConnection, tick_index: int) -> int:
     reached its knockout level. Called inside apply_tick's transaction after
     instrument prices are written; knockout checks the tick-close price.
     """
-    async with conn.cursor() as cur:
+    async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
             UPDATE bounded_shorts bs
@@ -441,10 +442,35 @@ async def sweep_knockouts(conn: AsyncConnection, tick_index: int) -> int:
             WHERE i.id = bs.instrument_id
               AND bs.status = 'OPEN'
               AND i.quoted_price >= bs.knockout_price
+            RETURNING bs.user_id, i.ticker, bs.quantity, bs.entry_price,
+                      bs.knockout_price
             """,
             (tick_index,),
         )
-        return cur.rowcount
+        knocked = await cur.fetchall()
+        # Outbox: same transaction as the UPDATE above -- one notification
+        # row per short, coalesced by the poller per (user, tick).
+        for row in knocked:
+            await cur.execute(
+                """
+                INSERT INTO notifications (user_id, kind, payload)
+                VALUES (%s, 'KNOCKOUT', %s)
+                """,
+                (
+                    int(row["user_id"]),
+                    json.dumps(
+                        {
+                            "tick_index": tick_index,
+                            "ticker": row["ticker"],
+                            "qty": int(row["quantity"]),
+                            "entry": float(row["entry_price"]),
+                            "ko_price": float(row["knockout_price"]),
+                            "payout": 0,
+                        }
+                    ),
+                ),
+            )
+        return len(knocked)
 
 
 async def list_open_shorts(

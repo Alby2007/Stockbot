@@ -223,6 +223,16 @@ async def test_liquidation_fires_when_price_gaps_up(conn: AsyncConnection) -> No
     health = await compute_health(conn, 2006)
     assert health.equity_minor >= 0
 
+    # N1 outbox: each leg writes a notification in the same transaction.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT kind, payload FROM notifications WHERE user_id = 2006"
+        )
+        rows = await cur.fetchall()
+    assert len(rows) == count
+    assert all(kind == "LIQUIDATION" for kind, _ in rows)
+    assert all(payload["ticker"] == ticker for _, payload in rows)
+
 
 async def test_never_negative_equity_and_fund_reconciles(
     conn: AsyncConnection,

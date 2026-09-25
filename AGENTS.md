@@ -709,3 +709,43 @@ pip-installed under site-packages, so the Dockerfile sets
 dir is missing; before that guard the migrate service silently printed
 "No pending migrations" and exited 0 while the prod schema stalled
 several migrations behind the code.
+
+## Release UX (plan-1ccd460d1232ae3e.md)
+
+**Phase N1 done** (`migrations/0035_notifications.sql`): a transactional
+outbox for the events that happen server-side between commands
+(liquidations, knockouts, order fills, season results) so a user isn't
+finding out they were liquidated by noticing a smaller balance.
+`notifications` rows are written *inside the same transaction* as the
+event, at the row's insert site (`margin/service.py` `_liquidate_leg`,
+`shorts/service.py` `sweep_knockouts`, `orders/service.py` both fill
+sites -- cross and MM fallback -- gated on the UPDATE's `RETURNING
+status` actually flipping to FILLED, not just any partial fill, and
+`seasons/service.py` `_close_season_claimed`, one row per entrant
+including unqualified ones) — a rollback there means the notification
+never existed. `sweep_knockouts` changed from a bulk UPDATE to
+`UPDATE ... RETURNING` so it has the per-row data (user, ticker, qty,
+prices) to notify with; it still does all knockouts in one round trip.
+
+`bot/notify.py` is the poller (`bot/main.py`'s `_notify_loop`, modeled on
+the existing `_heartbeat_loop`, polling every 5s on its own connection —
+one poll is one committed transaction, so a mid-poll crash can't
+double-send or double-mark). It coalesces rows by `(user_id, kind,
+payload['tick_index'])` before formatting, so a 3-leg liquidation or a
+2-position knockout sweep sends one DM, not N — every insert site must
+put `tick_index` in its payload or coalescing silently degenerates to
+one-row groups. `deliver: Callable[[int, str], Awaitable[None]]` is
+injected (tests use a stub, `bot/main.py` wires `discord.Client.send`);
+raising `DeliveryForbidden` dead-letters *every* currently-pending row
+for that user immediately (not just the batch's rows) so the next poll
+doesn't rediscover the same Forbidden and repeat it. Other exceptions
+bump `attempts` and schedule `next_attempt_at` with exponential backoff
+(1/5/15/60/240 min); `attempts >= 5` is the dead-letter threshold, and
+the poller's own SELECT excludes both dead-lettered and not-yet-due rows
+so a full table scan every 5s stays cheap (partial index on
+`next_attempt_at WHERE sent_at IS NULL AND attempts < 5`).
+
+`/notify` toggles `users.dm_notifications`, read at *poll* time (folded
+into the poller's SELECT via a JOIN), not write time — an opted-out
+user's rows are never touched (not retried, not dead-lettered, `attempts`
+stays 0), so opting back in surfaces the backlog instead of losing it.

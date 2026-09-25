@@ -26,6 +26,7 @@ MARKET_MAKER (the counterparty to every trade). Both legs are recorded in
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
@@ -501,6 +502,31 @@ async def _liquidate_leg(
         row = await cur.fetchone()
         assert row is not None
         liquidation_id = int(row[0])
+
+        # Outbox: written in the same transaction as the liquidations row
+        # above, so a rollback can never leave a notification for an
+        # event that didn't happen. The poller coalesces per tick_index
+        # -- a multi-leg liquidation sends one DM, not N.
+        await cur.execute(
+            """
+            INSERT INTO notifications (user_id, kind, payload)
+            VALUES (%s, 'LIQUIDATION', %s)
+            """,
+            (
+                user_id,
+                json.dumps(
+                    {
+                        "tick_index": tick_index,
+                        "ticker": position["ticker"],
+                        "side": "BUY" if qty < 0 else "SELL",
+                        "qty": close_qty,
+                        "fill": float(fill),
+                        "penalty": paid_penalty,
+                        "equity_before": equity_before,
+                    }
+                ),
+            ),
+        )
 
     if paid_penalty > 0:
         await _record_fund_flow(

@@ -179,6 +179,18 @@ async def test_close_ranks_qualifying_entrants_and_pays_prizes(conn: AsyncConnec
         )
         assert await cur.fetchone() is not None
 
+    # N1 outbox: every entrant gets a SEASON_RESULT notification, ranked
+    # or not.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT user_id, payload FROM notifications WHERE kind = 'SEASON_RESULT'"
+        )
+        rows = dict(await cur.fetchall())
+    assert rows[2001]["rank"] == 1
+    assert rows[2001]["prize"] == expected_prize
+    assert rows[2002]["rank"] is None
+    assert rows[2002]["prize"] == 0
+
 
 async def test_league_positions_scored_as_equity(conn: AsyncConnection) -> None:
     """Equity includes mark-to-market league positions, not just cash."""

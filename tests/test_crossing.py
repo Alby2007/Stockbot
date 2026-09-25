@@ -169,6 +169,21 @@ async def test_cross_at_maker_price_and_mark_print(conn: AsyncConnection) -> Non
     assert bid_trades[0]["counterparty_user_id"] == 4001
     assert bid_trades[0]["side"] == "BUY"
 
+    # N1 outbox: both fully-filled legs of the cross get an ORDER_FILLED
+    # notification, tagged with the correct maker/taker side.
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT user_id, payload FROM notifications "
+            "WHERE kind = 'ORDER_FILLED' ORDER BY user_id"
+        )
+        rows = await cur.fetchall()
+    assert len(rows) == 2
+    by_user = {int(r["user_id"]): r["payload"] for r in rows}
+    assert by_user[4001]["maker"] is True
+    assert by_user[4001]["order_id"] == ask.order_id
+    assert by_user[4002]["maker"] is False
+    assert by_user[4002]["order_id"] == bid.order_id
+
 
 async def test_taker_gets_price_improvement(conn: AsyncConnection) -> None:
     """The resting bid is the maker: a crossing ask executes at the bid's
