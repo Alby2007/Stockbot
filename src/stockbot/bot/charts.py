@@ -34,6 +34,27 @@ def bucket_for_span(span: int) -> int:
     return max(1, math.ceil(span / 240))
 
 
+def _span_label(span: int) -> str:
+    """Human span for the title (trading-day-aware: 960 open ticks = one
+    market day, 4800 = a week) -- replaces "N open ticks" insider speak.
+    Odd zoom levels from the buttons fall back to tick counts."""
+    return {60: "1h", 240: "4h", 960: "1d", 4800: "1w"}.get(
+        span, f"~{span // 960}d" if span >= 960 else f"{span}t"
+    )
+
+
+def _session_boundaries(ticks: list[int], bucket: int) -> list[float]:
+    """Positions where consecutive candles' tick gap exceeds the bucket --
+    an open-phase discontinuity the ordinal axis compresses (overnight,
+    halt, missing data). Drawn as hairline separators so the compressed
+    jump is spatially legible. The closed tail has shading instead."""
+    return [
+        i - 0.5
+        for i in range(1, len(ticks))
+        if ticks[i] - ticks[i - 1] > bucket
+    ]
+
+
 async def _select_window_rows(
     conn: AsyncConnection,
     instrument_id: int,
@@ -239,10 +260,26 @@ def _render_png(
     for a in (ax, axv):
         a.set_facecolor(_BG)
         a.tick_params(colors=_TEXT, labelsize=8)
-        a.grid(color=_GRID, alpha=0.06)
+        # Horizontal gridlines only -- the session separators below carry
+        # the vertical reference, without the crosshatch noise.
+        a.grid(axis="y", color=_GRID, alpha=0.06)
         for spine in a.spines.values():
             spine.set_color(_SPINE)
     ax.tick_params(labelbottom=False)
+
+    # Ticker watermark behind everything -- cheap terminal flavor.
+    ax.text(
+        0.5,
+        0.45,
+        ticker,
+        transform=ax.transAxes,
+        fontsize=64,
+        color=_TEXT,
+        alpha=0.035,
+        ha="center",
+        va="center",
+        zorder=0,
+    )
 
     # Closed-session shading: contiguous CLOSED runs get a muted overlay,
     # and their flat candles draw in grey rather than up/down colors.
@@ -262,18 +299,26 @@ def _render_png(
     # discontinuity between neighbours -- like real charts compress the
     # overnight -- instead of a hundreds-wide empty band on a tick axis.
     pos = list(range(len(ticks)))
+    n_bars = len(pos)
+    # Dense windows thin the bars so 240-candle spans don't blur to mush.
+    bar_w, wick_lw = (0.8, 0.8) if n_bars <= 120 else (0.6, 0.6)
+
+    # Session-boundary separators: open-open tick discontinuities the
+    # ordinal axis hides (overnights, halts) get a hairline marker.
+    for boundary in _session_boundaries(ticks, bucket):
+        ax.axvline(boundary, color=_SPINE, linestyle="--", linewidth=0.6)
 
     # Candlesticks: wick low->high, body over [min(o,c), |o-c|].
     vol_colors = []
     for i, x in enumerate(pos):
         closed = sessions[i] == "CLOSED"
         color = _MUTED if closed else (_UP if up[i] else _DOWN)
-        ax.vlines(x, lows[i], highs[i], color=color, linewidth=0.8)
+        ax.vlines(x, lows[i], highs[i], color=color, linewidth=wick_lw)
         body_lo = min(opens[i], closes[i])
         body_h = max(abs(closes[i] - opens[i]), doji_eps)
         ax.add_patch(
             Rectangle(
-                (x - 0.4, body_lo), 0.8, body_h,
+                (x - bar_w / 2, body_lo), bar_w, body_h,
                 facecolor=color, edgecolor=color, linewidth=0.5,
             )
         )
@@ -290,17 +335,38 @@ def _render_png(
                 linewidths=0,
             )
 
-    # Last-price line, colored by the final candle's direction.
+    # Window OHLC + net-change legend, top-left -- the "how much did it
+    # move" answer in one glance, colored by the window's direction.
+    window_delta = closes[-1] / opens[0] - 1 if opens[0] else 0.0
+    window_color = _UP if closes[-1] >= opens[0] else _DOWN
+    ax.text(
+        0.01,
+        0.98,
+        f"O {opens[0]:,.2f}   H {price_hi:,.2f}   L {price_lo:,.2f}   "
+        f"C {closes[-1]:,.2f}   Δ {window_delta:+.2%}",
+        transform=ax.transAxes,
+        color=window_color,
+        fontsize=9,
+        va="top",
+        ha="left",
+    )
+
+    # Last-price line, colored by the final candle's direction, with a
+    # TradingView-style pill pinned in the reserved right gutter.
     last_color = _UP if up[-1] else _DOWN
     ax.axhline(closes[-1], color=last_color, linestyle="--", linewidth=0.8, alpha=0.9)
     ax.annotate(
         f"{closes[-1]:,.2f}",
         xy=(1.005, closes[-1]),
         xycoords=("axes fraction", "data"),
-        color=last_color,
+        color="#ffffff",
+        fontweight="bold",
         fontsize=8,
         va="center",
         annotation_clip=False,
+        bbox=dict(
+            boxstyle="round,pad=0.25", facecolor=last_color, edgecolor="none"
+        ),
     )
 
     ax.set_ylim(price_lo - ypad, price_hi + ypad)
@@ -319,7 +385,7 @@ def _render_png(
     closed_now = sessions[-1] == "CLOSED"
     bucket_note = f" · {bucket}t/candle" if bucket > 1 else ""
     ax.set_title(
-        f"{ticker} — {span} open ticks{bucket_note}"
+        f"{ticker} · {_span_label(span)}{bucket_note}"
         + (" · MARKET CLOSED" if closed_now else ""),
         color=_TEXT,
         fontsize=11,
@@ -328,7 +394,7 @@ def _render_png(
     ax.set_ylabel("price", color=_TEXT, fontsize=8)
     ax.margins(x=0.02)
 
-    axv.bar(pos, volumes, width=0.8, color=vol_colors, alpha=0.6)
+    axv.bar(pos, volumes, width=bar_w, color=vol_colors, alpha=0.6)
     axv.set_ylim(bottom=0)
     # Ordinal positions hold OPEN candles only (+ a closed tail): a skipped
     # closed run reads as a jump in the axis labels, not a hole in the plot.
@@ -346,7 +412,9 @@ def _render_png(
         )
     )
 
-    gs.tight_layout(fig)
+    # Right gutter reserved for the price pill's annotate (x=1.005 lands
+    # inside the rect boundary instead of clipping at the figure edge).
+    gs.tight_layout(fig, rect=(0, 0, 0.94, 1))
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
     buf.seek(0)

@@ -182,6 +182,18 @@ panl/panr (half-span shifts in open candles, clamped to history
 bounds), zin/zout (span/2, span*2 clamped to [30, 6720]), home and
 s<span> presets (re-anchor to last open). Action names starting `s`
 carry the target span (`s960` = 1D at 960-tick sessions).
+Render aesthetics live in `_render_png` helpers, all pure:
+`_span_label(span)` maps spans to `1h`/`4h`/`1d`/`1w` (`~Nd`/`Nt`
+fallbacks) for the title, and `_session_boundaries(ticks, bucket)`
+returns `i - 0.5` positions wherever `ticks[i] - ticks[i-1] > bucket`
+(compressed open-open gaps from overnights/halts) for dashed separators
+— the open→closed-tail transition is tick-adjacent so the shading marks
+it, not a separator. The legend (`O/H/L/C Δ%` in the window's direction
+color), right-edge last-price pill (`rect=(0,0,0.94,1)` reserves its
+gutter), and faint ticker watermark are all derived from `rows` — no
+protocol/signature change. Candle/wick/volume widths drop to 0.6 above
+120 bars, else 0.8. `MARKET CLOSED` only suffixes the title when the
+tail is closed candles.
 `market_ticks` row itself (duration_ms, fills, crosses, stops_triggered,
 knockouts, liquidations, events_resolved) plus one structured log line
 (`tick=N phase=… crosses=… ms=…`) — tick 4532 is fully re-describable

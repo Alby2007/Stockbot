@@ -366,3 +366,38 @@ def test_axis_formatter_ticks_mode() -> None:
     fmt = charts._axis_formatter([None, None], [4323, 4324], "ticks")
     assert fmt(0, 0) == "4323"
     assert fmt(1, 0) == "4324"
+
+
+def test_session_boundaries_detects_compressed_gap() -> None:
+    """An open-open tick jump (compressed overnight/halt) draws a
+    separator at the gap's left edge."""
+    assert charts._session_boundaries([100, 101, 102, 580, 581], 1) == [2.5]
+
+
+def test_session_boundaries_none_when_contiguous() -> None:
+    assert charts._session_boundaries([10, 11, 12, 13], 1) == []
+    assert charts._session_boundaries([], 1) == []
+    assert charts._session_boundaries([7], 1) == []
+
+
+def test_session_boundaries_respect_bucket() -> None:
+    """Bucketed rows differ by `bucket` normally -- only bigger gaps are
+    real boundaries."""
+    assert charts._session_boundaries([100, 104, 108], 4) == []
+    assert charts._session_boundaries([100, 104, 120], 4) == [1.5]
+
+
+def test_session_boundaries_closed_tail_is_not_a_boundary() -> None:
+    """The open->closed-tail transition is tick-adjacent (gap=1), so no
+    separator -- the shading already marks it."""
+    ticks = [956, 957, 958, 959, 960, 961, 962]
+    assert charts._session_boundaries(ticks, 1) == []
+
+
+def test_span_label() -> None:
+    assert charts._span_label(60) == "1h"
+    assert charts._span_label(240) == "4h"
+    assert charts._span_label(960) == "1d"
+    assert charts._span_label(4800) == "1w"
+    assert charts._span_label(6720) == "~7d"  # max zoom-out
+    assert charts._span_label(30) == "30t"  # sub-hour zoom-in
