@@ -140,7 +140,7 @@ async def test_disabled_command_gets_suspended_ephemeral() -> None:
         user_id = _snowflake()
         async with db.connection() as conn, conn.transaction():
             await bootstrap_user(conn, user_id)
-            await disable_user(conn, user_id, "test", 1)
+            await disable_user(conn, user_id, "audit-flag-7", 1)
 
         client = StockBotClient()
         cmd = client.tree.get_command("balance")
@@ -155,7 +155,9 @@ async def test_disabled_command_gets_suspended_ephemeral() -> None:
         await cmd.callback(interaction)
 
         interaction.response.send_message.assert_awaited_once()
-        assert "suspended" in interaction.response.send_message.call_args.args[0]
+        message = interaction.response.send_message.call_args.args[0]
+        assert "suspended" in message
+        assert "audit-flag-7" in message  # the admin's reason surfaces
         assert interaction.response.send_message.call_args.kwargs["ephemeral"]
     finally:
         await db.close_pool()

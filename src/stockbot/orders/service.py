@@ -430,6 +430,15 @@ async def _settle_cross(
                 instrument_id,
             ),
         )
+        if halted:
+            # The candle for this tick was already written during the
+            # step phase -- amend halt_kind so the cross-attributed halt
+            # is visible to chart/replay instead of NULL.
+            await cur.execute(
+                "UPDATE candles SET halt_kind = 'FLOW' "
+                "WHERE instrument_id = %s AND tick_index = %s",
+                (instrument_id, tick_index),
+            )
         for order, is_maker in ((bid, bid_maker), (ask, not bid_maker)):
             await cur.execute(
                 """

@@ -106,7 +106,13 @@ cover/liquidation — the cash CHECK means shorts can never be debited
 directly. Bounded shorts are NOT charged (collateralized derivative, not
 borrowed stock). Events on INDEX instruments resolve as no-ops (marked
 resolved, nothing applied) — a hand-inserted index DIVIDEND would
-otherwise pay index longs cash for free.
+otherwise pay index longs cash for free. User suspension
+(`users.disabled_at`): `bootstrap_user` raises `UserDisabledError`
+carrying `disabled_reason`, which `_instrument_one` catches into an
+ephemeral reply — keep the reason on the exception or suspended users
+get a bare refusal. `profile_stats.active_season_equity_minor` is full
+league MTM equity via `seasons.league_equity_minor`, NOT the league
+account's raw cash.
 
 Sessions notes: `session_phase(tick, open, closed, offset)` in engine.py
 is pure -- session state derives from the tick index, no shared flag.
@@ -254,7 +260,12 @@ total at `vol.flow_ret_cap`, and the breaker evaluates
 |r_model + bounded_flow| — a lone account is capped below the cap so a
 whale alone can never manufacture a halt, while crowd-scale flow still
 can (halt_kind 'FLOW' on the candle) and gets the shorter
-`vol.flow_halt_ticks` instead of CIRCUIT_HALT_TICKS. Halts gate
+`vol.flow_halt_ticks` instead of CIRCUIT_HALT_TICKS. INDEX instruments
+skip the flow-breach check — the basket re-derives their price every
+tick, so a "halt" would freeze orders without freezing the price; the
+mislabel also lied about cause. A cross-triggered halt amends the
+already-written candle's `halt_kind` post-match (`_settle_cross`).
+Halts gate
 risk-increasing trades only: closing/covering/liquidating proceeds during
 a halt. `candles.model_ret` is the post-step pre-fill return — fills
 amend `close` intra-tick, so replay can't recover r_model from OHLC;

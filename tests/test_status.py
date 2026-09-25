@@ -217,3 +217,46 @@ async def test_profile_stats_reports_rank_and_trophies(conn: AsyncConnection) ->
 
 async def test_profile_stats_none_for_unknown_user(conn: AsyncConnection) -> None:
     assert await profile_stats(conn, 999_999_999) is None
+
+
+async def test_profile_stats_season_equity_is_mtm_not_cash(
+    conn: AsyncConnection,
+) -> None:
+    """Regression: active_season_equity_minor returned the league
+    account's raw cash -- a mid-season user with open positions saw cash
+    mislabeled as equity. It must equal league_equity_minor (standings)."""
+    from stockbot.seasons.service import (
+        create_season,
+        join_season,
+        league_equity_minor,
+        on_tick,
+    )
+
+    await bootstrap_user(conn, 8070)
+    season_id = await create_season(
+        conn, name="ProfileSeason", start_tick=0, end_tick=10_000,
+        entry_fee_minor=0, stake_minor=5_000_000,
+    )
+    await on_tick(conn, 0)  # activate
+    await join_season(conn, 8070, season_id)
+    await execute_trade(
+        conn, user_id=8070, ticker=await _first_ticker(conn),
+        side="BUY", quantity=10, season_id=season_id,
+    )
+
+    stats = await profile_stats(conn, 8070)
+    assert stats is not None
+    assert stats.active_season_equity_minor == await league_equity_minor(
+        conn, season_id, 8070
+    )
+    # And it is decisively NOT the raw cash balance, which dropped by the
+    # fill's notional.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT a.balance FROM season_entries e "
+            "JOIN accounts a ON a.id = e.account_id "
+            "WHERE e.user_id = %s AND e.season_id = %s",
+            (8070, season_id),
+        )
+        (cash,) = await cur.fetchone()
+    assert stats.active_season_equity_minor != int(cash)

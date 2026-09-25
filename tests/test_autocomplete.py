@@ -15,6 +15,7 @@ from stockbot.bot.autocomplete import (
     MAX_CHOICES,
     _ticker_matches,
     order_autocomplete,
+    sector_autocomplete,
     short_autocomplete,
     ticker_autocomplete,
     tunable_param_autocomplete,
@@ -151,3 +152,28 @@ async def test_tunable_param_autocomplete_prefix() -> None:
     choices = await tunable_param_autocomplete(interaction, "sig")
     assert [c.value for c in choices] == ["sigma"]
     assert len(await tunable_param_autocomplete(interaction, "")) <= MAX_CHOICES
+
+
+async def test_sector_autocomplete_lists_real_sector_keys() -> None:
+    """Regression: the query once read instruments.sector_key, a column
+    that does not exist (sector_id -> sectors.key) -- every keystroke on
+    /admin instrument-add raised UndefinedColumn and showed zero choices."""
+    await db.init_pool(get_settings().test_database_url, min_size=1, max_size=2)
+    try:
+        interaction = _user_interaction(_fresh_user())
+        choices = await sector_autocomplete(interaction, "")
+        values = [str(c.value) for c in choices]
+        assert values, "no sector choices returned"
+        assert "index" not in values  # add_instrument refuses it
+        async with db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT COUNT(*) FROM sectors WHERE key <> 'index'"
+            )
+            (expected,) = await cur.fetchone()
+        assert len(values) == int(expected)
+        # Prefix filter works on the real key text.
+        prefix = values[0][:2]
+        for c in await sector_autocomplete(interaction, prefix.lower()):
+            assert str(c.value).startswith(prefix)
+    finally:
+        await db.close_pool()

@@ -107,15 +107,15 @@ async def bootstrap_user(conn: AsyncConnection, user_id: int) -> BootstrapResult
         account_id, created = await create_user_account(conn, user_id)
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT grant_issued, disabled_at FROM users "
+                "SELECT grant_issued, disabled_at, disabled_reason FROM users "
                 "WHERE id = %s FOR UPDATE",
                 (user_id,),
             )
             row = await cur.fetchone()
             assert row is not None
-            grant_issued, disabled_at = row
+            grant_issued, disabled_at, disabled_reason = row
             if disabled_at is not None:
-                raise UserDisabledError(user_id)
+                raise UserDisabledError(user_id, disabled_reason)
 
             granted_now = False
             grant_pending = False

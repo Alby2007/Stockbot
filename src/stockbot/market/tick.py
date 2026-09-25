@@ -440,10 +440,15 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                     v_i = engine.ewma_vol_update(v_prev, numerator, rho)
                 if (
                     halts[result.id] is None
+                    and not is_index
                     and abs(r_model + bounded_flow) > engine.CIRCUIT_BREAKER_CAP
                 ):
                     # Reached only when the model alone did NOT breach --
                     # by construction this is a flow-attributed breach.
+                    # Indexes are excluded: their level re-derives from
+                    # constituents every tick, so a "halt" would only
+                    # freeze orders without freezing the price (and a big
+                    # basket gap was mislabeling them halt_kind='FLOW').
                     halts[result.id] = tick_index + flow_halt
                     flow_breached.add(result.id)
             # H2: sector sympathy -- bounded peer flow moves this mark.

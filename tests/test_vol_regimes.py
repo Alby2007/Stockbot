@@ -82,6 +82,14 @@ async def _halted_until(conn: AsyncConnection, instrument_id: int) -> int | None
     return None if row is None or row[0] is None else int(row[0])
 
 
+async def _last_tick(conn: AsyncConnection) -> int:
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT MAX(tick_index) FROM market_ticks")
+        row = await cur.fetchone()
+    assert row is not None and row[0] is not None
+    return int(row[0])
+
+
 async def _cap_size_qty(conn: AsyncConnection, inst: dict) -> int:
     """Largest per-fill quantity that stays under the participation cap,
     with headroom for the whale's own impact raising the fill price.
@@ -336,6 +344,31 @@ async def test_lone_whale_cannot_trip_breaker(conn, monkeypatch) -> None:
         # raw flow was ~10 * 0.3% = ~3%; the recorded contribution is the
         # bounded 1%.
         assert float(flow_ret) <= 0.01 + 1e-9
+
+    # The trade-driven loop alone can stay under the cap (concave impact
+    # is thin at cap size), which would leave the clip itself unproven.
+    # Inject a raw per-account flow delta far above the account cap and
+    # assert the recorded contribution is exactly the clipped 1% -- and
+    # even that oversized blast halts nothing.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO pending_flow "
+            "(instrument_id, user_id, tick_index, delta_impact, signed_notional_minor) "
+            "VALUES (%s, %s, %s, 0.05, 0) "
+            "ON CONFLICT (instrument_id, user_id) "
+            "DO UPDATE SET delta_impact = pending_flow.delta_impact + 0.05",
+            (inst["id"], 9101, await _last_tick(conn)),
+        )
+    applied = await apply_tick(conn, _SEED)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT ABS(flow_ret) FROM candles "
+            "WHERE instrument_id = %s AND tick_index = %s",
+            (inst["id"], applied),
+        )
+        (flow_ret,) = await cur.fetchone()
+    assert float(flow_ret) == pytest.approx(0.01)  # clipped, not 0.05
+    assert await _halted_until(conn, inst["id"]) is None
 
 
 async def test_crowd_flow_trips_short_halt_not_full_halt(conn, monkeypatch) -> None:

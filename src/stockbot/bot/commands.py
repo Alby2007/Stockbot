@@ -27,6 +27,7 @@ from stockbot.accounts.service import (
     STARTING_GRANT,
     BootstrapResult,
     bootstrap_user,
+    min_discord_age_days,
 )
 from stockbot.admin.service import (
     TUNABLE_CONFIG_KEYS,
@@ -287,6 +288,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def start(interaction: discord.Interaction) -> None:
         async with db.connection() as conn:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
+            min_age = await min_discord_age_days(conn)
         embed = discord.Embed(
             title="Welcome to the market" if bootstrap.created else "Quick start",
             description=(
@@ -332,7 +334,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             value=(
                 "`/claim` pays a daily stipend — your first one unlocks "
                 "24h after account creation (anti-farm), and Discord "
-                "accounts under 30 days can't claim at all."
+                f"accounts under {min_age} days can't claim at all."
             ),
             inline=False,
         )
@@ -2447,18 +2449,19 @@ def _instrument_one(cmd: Any) -> None:
                 return None
             hits.append(now)
             return await original(interaction, *args, **kwargs)
-        except UserDisabledError:
+        except UserDisabledError as exc:
             # H2: the account-level chokepoint raised -- one ephemeral
             # for every command, no per-handler edits.
             ok, error = False, "UserDisabledError"
+            notice = "This account is suspended."
+            if exc.reason:
+                notice += f" Reason: {exc.reason}"
             try:
                 if interaction.response.is_done():
-                    await interaction.followup.send(
-                        "This account is suspended.", ephemeral=True
-                    )
+                    await interaction.followup.send(notice, ephemeral=True)
                 else:
                     await interaction.response.send_message(
-                        "This account is suspended.", ephemeral=True
+                        notice, ephemeral=True
                     )
             except discord.HTTPException:
                 pass
