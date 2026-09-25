@@ -928,6 +928,14 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   >90d. The notification poller's assumptions matter here: notification
   tests start from `DELETE FROM notifications` because command-level
   tests now commit real outbox rows to the shared test DB.
+- **Command sync is hash-gated**: `setup_hook` hashes the serialized
+  command set into `config.bot.command_hash` and skips `tree.sync()`
+  when unchanged. A bulk PUT bumps Discord's global command `version`
+  on EVERY call — even identical payloads — so unconditional
+  sync-on-boot broke clients' cached command index for minutes after
+  each deploy ("This command is outdated", interactions never reaching
+  the gateway). If the registry is ever wiped server-side, delete the
+  config row to force a re-publish.
 - **Rate limits** (H4): `/chart` has `@app_commands.checks.cooldown(1,
   10)` (per-user default); `StockBotTree.on_error` maps
   `CommandOnCooldown` to "Slow down -- retry in Ns". `_instrument_one`

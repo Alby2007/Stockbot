@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import sys
 from typing import Any
@@ -79,7 +81,38 @@ class StockBotClient(discord.Client):
         self._notify_stats: dict[str, int] = {}
 
     async def setup_hook(self) -> None:
-        await self.tree.sync()
+        # tree.sync() is a bulk PUT that re-publishes the entire command
+        # set: Discord bumps the global command `version` on EVERY call,
+        # even a byte-identical one, and clients holding the old version
+        # get "This command is outdated" -- the interaction never reaches
+        # the gateway. Syncing on every boot therefore breaks slash
+        # commands for minutes after each deploy/restart. Hash the
+        # serialized command set and only re-publish on a real change.
+        payload = [cmd.to_dict(self.tree) for cmd in self.tree.get_commands()]
+        digest = int(
+            hashlib.sha256(
+                json.dumps(payload, sort_keys=True, default=str).encode()
+            ).hexdigest()[:20],
+            16,
+        )
+        async with db.connection() as conn, conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT value FROM config WHERE key = 'bot.command_hash'"
+                )
+                row = await cur.fetchone()
+            if row is not None and int(row[0]) == digest:
+                log.info("command set unchanged -- skipping global sync")
+                return
+            synced = await self.tree.sync()
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO config (key, value) "
+                    "VALUES ('bot.command_hash', %s) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    (digest,),
+                )
+            log.info("synced %d global commands", len(synced))
 
     async def _heartbeat_loop(self) -> None:
         """Liveness signal: 'bot is running' means 'heartbeat younger than
