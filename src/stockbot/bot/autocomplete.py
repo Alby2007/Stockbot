@@ -71,10 +71,12 @@ async def sector_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
     """Sector keys for /admin instrument-add (the new listing's ticker
-    can't autocomplete -- it doesn't exist yet)."""
+    can't autocomplete -- it doesn't exist yet). Sector keys live on
+    `sectors.key`, not instruments (which has sector_id); 'index' is
+    excluded because add_instrument refuses it."""
     async with db.connection() as conn, conn.cursor() as cursor:
         await cursor.execute(
-            "SELECT DISTINCT sector_key FROM instruments ORDER BY sector_key"
+            "SELECT key FROM sectors WHERE key <> 'index' ORDER BY key"
         )
         keys = [str(r[0]) for r in await cursor.fetchall()]
     cur = current.strip().upper()
@@ -88,7 +90,12 @@ async def sector_autocomplete(
 async def order_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[int]]:
-    """The caller's open orders only (N5: pickers never leak others')."""
+    """The caller's open orders only (N5: pickers never leak others').
+    The text filter runs in SQL -- a Python-side filter over a LIMIT-100
+    window would under-fill the picker for users with >100 open orders."""
+    cur = current.strip()
+    id_like = f"%{cur.lstrip('#')}%" if cur else "%"
+    tick_like = f"%{cur.upper()}%" if cur else "%"
     async with db.connection() as conn, conn.cursor() as cursor:
         await cursor.execute(
             """
@@ -96,12 +103,12 @@ async def order_autocomplete(
                    o.order_type, o.limit_price, o.stop_price
             FROM orders o JOIN instruments i ON i.id = o.instrument_id
             WHERE o.user_id = %s AND o.status = 'OPEN'
+              AND (CAST(o.id AS TEXT) LIKE %s OR i.ticker LIKE %s)
             ORDER BY o.id DESC LIMIT 100
             """,
-            (interaction.user.id,),
+            (interaction.user.id, id_like, tick_like),
         )
         rows = await cursor.fetchall()
-    cur = current.strip()
     choices = []
     for oid, side, remaining, ticker, otype, limit, stop in rows:
         anchor = (
@@ -114,8 +121,6 @@ async def order_autocomplete(
             )
         )
         label = f"#{oid} {side} {remaining:,} {ticker} {anchor}"
-        if cur and cur.lstrip("#") not in str(oid) and cur.upper() not in str(ticker):
-            continue
         choices.append(app_commands.Choice(name=label[:100], value=int(oid)))
         if len(choices) >= MAX_CHOICES:
             break
@@ -127,6 +132,9 @@ async def admin_order_autocomplete(
 ) -> list[app_commands.Choice[int]]:
     """Every open order across users -- for /admin order-cancel, whose
     whole job is fixing OTHER people's orders."""
+    cur = current.strip()
+    id_like = f"%{cur.lstrip('#')}%" if cur else "%"
+    tick_like = f"%{cur.upper()}%" if cur else "%"
     async with db.connection() as conn, conn.cursor() as cursor:
         await cursor.execute(
             """
@@ -134,16 +142,15 @@ async def admin_order_autocomplete(
                    o.user_id
             FROM orders o JOIN instruments i ON i.id = o.instrument_id
             WHERE o.status = 'OPEN'
+              AND (CAST(o.id AS TEXT) LIKE %s OR i.ticker LIKE %s)
             ORDER BY o.id DESC LIMIT 100
             """,
+            (id_like, tick_like),
         )
         rows = await cursor.fetchall()
-    cur = current.strip()
     choices = []
     for oid, side, remaining, ticker, uid in rows:
         label = f"#{oid} {side} {remaining:,} {ticker} (user {uid})"
-        if cur and cur.lstrip("#") not in str(oid) and cur.upper() not in str(ticker):
-            continue
         choices.append(app_commands.Choice(name=label[:100], value=int(oid)))
         if len(choices) >= MAX_CHOICES:
             break
@@ -154,23 +161,24 @@ async def short_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[int]]:
     """The caller's open bounded shorts."""
+    cur = current.strip()
+    id_like = f"%{cur.lstrip('#')}%" if cur else "%"
+    tick_like = f"%{cur.upper()}%" if cur else "%"
     async with db.connection() as conn, conn.cursor() as cursor:
         await cursor.execute(
             """
             SELECT s.id, i.ticker, s.quantity, s.entry_price
             FROM bounded_shorts s JOIN instruments i ON i.id = s.instrument_id
             WHERE s.user_id = %s AND s.status = 'OPEN'
+              AND (CAST(s.id AS TEXT) LIKE %s OR i.ticker LIKE %s)
             ORDER BY s.id DESC LIMIT 100
             """,
-            (interaction.user.id,),
+            (interaction.user.id, id_like, tick_like),
         )
         rows = await cursor.fetchall()
-    cur = current.strip()
     choices = []
     for sid, ticker, quantity, entry in rows:
         label = f"#{sid} {quantity:,} {ticker} @ {format_price(entry)}"
-        if cur and cur.lstrip("#") not in str(sid) and cur.upper() not in str(ticker):
-            continue
         choices.append(app_commands.Choice(name=label[:100], value=int(sid)))
         if len(choices) >= MAX_CHOICES:
             break

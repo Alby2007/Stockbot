@@ -856,3 +856,58 @@ callbacks use `cursor` for psycopg cursors and `cur` for the typed
 string — mypy treats a reassigned name as one type. `/stock`'s Mark
 field reads "Mark (mid)" whenever bid/ask are shown so the mark isn't
 mistaken for a tradeable price.
+
+**Release hardening done** (grant gating / disable / maintenance /
+rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
+
+- **Snowflake age derivation** (`accounts.service.discord_age_days`):
+  `(user_id >> 22) + 1420070400000` = Discord creation ms -- pure int
+  math, no API call. Every legacy test id (3001, SYNTHETIC_USER_ID_BASE
+  9e14, ...) resolves to ~2015 so they're all eligible; ids from a bare
+  `randrange(10**15, 2**62)` land in the FUTURE and stay grant-pending
+  forever -- generate test snowflakes as `(now_ms - epoch - age) << 22
+  | random22` (see `_snowflake`/`_fresh_user` helpers).
+- **`BootstrapResult` fields**: `account_id, created, granted_now,
+  grant_pending, min_age_days`. The grant is decoupled from creation:
+  `bootstrap_user` issues `STARTING_GRANT` iff `NOT grant_issued AND
+  snowflake age >= accounts.min_discord_age_days` (config, default 30,
+  in CONFIG_BOUNDS so `/admin config` can tune it and doctor knows it).
+  Grant claims run under a `SELECT ... FOR UPDATE` on the users row --
+  concurrent pending bootstraps can't double-grant. Pending self-heals:
+  the first bootstrap after aging delivers the grant, no cron.
+- **Welcome surface**: `_welcome_suffix(result)` -- full welcome only on
+  `created`, but the grant-pending note repeats on EVERY call while it
+  applies (a pending user's $0 needs the explanation every time).
+- **Claim gates moved into `claim_daily`**: `AccountTooYoungError`
+  (snowflake floor) and `FirstClaimLockedError` (24h after
+  users.created_at, carries `unlock_at` for the "when" message -- H5).
+  The harness passes `enforce_first_claim_delay=False` (sim users'
+  created_at is wall-clock, not sim time); all pre-existing claim tests
+  pass it too. `/claim` renders the errors; no more inline SQL.
+- **Per-user disable** (H2): `bootstrap_user` raises `UserDisabledError`
+  (accounts/errors.py -- a plain Exception, NOT a TradingError
+  subclass: importing trading.errors from accounts would cycle through
+  trading.__init__ -> shop -> accounts). `_instrument_one` catches it ->
+  ephemeral "This account is suspended." for every command. Fills and
+  liquidation sweeps NEVER consult bootstrap -- positions still get
+  margin-swept; that's deliberate. `/admin disable` is one transaction:
+  set fields, cancel all OPEN orders (the fill path's bootstrap gap),
+  enqueue `ACCOUNT_SUSPENDED` (kind added to the CHECK in 0038; notify.py
+  has a formatter). `/admin enable` clears; `/admin user-info` is the
+  triage view (balance, grant state, orders/positions/shorts/wash
+  counts, disabled status, real Discord age).
+- **Daily maintenance** (`maintenance.py`, H3): `_post_tick` calls
+  `run_maintenance_if_due` at `tick_index % TICKS_PER_DAY == 0` -- same
+  cadence as the net-worth snapshots, inside _post_tick's own
+  transaction + try/except (prune failures can't poison a tick).
+  Deletes: idempotency_keys >30d, notifications with sent_at >90d
+  (unsent rows are NEVER pruned -- still deliverable), command_stats
+  >90d. The notification poller's assumptions matter here: notification
+  tests start from `DELETE FROM notifications` because command-level
+  tests now commit real outbox rows to the shared test DB.
+- **Rate limits** (H4): `/chart` has `@app_commands.checks.cooldown(1,
+  10)` (per-user default); `StockBotTree.on_error` maps
+  `CommandOnCooldown` to "Slow down -- retry in Ns". `_instrument_one`
+  adds a dumb global throttle (10 cmds / 10s / user, in-memory deque) --
+  catches scripted bursts across all commands, not just the expensive
+  one.

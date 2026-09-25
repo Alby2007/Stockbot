@@ -11,6 +11,7 @@ import time
 from psycopg import AsyncConnection, sql
 from psycopg.rows import dict_row
 
+from stockbot.maintenance import run_maintenance_if_due
 from stockbot.margin import service as margin
 from stockbot.market import data, engine, events
 from stockbot.observability import (
@@ -713,6 +714,9 @@ async def _post_tick(conn: AsyncConnection, tick_index: int) -> None:
             # bootstrap_user trap from AGENTS.md, but for the market).
             if tick_index > 0 and tick_index % await audit_every_n_ticks(conn) == 0:
                 await run_periodic_audit(conn, tick_index)
+            # H3: same day-boundary cadence as the equity snapshots --
+            # prunes idempotency_keys/notifications/command_stats.
+            await run_maintenance_if_due(conn, tick_index)
     except Exception:
         # The audit must never poison the tick loop -- a failed audit
         # *query* is itself the signal.

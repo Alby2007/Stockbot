@@ -35,6 +35,22 @@ class StockBotTree(discord.app_commands.CommandTree["StockBotClient"]):
         error: discord.app_commands.AppCommandError,
     ) -> None:
         command_name = interaction.command.name if interaction.command else "unknown"
+        # H4: cooldowns are expected flow, not errors -- say how long to
+        # wait instead of the generic failure line.
+        if isinstance(error, discord.app_commands.CommandOnCooldown):
+            retry = getattr(error, "retry_after", 0.0)
+            try:
+                msg = (
+                    f"Slow down — `/{command_name}` can be used again in "
+                    f"{retry:.0f}s."
+                )
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except discord.HTTPException:
+                pass
+            return
         log.error("unhandled error in /%s", command_name, exc_info=error)
         try:
             if interaction.response.is_done():

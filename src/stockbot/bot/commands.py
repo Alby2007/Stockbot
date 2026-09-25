@@ -11,7 +11,8 @@ import asyncio
 import functools
 import logging
 import time
-from datetime import UTC, datetime, timedelta
+from collections import deque
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -21,7 +22,12 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from stockbot import db
-from stockbot.accounts.service import STARTING_GRANT, bootstrap_user
+from stockbot.accounts.errors import UserDisabledError
+from stockbot.accounts.service import (
+    STARTING_GRANT,
+    BootstrapResult,
+    bootstrap_user,
+)
 from stockbot.admin.service import (
     TUNABLE_CONFIG_KEYS,
     TUNABLE_PARAMS,
@@ -29,10 +35,13 @@ from stockbot.admin.service import (
     admin_adjust,
     admin_cancel_order,
     delist_instrument,
+    disable_user,
+    enable_user,
     ledger_audit,
     recalc_balances,
     set_config,
     tune_instrument,
+    user_info,
 )
 from stockbot.bot.autocomplete import (
     admin_order_autocomplete,
@@ -51,7 +60,11 @@ from stockbot.bot.chart_view import (
 )
 from stockbot.bot.charts import render_candle_chart
 from stockbot.bot.format import format_money, format_pct, format_price
-from stockbot.claims.errors import AlreadyClaimedTodayError
+from stockbot.claims.errors import (
+    AccountTooYoungError,
+    AlreadyClaimedTodayError,
+    FirstClaimLockedError,
+)
 from stockbot.claims.service import claim_daily
 from stockbot.compliance.wash_trade import scan_for_wash_trades
 from stockbot.config import get_settings
@@ -114,10 +127,6 @@ from stockbot.trading.service import (
 
 log = logging.getLogger("stockbot.bot.commands")
 
-MIN_DISCORD_ACCOUNT_AGE = timedelta(days=30)
-MIN_BOT_ACCOUNT_AGE_BEFORE_FIRST_CLAIM = timedelta(hours=24)
-
-
 def guild_welcome_message() -> str:
     """Posted once per guild on join (N3.2). Points everyone at /start --
     accounts stay per-user and are still only created on first use."""
@@ -132,14 +141,31 @@ def guild_welcome_message() -> str:
     )
 
 
-def _welcome_suffix(created: bool) -> str:
-    """Appended once, on the command that actually created the account
-    (N3.1) -- `bootstrap_user`'s `created` flag is exactly-once per user,
-    so this can never double-fire even if a user's first interaction is
-    something unexpected like `/liquidations`. Explicitly calls out the
-    claim-age gate: without it, a first-time user's day-one `/claim`
-    rejection reads like a bug."""
-    if not created:
+def _welcome_suffix(result: BootstrapResult | None) -> str:
+    # League paths never bootstrap (season-scoped accounts) -> None.
+    if result is None:
+        return ""
+    """Appended to a command's response. Fires the full welcome exactly
+    once -- on the command that actually created the account (N3.1,
+    `bootstrap_user`'s `created` flag is exactly-once) -- but repeats the
+    grant-pending note on EVERY call while it applies (H1): a pending
+    user's $0 balance needs the explanation every time, not just once.
+    Explicitly calls out the claim-age gate: without it, a first-time
+    user's day-one `/claim` rejection reads like a bug."""
+    if result.grant_pending:
+        note = (
+            f"**Your starting grant is pending** — it unlocks once your "
+            f"Discord account is {result.min_age_days} days old "
+            f"(anti-abuse). Everything else works now."
+        )
+        if not result.created:
+            return f"\n\n{note}"
+        return (
+            f"\n\n**Welcome to the market!** {note} Try `/market` to see "
+            "what's tradeable, or `/start` for a full walkthrough. Your "
+            "first `/claim` unlocks 24h after your account is created."
+        )
+    if not result.created:
         return ""
     return (
         f"\n\n**Welcome to the market!** You've been seeded with "
@@ -269,15 +295,20 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 "order flow. Fake money, real mechanics."
             ),
         )
-        embed.add_field(
-            name="Your account",
-            value=(
+        if bootstrap.grant_pending:
+            account_line = (
+                f"Your **{format_money(STARTING_GRANT)}** starting grant "
+                f"unlocks once your Discord account is "
+                f"{bootstrap.min_age_days} days old (anti-abuse) — "
+                "everything else works now."
+            )
+        else:
+            account_line = (
                 f"{'You were just seeded with' if bootstrap.created else 'You started with'} "
                 f"**{format_money(STARTING_GRANT)}**. `/balance` shows cash, "
                 "`/portfolio` shows holdings, `/profile` your track record."
-            ),
-            inline=False,
-        )
+            )
+        embed.add_field(name="Your account", value=account_line, inline=False)
         embed.add_field(
             name="Find trades",
             value=(
@@ -344,7 +375,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"Cash balance: **{format_money(cash)}**\n"
             f"Lifetime volume {format_money(total_traded)} — "
             f"taker fee {fee_bps}bps (makers earn a rebate on crosses)"
-            + _welcome_suffix(bootstrap.created)
+            + _welcome_suffix(bootstrap)
         )
 
     @tree.command(
@@ -367,58 +398,48 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 else "DM notifications are now **off**. Events still happen — "
                 "you just won't hear about them until you turn this back on."
             )
-            + _welcome_suffix(bootstrap.created),
+            + _welcome_suffix(bootstrap),
             ephemeral=True,
         )
 
     @tree.command(name="claim", description="Claim your daily faucet grant")
     async def claim(interaction: discord.Interaction) -> None:
         user = interaction.user
-        account_age = datetime.now(UTC) - discord.utils.snowflake_time(user.id)
-        if account_age < MIN_DISCORD_ACCOUNT_AGE:
-            await interaction.response.send_message(
-                "Your Discord account needs to be at least 30 days old to claim.",
-                ephemeral=True,
-            )
-            return
-
+        # Both age gates live in claim_daily now (H1 defense-in-depth);
+        # the command just renders them. Bootstrapping first is fine --
+        # an under-age user gets a pending-grant account, not a rejection.
         async with db.connection() as conn:
             bootstrap = await bootstrap_user(conn, user.id)
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT created_at FROM users WHERE id = %s", (user.id,))
-                row = await cur.fetchone()
-                assert row is not None
-                (created_at,) = row
-                await cur.execute("SELECT 1 FROM claims WHERE user_id = %s", (user.id,))
-                has_claimed_before = await cur.fetchone() is not None
-
-            if (
-                not has_claimed_before
-                and (datetime.now(UTC) - created_at) < MIN_BOT_ACCOUNT_AGE_BEFORE_FIRST_CLAIM
-            ):
-                # The gate that would otherwise look like a bug to a
-                # brand-new user (their very first /claim always lands
-                # here -- the account was just created).
+            try:
+                amount, streak = await claim_daily(conn, user.id)
+            except AccountTooYoungError:
                 await interaction.response.send_message(
-                    "New accounts need to wait 24h before their first claim."
-                    + _welcome_suffix(bootstrap.created),
+                    f"Your Discord account needs to be at least "
+                    f"{bootstrap.min_age_days} days old to claim."
+                    + _welcome_suffix(bootstrap),
                     ephemeral=True,
                 )
                 return
-
-            try:
-                amount, streak = await claim_daily(conn, user.id)
+            except FirstClaimLockedError as exc:
+                # Say WHEN it unlocks -- a bare "wait 24h" reads as a bug
+                # on a brand-new user's very first command (H5).
+                await interaction.response.send_message(
+                    f"Your first claim unlocks <t:{int(exc.unlock_at.timestamp())}:R>."
+                    + _welcome_suffix(bootstrap),
+                    ephemeral=True,
+                )
+                return
             except AlreadyClaimedTodayError:
                 await interaction.response.send_message(
                     "You already claimed today. Come back tomorrow!"
-                    + _welcome_suffix(bootstrap.created),
+                    + _welcome_suffix(bootstrap),
                     ephemeral=True,
                 )
                 return
 
         await interaction.response.send_message(
             f"Claimed **{format_money(amount)}**! Current streak: **{streak}** day(s)."
-            + _welcome_suffix(bootstrap.created)
+            + _welcome_suffix(bootstrap)
         )
 
     @tree.command(name="market", description="List all tradeable instruments")
@@ -565,6 +586,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ],
     )
     @app_commands.autocomplete(ticker=ticker_autocomplete)
+    # H4: the ~100ms matplotlib render is the one command worth a real
+    # cooldown -- everything else is sub-10ms SQL.
+    @app_commands.checks.cooldown(1, 10.0)  # default bucket: per user
     async def chart(
         interaction: discord.Interaction,
         ticker: str,
@@ -781,7 +805,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def portfolio(interaction: discord.Interaction, league: bool = False) -> None:
         async with db.connection() as conn:
             season_id: int | None = None
-            created = False
+            bootstrap: BootstrapResult | None = None
             if league:
                 entry = await get_active_entry(conn, interaction.user.id)
                 if entry is None:
@@ -793,7 +817,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 season_id, account_id = entry
             else:
                 bootstrap = await bootstrap_user(conn, interaction.user.id)
-                account_id, created = bootstrap.account_id, bootstrap.created
+                account_id = bootstrap.account_id
             cash = await get_balance(conn, account_id)
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -845,7 +869,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 )
             )
         await interaction.response.send_message(
-            content=_welcome_suffix(created) or None, embed=embed
+            content=_welcome_suffix(bootstrap) or None, embed=embed
         )
 
     @tree.command(
@@ -871,7 +895,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"\u2014 {format_money(caller.equity_minor)}"
             )
         await interaction.response.send_message(
-            content=_welcome_suffix(bootstrap.created) or None, embed=embed
+            content=_welcome_suffix(bootstrap) or None, embed=embed
         )
 
     @tree.command(name="history", description="Show your recent trades")
@@ -882,7 +906,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         if not trades:
             await interaction.response.send_message(
                 "No trades yet. Try `/market` to see what's tradeable."
-                + _welcome_suffix(bootstrap.created),
+                + _welcome_suffix(bootstrap),
                 ephemeral=True,
             )
             return
@@ -896,7 +920,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         embed = discord.Embed(title="Recent trades")
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(
-            content=_welcome_suffix(bootstrap.created) or None, embed=embed
+            content=_welcome_suffix(bootstrap) or None, embed=embed
         )
 
     @tree.command(name="compare", description="Head-to-head comparison with another user")
@@ -933,7 +957,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         embed.add_field(name=interaction.user.display_name, value=_fmt(me))
         embed.add_field(name=user.display_name, value=_fmt(them))
         await interaction.response.send_message(
-            content=_welcome_suffix(bootstrap.created) or None, embed=embed
+            content=_welcome_suffix(bootstrap) or None, embed=embed
         )
 
     @tree.command(
@@ -966,7 +990,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 value=format_money(stats.active_season_equity_minor),
             )
         await interaction.response.send_message(
-            content=_welcome_suffix(bootstrap.created) or None, embed=embed
+            content=_welcome_suffix(bootstrap) or None, embed=embed
         )
 
     @tree.command(name="buy", description="Buy shares of an instrument")
@@ -1033,7 +1057,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     ) -> None:
         async with db.connection() as conn:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
-            account_id, created = bootstrap.account_id, bootstrap.created
+            account_id = bootstrap.account_id
             season_id: int | None = None
             if league:
                 entry = await get_active_entry(conn, interaction.user.id)
@@ -1139,7 +1163,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"{format_price(result.fill_price)} — {moved} "
             f"(fee {format_money(result.fee_minor)}). "
             f"Cash: **{format_money(cash_after)}**{closed}{suffix}"
-            + _welcome_suffix(created)
+            + _welcome_suffix(bootstrap)
         )
 
     @tree.command(
@@ -1162,7 +1186,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     ) -> None:
         async with db.connection() as conn:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
-            account_id, created = bootstrap.account_id, bootstrap.created
+            account_id = bootstrap.account_id
             season_id: int | None = None
             if league:
                 entry = await get_active_entry(conn, interaction.user.id)
@@ -1222,7 +1246,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"@ {format_price(result.entry_price)} — collateral "
             f"{format_money(result.collateral_minor)}, knocks out at "
             f"{format_price(result.knockout_price)}."
-            + _welcome_suffix(created)
+            + _welcome_suffix(bootstrap)
         )
 
     @tree.command(name="shorts", description="List your open bounded shorts")
@@ -1230,7 +1254,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def shorts(interaction: discord.Interaction, league: bool = False) -> None:
         async with db.connection() as conn:
             season_id: int | None = None
-            created = False
+            bootstrap: BootstrapResult | None = None
             if league:
                 entry = await get_active_entry(conn, interaction.user.id)
                 if entry is None:
@@ -1240,7 +1264,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     return
                 season_id = entry[0]
             else:
-                created = (await bootstrap_user(conn, interaction.user.id)).created
+                bootstrap = await bootstrap_user(conn, interaction.user.id)
             rows = await list_open_shorts(conn, interaction.user.id, season_id)
 
         if not rows:
@@ -1264,7 +1288,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         embed.set_footer(text="/cover <id> to close early")
         await interaction.response.send_message(
-            content=_welcome_suffix(created) or None, embed=embed
+            content=_welcome_suffix(bootstrap) or None, embed=embed
         )
 
     @tree.command(name="cover", description="Close a bounded short at market")
@@ -1272,7 +1296,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @app_commands.autocomplete(short_id=short_autocomplete)
     async def cover(interaction: discord.Interaction, short_id: int) -> None:
         async with db.connection() as conn:
-            created = (await bootstrap_user(conn, interaction.user.id)).created
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
             try:
                 result = await cover_bounded_short(
                     conn, user_id=interaction.user.id, short_id=short_id
@@ -1286,14 +1310,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"{format_price(result.close_price)} — {outcome} "
             f"{format_money(abs(result.payoff_minor))}, paid out "
             f"{format_money(result.payout_minor)}."
-            + _welcome_suffix(created)
+            + _welcome_suffix(bootstrap)
         )
 
     @tree.command(name="margin", description="Show your margin account health")
     @app_commands.describe(league="Show your league account's margin instead")
     async def margin_cmd(interaction: discord.Interaction, league: bool = False) -> None:
         async with db.connection() as conn:
-            created = (await bootstrap_user(conn, interaction.user.id)).created
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
             season_id: int | None = None
             if league:
                 entry = await get_active_entry(conn, interaction.user.id)
@@ -1339,7 +1363,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         if health.undermargined:
             embed.set_footer(text="Below maintenance — liquidation may fire on the next tick.")
         await interaction.response.send_message(
-            content=_welcome_suffix(created) or None, embed=embed
+            content=_welcome_suffix(bootstrap) or None, embed=embed
         )
 
     @tree.command(
@@ -1349,7 +1373,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @app_commands.describe(league="Show league positions instead")
     async def collateral(interaction: discord.Interaction, league: bool = False) -> None:
         async with db.connection() as conn:
-            created = (await bootstrap_user(conn, interaction.user.id)).created
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
             season_id: int | None = None
             if league:
                 entry = await get_active_entry(conn, interaction.user.id)
@@ -1394,13 +1418,13 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         embed = discord.Embed(title="Collateral — open shorts")
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(
-            content=_welcome_suffix(created) or None, embed=embed
+            content=_welcome_suffix(bootstrap) or None, embed=embed
         )
 
     @tree.command(name="liquidations", description="Show your recent liquidation events")
     async def liquidations(interaction: discord.Interaction) -> None:
         async with db.connection() as conn:
-            created = (await bootstrap_user(conn, interaction.user.id)).created
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
             rows = await list_liquidations(conn, interaction.user.id)
         if not rows:
             await interaction.response.send_message(
@@ -1418,7 +1442,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         embed = discord.Embed(title="Liquidations")
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(
-            content=_welcome_suffix(created) or None, embed=embed
+            content=_welcome_suffix(bootstrap) or None, embed=embed
         )
 
     order_group = app_commands.Group(
@@ -1450,7 +1474,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
             return
         async with db.connection() as conn:
-            created = (await bootstrap_user(conn, interaction.user.id)).created
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
             season_id: int | None = None
             if league:
                 entry = await get_active_entry(conn, interaction.user.id)
@@ -1568,7 +1592,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"**{result.quantity:,}** {result.ticker} {price_part}{iceberg}"
             f"{notional}{position_capped}{unbacked_note} "
             f"({expiry}). Fills when the market reaches it."
-            + _welcome_suffix(created)
+            + _welcome_suffix(bootstrap)
         )
 
     @order_group.command(name="buy", description="Rest a limit/stop buy")
@@ -1637,7 +1661,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @app_commands.describe(league="Show league orders instead of main-portfolio ones")
     async def order_list(interaction: discord.Interaction, league: bool = False) -> None:
         async with db.connection() as conn:
-            created = (await bootstrap_user(conn, interaction.user.id)).created
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
             season_id: int | None = None
             if league:
                 entry = await get_active_entry(conn, interaction.user.id)
@@ -1683,7 +1707,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         embed = discord.Embed(title="Open orders")
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(
-            content=_welcome_suffix(created) or None, embed=embed
+            content=_welcome_suffix(bootstrap) or None, embed=embed
         )
 
     @order_group.command(name="cancel", description="Cancel a resting order")
@@ -1691,13 +1715,13 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @app_commands.autocomplete(order_id=order_autocomplete)
     async def order_cancel(interaction: discord.Interaction, order_id: int) -> None:
         async with db.connection() as conn:
-            created = (await bootstrap_user(conn, interaction.user.id)).created
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
             cancelled = await cancel_order(
                 conn, user_id=interaction.user.id, order_id=order_id
             )
         if cancelled:
             await interaction.response.send_message(
-                f"Cancelled order **#{order_id}**." + _welcome_suffix(created)
+                f"Cancelled order **#{order_id}**." + _welcome_suffix(bootstrap)
             )
         else:
             await interaction.response.send_message(
@@ -1713,7 +1737,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @shop_group.command(name="list", description="List items available in the shop")
     async def shop_list(interaction: discord.Interaction) -> None:
         async with db.connection() as conn:
-            created = (await bootstrap_user(conn, interaction.user.id)).created
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
             items = await list_items(conn)
             slot_count = await get_slot_count(conn, interaction.user.id)
             owned = await get_user_entitlements(conn, interaction.user.id)
@@ -1747,7 +1771,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         embed.set_footer(text="/shop buy <item>")
         await interaction.response.send_message(
-            content=_welcome_suffix(created) or None, embed=embed
+            content=_welcome_suffix(bootstrap) or None, embed=embed
         )
 
     @shop_group.command(name="buy", description="Buy an item from the shop")
@@ -1755,7 +1779,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @app_commands.autocomplete(item=shop_item_autocomplete)
     async def shop_buy(interaction: discord.Interaction, item: str) -> None:
         async with db.connection() as conn:
-            created = (await bootstrap_user(conn, interaction.user.id)).created
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
             try:
                 price = await buy_item(
                     conn,
@@ -1778,7 +1802,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 return
         await interaction.response.send_message(
             f"Purchased **{item.lower()}** for {format_money(price)}."
-            + _welcome_suffix(created)
+            + _welcome_suffix(bootstrap)
         )
 
     tree.add_command(shop_group)
@@ -1831,7 +1855,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @league_group.command(name="join", description="Enter the open league season")
     async def league_join(interaction: discord.Interaction) -> None:
         async with db.connection() as conn:
-            created = (await bootstrap_user(conn, interaction.user.id)).created
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
             season = await get_open_season(conn)
             try:
                 await join_season(conn, interaction.user.id)
@@ -1850,7 +1874,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             # Rare race: the season was created between our read and
             # join_season's own lookup -- confirm the join anyway.
             await interaction.response.send_message(
-                "Entered the league season." + _welcome_suffix(created)
+                "Entered the league season." + _welcome_suffix(bootstrap)
             )
             return
         await interaction.response.send_message(
@@ -1858,7 +1882,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"**{format_money(season.stake_minor)}**. Trade it with "
             "`/buy <ticker> quantity:<shares>` or `dollars:<$>` — add "
             "`league:True`."
-            + _welcome_suffix(created)
+            + _welcome_suffix(bootstrap)
         )
 
     @league_group.command(name="standings", description="Show league standings")
@@ -2124,6 +2148,91 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.response.send_message(msg, ephemeral=True)
 
     @admin_group.command(
+        name="disable",
+        description="Suspend a user: blocks commands, cancels their open orders, DMs them",
+    )
+    @app_commands.describe(user="Discord user", reason="Why (shown to the user)")
+    async def admin_disable(
+        interaction: discord.Interaction, user: discord.User, reason: str
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            try:
+                changed = await disable_user(
+                    conn, user.id, reason, interaction.user.id
+                )
+            except ValueError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            (
+                f"**{user.display_name}** suspended — open orders cancelled, "
+                "DM enqueued. Their open positions still follow market "
+                "mechanics (liquidation sweeps run as usual)."
+            )
+            if changed
+            else f"**{user.display_name}** is already suspended.",
+            ephemeral=True,
+        )
+
+    @admin_group.command(name="enable", description="Lift a user's suspension")
+    @app_commands.describe(user="Discord user")
+    async def admin_enable(
+        interaction: discord.Interaction, user: discord.User
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            changed = await enable_user(conn, user.id)
+        await interaction.response.send_message(
+            (
+                f"**{user.display_name}** re-enabled."
+            )
+            if changed
+            else f"**{user.display_name}** isn't suspended.",
+            ephemeral=True,
+        )
+
+    @admin_group.command(
+        name="user-info", description="Moderation triage: balances, grants, flags, status"
+    )
+    @app_commands.describe(user="Discord user")
+    async def admin_user_info(
+        interaction: discord.Interaction, user: discord.User
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            info = await user_info(conn, user.id)
+        if not info.exists:
+            await interaction.response.send_message(
+                f"**{user.display_name}** has no StockBot account "
+                f"(Discord account age: {info.discord_age_days:.0f} days).",
+                ephemeral=True,
+            )
+            return
+        disabled = (
+            f"suspended by {info.disabled_by}: {info.disabled_reason}"
+            if info.disabled_at is not None
+            else "active"
+        )
+        await interaction.response.send_message(
+            f"**{user.display_name}** (`{user.id}`) — {disabled}\n"
+            f"Discord age: {info.discord_age_days:.0f}d · "
+            f"created {info.created_at:%Y-%m-%d} · "
+            f"grant {'issued' if info.grant_issued else 'PENDING'}\n"
+            f"balance {format_money(info.balance_minor or 0)} · "
+            f"{info.open_positions} position(s) · {info.open_shorts} "
+            f"short(s) · {info.open_orders} open order(s) · "
+            f"**{info.wash_flags}** wash flag(s)",
+            ephemeral=True,
+        )
+
+    @admin_group.command(
         name="recalc-balances",
         description="Rebuild accounts.balance from SUM(ledger_entries); reports drift fixed",
     )
@@ -2299,6 +2408,13 @@ def _instrument_commands(tree: app_commands.CommandTree) -> None:
         _instrument_one(cmd)
 
 
+# H4: cheap in-memory per-user throttle against scripted command spam --
+# one dict, no table. Discord's own cooldowns cover the expensive
+# commands (/chart); this catches bursts across ALL commands.
+_THROTTLE_RATE, _THROTTLE_WINDOW = 10, 10.0  # commands / seconds
+_throttle: dict[int, deque[float]] = {}
+
+
 def _instrument_one(cmd: Any) -> None:
     if isinstance(cmd, app_commands.Group):
         for sub in cmd.commands:
@@ -2316,7 +2432,37 @@ def _instrument_one(cmd: Any) -> None:
         started = time.perf_counter()
         ok, error = True, None
         try:
+            # Cheap global throttle: N commands per window per user.
+            hits = _throttle.setdefault(interaction.user.id, deque())
+            now = time.monotonic()
+            while hits and now - hits[0] > _THROTTLE_WINDOW:
+                hits.popleft()
+            if len(hits) >= _THROTTLE_RATE:
+                ok, error = False, "throttled"
+                await interaction.response.send_message(
+                    "Slow down — too many commands. Try again in a few "
+                    "seconds.",
+                    ephemeral=True,
+                )
+                return None
+            hits.append(now)
             return await original(interaction, *args, **kwargs)
+        except UserDisabledError:
+            # H2: the account-level chokepoint raised -- one ephemeral
+            # for every command, no per-handler edits.
+            ok, error = False, "UserDisabledError"
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        "This account is suspended.", ephemeral=True
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "This account is suspended.", ephemeral=True
+                    )
+            except discord.HTTPException:
+                pass
+            return None
         except Exception as exc:
             ok, error = False, f"{type(exc).__name__}: {exc}"[:200]
             raise

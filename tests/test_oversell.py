@@ -4,6 +4,7 @@ flag, dollar-formatted margin errors."""
 from __future__ import annotations
 
 import random
+import time
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
@@ -28,8 +29,12 @@ SEED = "oversell-test-seed"
 
 def _fresh_user() -> int:
     """Command-level tests run through the real pool and commit; a fixed
-    snowflake would only be 'new' on the first run ever."""
-    return random.SystemRandom().randrange(10**15, 2**62)
+    snowflake would only be 'new' on the first run ever. Anchored >30d
+    in the past so the H1 grant gate doesn't leave the account unfunded."""
+    rng = random.SystemRandom()
+    age_ms = rng.randrange(31, 4000) * 86_400_000
+    ts_ms = int(time.time() * 1000) - 1_420_070_400_000 - age_ms
+    return (ts_ms << 22) | rng.randrange(1, 1 << 22)
 
 
 async def _first_ticker(conn: AsyncConnection) -> str:

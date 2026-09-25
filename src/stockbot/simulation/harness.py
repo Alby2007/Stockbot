@@ -213,7 +213,12 @@ async def _random_active_ticker(conn: AsyncConnection, rng: random.Random) -> st
 
 async def _safe_claim(conn: AsyncConnection, user_id: int, sim_today: date) -> None:
     try:
-        await claim_daily(conn, user_id, as_of_date=sim_today)
+        # enforce_first_claim_delay=False: sim users' users.created_at is
+        # wall-clock now, not sim time -- the 24h gate is real-Discord
+        # anti-farm, meaningless for agents.
+        await claim_daily(
+            conn, user_id, as_of_date=sim_today, enforce_first_claim_delay=False
+        )
     except AlreadyClaimedTodayError:
         pass
 

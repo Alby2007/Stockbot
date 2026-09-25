@@ -230,7 +230,7 @@ async def profile_stats(conn: AsyncConnection, user_id: int) -> ProfileStats | N
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            SELECT e.account_id FROM season_entries e
+            SELECT e.season_id FROM season_entries e
             JOIN seasons s ON s.id = e.season_id
             WHERE e.user_id = %s AND s.status = 'ACTIVE'
             """,
@@ -239,12 +239,13 @@ async def profile_stats(conn: AsyncConnection, user_id: int) -> ProfileStats | N
         active_entry = await cur.fetchone()
     active_equity = None
     if active_entry is not None:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT balance FROM accounts WHERE id = %s", (active_entry[0],)
-            )
-            bal_row = await cur.fetchone()
-        active_equity = int(bal_row[0]) if bal_row else 0
+        # Mark-to-market league equity (cash + positions + shorts net of
+        # accruals) -- the same number standings report, not raw cash.
+        from stockbot.seasons.service import league_equity_minor
+
+        active_equity = await league_equity_minor(
+            conn, int(active_entry[0]), user_id
+        )
 
     age_days = (datetime.now(UTC) - created_at).total_seconds() / 86400
 

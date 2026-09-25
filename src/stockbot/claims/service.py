@@ -7,12 +7,20 @@ what a single good trade nets.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 from psycopg import AsyncConnection
 
-from stockbot.accounts.service import bootstrap_user
-from stockbot.claims.errors import AlreadyClaimedTodayError
+from stockbot.accounts.service import (
+    bootstrap_user,
+    discord_age_days,
+    min_discord_age_days,
+)
+from stockbot.claims.errors import (
+    AccountTooYoungError,
+    AlreadyClaimedTodayError,
+    FirstClaimLockedError,
+)
 from stockbot.ledger.service import get_system_account_id, post_transfer
 
 BASE_CLAIM_MINOR = 200  # $2.00
@@ -25,8 +33,15 @@ def claim_amount(streak: int) -> int:
     return BASE_CLAIM_MINOR + bonus_days * STREAK_BONUS_PER_DAY_MINOR
 
 
+FIRST_CLAIM_DELAY = timedelta(hours=24)
+
+
 async def claim_daily(
-    conn: AsyncConnection, user_id: int, *, as_of_date: date | None = None
+    conn: AsyncConnection,
+    user_id: int,
+    *,
+    as_of_date: date | None = None,
+    enforce_first_claim_delay: bool = True,
 ) -> tuple[int, int]:
     """Claim today's faucet grant. Returns (amount_minor, streak).
 
@@ -34,12 +49,23 @@ async def claim_daily(
     (server date, UTC). A streak continues if the previous claim was
     yesterday; any bigger gap resets it to 1.
 
+    Two anti-farm gates live HERE, not just at the command layer (H1
+    defense-in-depth): the Discord snowflake must be older than
+    `accounts.min_discord_age_days` (`AccountTooYoungError`), and a
+    brand-new bot account waits FIRST_CLAIM_DELAY before its first claim
+    (`FirstClaimLockedError`, which carries the unlock instant).
+
     `as_of_date` overrides "today" -- the simulation harness passes
     simulated dates so a 90-simulated-day run exercises the real claim path
-    instead of collapsing into the single real date the run happens on.
+    instead of collapsing into the single real date the run happens on; it
+    also passes `enforce_first_claim_delay=False` since its users'
+    `users.created_at` is wall-clock now, not sim time.
     """
     async with conn.transaction():
         await bootstrap_user(conn, user_id)
+        min_age = await min_discord_age_days(conn)
+        if discord_age_days(user_id) < min_age:
+            raise AccountTooYoungError(min_age)
         account_id_row = None
         async with conn.cursor() as cur:
             await cur.execute(
@@ -56,6 +82,17 @@ async def claim_daily(
                 (user_id,),
             )
             existing = await cur.fetchone()
+
+            if enforce_first_claim_delay and existing is None:
+                await cur.execute(
+                    "SELECT created_at FROM users WHERE id = %s", (user_id,)
+                )
+                created_row = await cur.fetchone()
+                assert created_row is not None  # bootstrap ran in this tx
+                (created_at,) = created_row
+                unlock_at = created_at + FIRST_CLAIM_DELAY
+                if datetime.now(UTC) < unlock_at:
+                    raise FirstClaimLockedError(unlock_at)
 
             if as_of_date is None:
                 await cur.execute("SELECT CURRENT_DATE")

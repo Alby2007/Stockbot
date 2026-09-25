@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import time
 from decimal import Decimal
 from unittest.mock import MagicMock
 
@@ -24,7 +25,13 @@ from stockbot.shorts.service import open_bounded_short
 
 
 def _fresh_user() -> int:
-    return random.SystemRandom().randrange(10**15, 2**62)
+    """A unique, comfortably >30d-old Discord snowflake: the high bits are
+    ms since the Discord epoch (2015-01-01), the low 22 are random. Bare
+    randrange ids land in the future and stay grant-pending forever."""
+    rng = random.SystemRandom()
+    age_ms = rng.randrange(31, 4000) * 86_400_000
+    ts_ms = int(time.time() * 1000) - 1_420_070_400_000 - age_ms
+    return (ts_ms << 22) | rng.randrange(1, 1 << 22)
 
 
 def _user_interaction(user_id: int) -> MagicMock:

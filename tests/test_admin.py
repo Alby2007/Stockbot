@@ -75,7 +75,7 @@ async def test_param_bounds_are_enforced_by_the_schema(conn: AsyncConnection) ->
 
 async def test_ledger_audit_is_healthy_on_a_clean_ledger(conn: AsyncConnection) -> None:
     await bootstrap_user(conn, 4001)
-    await claim_daily(conn, 4001)
+    await claim_daily(conn, 4001, enforce_first_claim_delay=False)
     report = await ledger_audit(conn)
     assert report.healthy
     assert report.ledger_sum == 0
@@ -88,7 +88,7 @@ async def test_ledger_audit_flags_accounts_whose_balance_drifted(conn: AsyncConn
     """accounts.balance is a cache over ledger_entries; a write that bypasses
     post_transfer must show up here even though the global sum stays 0."""
     account_id = (await bootstrap_user(conn, 4002)).account_id
-    await claim_daily(conn, 4002)
+    await claim_daily(conn, 4002, enforce_first_claim_delay=False)
     async with conn.cursor() as cur:
         await cur.execute(
             "UPDATE accounts SET balance = balance + 1 WHERE id = %s", (account_id,)

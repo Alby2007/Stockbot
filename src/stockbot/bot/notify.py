@@ -112,11 +112,22 @@ def _fmt_season_result(items: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_account_suspended(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    return (
+        "Your StockBot account has been suspended"
+        + (f": {p['reason']}" if p.get("reason") else ".")
+        + " Your open orders were cancelled; open positions are still "
+        "managed by the market. Contact a moderator to appeal."
+    )
+
+
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "LIQUIDATION": _fmt_liquidation,
     "KNOCKOUT": _fmt_knockout,
     "ORDER_FILLED": _fmt_order_filled,
     "SEASON_RESULT": _fmt_season_result,
+    "ACCOUNT_SUSPENDED": _fmt_account_suspended,
 }
 
 

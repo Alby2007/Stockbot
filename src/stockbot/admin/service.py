@@ -13,6 +13,7 @@ migration 0013's `instruments_engine_params_sane` CHECK.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -140,6 +141,7 @@ async def ledger_audit(conn: AsyncConnection) -> LedgerAuditReport:
 # bounds are deliberately generous (these are ops knobs, not physics) but
 # always finite and nonzero where a zero would divide.
 CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
+    "accounts.min_discord_age_days": (0, 3650),
     "audit.every_n_ticks": (1, 1e6),
     "cross.collar_pct": (0.0001, 1.0),
     "cross.trade_through_epsilon": (0.0, 1.0),
@@ -280,6 +282,167 @@ async def admin_cancel_order(conn: AsyncConnection, order_id: int) -> bool:
             (order_id,),
         )
         return cur.rowcount > 0
+
+
+async def disable_user(
+    conn: AsyncConnection, user_id: int, reason: str, admin_id: int
+) -> bool:
+    """Suspend a user: bootstrap_user raises UserDisabledError from now on,
+    which blocks every user-initiated money path (trades, orders, claims,
+    shop, league join). One transaction:
+
+    - set disabled_at/reason/by (idempotent -- already-disabled is a no-op
+      returning False)
+    - cancel ALL their OPEN orders (fills never consult bootstrap, so
+      without this a suspended user's resting orders would keep trading
+      forever -- the gap the audit flagged)
+    - enqueue an ACCOUNT_SUSPENDED outbox row so the DM explains itself
+
+    Positions are deliberately untouched: the liquidation engine still
+    manages them -- freezing those would be strictly worse.
+    """
+    async with conn.transaction(), conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE users
+            SET disabled_at = now(), disabled_reason = %s, disabled_by = %s
+            WHERE id = %s AND disabled_at IS NULL
+            """,
+            (reason, admin_id, user_id),
+        )
+        if cur.rowcount == 0:
+            await cur.execute("SELECT 1 FROM users WHERE id = %s", (user_id,))
+            if await cur.fetchone() is None:
+                raise ValueError(f"user {user_id} has no StockBot account")
+            return False
+        await cur.execute(
+            "UPDATE orders SET status = 'CANCELLED' "
+            "WHERE user_id = %s AND status = 'OPEN'",
+            (user_id,),
+        )
+        cancelled = cur.rowcount
+        await cur.execute(
+            """
+            INSERT INTO notifications (user_id, kind, payload)
+            VALUES (%s, 'ACCOUNT_SUSPENDED', %s)
+            """,
+            (
+                user_id,
+                json.dumps(
+                    {"reason": reason, "cancelled_orders": cancelled}
+                ),
+            ),
+        )
+    return True
+
+
+async def enable_user(conn: AsyncConnection, user_id: int) -> bool:
+    """Clear a suspension. Cancelled orders stay cancelled -- the user
+    can re-place them; un-cancelling would resurrect stale intents."""
+    async with conn.transaction(), conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE users
+            SET disabled_at = NULL, disabled_reason = NULL, disabled_by = NULL
+            WHERE id = %s AND disabled_at IS NOT NULL
+            """,
+            (user_id,),
+        )
+        return cur.rowcount > 0
+
+
+@dataclass(frozen=True)
+class UserInfo:
+    exists: bool
+    balance_minor: int | None
+    created_at: object | None
+    grant_issued: bool | None
+    discord_age_days: float
+    open_orders: int
+    open_positions: int
+    open_shorts: int
+    wash_flags: int
+    disabled_at: object | None
+    disabled_reason: str | None
+    disabled_by: int | None
+
+
+async def user_info(conn: AsyncConnection, user_id: int) -> UserInfo:
+    """Moderation triage for /admin user-info: everything you'd check the
+    first time wash-trades flags someone."""
+    from stockbot.accounts.service import discord_age_days
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT u.created_at, u.grant_issued, u.disabled_at,
+                   u.disabled_reason, u.disabled_by, a.balance
+            FROM users u
+            LEFT JOIN accounts a ON a.user_id = u.id AND a.kind = 'USER'
+            WHERE u.id = %s
+            """,
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return UserInfo(
+                exists=False,
+                balance_minor=None,
+                created_at=None,
+                grant_issued=None,
+                discord_age_days=discord_age_days(user_id),
+                open_orders=0,
+                open_positions=0,
+                open_shorts=0,
+                wash_flags=0,
+                disabled_at=None,
+                disabled_reason=None,
+                disabled_by=None,
+            )
+        created_at, grant_issued, disabled_at, reason, by, balance = row
+        await cur.execute(
+            "SELECT count(*) FROM orders WHERE user_id = %s AND status = 'OPEN'",
+            (user_id,),
+        )
+        open_orders_row = await cur.fetchone()
+        assert open_orders_row is not None
+        (open_orders,) = open_orders_row
+        await cur.execute(
+            "SELECT count(*) FROM positions WHERE user_id = %s AND quantity <> 0",
+            (user_id,),
+        )
+        open_positions_row = await cur.fetchone()
+        assert open_positions_row is not None
+        (open_positions,) = open_positions_row
+        await cur.execute(
+            "SELECT count(*) FROM bounded_shorts WHERE user_id = %s AND status = 'OPEN'",
+            (user_id,),
+        )
+        open_shorts_row = await cur.fetchone()
+        assert open_shorts_row is not None
+        (open_shorts,) = open_shorts_row
+        await cur.execute(
+            "SELECT count(*) FROM wash_trade_flags "
+            "WHERE buyer_id = %s OR seller_id = %s",
+            (user_id, user_id),
+        )
+        wash_flags_row = await cur.fetchone()
+        assert wash_flags_row is not None
+        (wash_flags,) = wash_flags_row
+    return UserInfo(
+        exists=True,
+        balance_minor=int(balance) if balance is not None else 0,
+        created_at=created_at,
+        grant_issued=bool(grant_issued),
+        discord_age_days=discord_age_days(user_id),
+        open_orders=int(open_orders),
+        open_positions=int(open_positions),
+        open_shorts=int(open_shorts),
+        wash_flags=int(wash_flags),
+        disabled_at=disabled_at,
+        disabled_reason=reason,
+        disabled_by=int(by) if by is not None else None,
+    )
 
 
 async def recalc_balances(conn: AsyncConnection) -> int:

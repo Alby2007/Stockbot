@@ -9,10 +9,21 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
 from psycopg import AsyncConnection
 
 from stockbot.accounts.service import bootstrap_user
 from stockbot.bot.notify import DeliveryForbidden, poll_once
+
+
+@pytest.fixture(autouse=True)
+async def _clean_outbox(conn: AsyncConnection) -> None:
+    """poll_once scans the WHOLE pending set -- command-level tests
+    elsewhere in the suite commit real outbox rows (e.g. H2's
+    ACCOUNT_SUSPENDED), so each test starts from an empty outbox
+    (rolled back with everything else)."""
+    async with conn.cursor() as cur:
+        await cur.execute("DELETE FROM notifications")
 
 
 async def _insert(

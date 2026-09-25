@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import random
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
 
 from stockbot import db
-from stockbot.accounts.service import STARTING_GRANT, bootstrap_user
+from stockbot.accounts.service import (
+    STARTING_GRANT,
+    BootstrapResult,
+    bootstrap_user,
+)
 from stockbot.bot.commands import (
     _welcome_suffix,
     guild_welcome_message,
@@ -20,8 +25,13 @@ from stockbot.ledger.service import get_balance
 
 def _fresh_user() -> int:
     """/start tests bootstrap through the real pool, which commits for
-    real -- a fixed snowflake would only be 'new' on the first run ever."""
-    return random.SystemRandom().randrange(10**15, 2**62)
+    real -- a fixed snowflake would only be 'new' on the first run ever.
+    Anchored >30d in the past so the H1 grant gate doesn't leave the
+    account unfunded."""
+    rng = random.SystemRandom()
+    age_ms = rng.randrange(31, 4000) * 86_400_000
+    ts_ms = int(time.time() * 1000) - 1_420_070_400_000 - age_ms
+    return (ts_ms << 22) | rng.randrange(1, 1 << 22)
 
 
 def _forbidden_channel() -> MagicMock:
@@ -35,11 +45,35 @@ def _forbidden_channel() -> MagicMock:
 
 
 def test_welcome_suffix_fires_only_on_creation() -> None:
-    assert _welcome_suffix(False) == ""
-    msg = _welcome_suffix(True)
+    assert _welcome_suffix(None) == ""
+    assert _welcome_suffix(BootstrapResult(account_id=1, created=False)) == ""
+    msg = _welcome_suffix(
+        BootstrapResult(account_id=1, created=True, granted_now=True)
+    )
     assert "Welcome" in msg
     assert format_money(STARTING_GRANT) in msg
     assert "/start" in msg
+
+
+def test_welcome_suffix_grant_pending_variants() -> None:
+    """H1: the pending note fires on EVERY call while it applies (a
+    pending user's $0 needs the explanation every time), not just at
+    creation."""
+    created = BootstrapResult(
+        account_id=1, created=True, grant_pending=True, min_age_days=30
+    )
+    msg = _welcome_suffix(created)
+    assert "Welcome" in msg
+    assert "pending" in msg
+    assert "30 days" in msg
+    assert format_money(STARTING_GRANT) not in msg
+
+    repeat = BootstrapResult(
+        account_id=1, created=False, grant_pending=True, min_age_days=30
+    )
+    msg = _welcome_suffix(repeat)
+    assert "Welcome" not in msg
+    assert "pending" in msg
 
 
 def test_guild_welcome_points_at_start() -> None:
