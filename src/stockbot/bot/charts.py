@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import math
+from datetime import UTC
 from typing import Any
 
 import matplotlib
@@ -96,7 +97,10 @@ async def _select_window_rows(
                    MAX(c.halt_kind) AS halt_kind,
                    -- 'OPEN' > 'CLOSED': a bucket mixing the session
                    -- boundary renders as the open-phase candle it mostly is.
-                   MAX(COALESCE(mt.session_state, 'OPEN')) AS session_state
+                   MAX(COALESCE(mt.session_state, 'OPEN')) AS session_state,
+                   -- Buckets label by their right edge's timestamp, like
+                   -- real charts label a bar by its close.
+                   MAX(mt.ts) AS ts
             FROM candles c
             JOIN picked p ON p.tick_index = c.tick_index
             LEFT JOIN market_ticks mt ON mt.tick_index = c.tick_index
@@ -135,10 +139,14 @@ async def render_candle_chart(
     *,
     end: int | None = None,
     span: int = 240,
-) -> tuple[io.BytesIO, int] | None:
+    axis: str = "time",
+) -> tuple[io.BytesIO, int, Any] | None:
     """Candlestick chart of the `span` open ticks ending at `end`.
-    Returns (png, resolved_end) -- the clamped end tick for encoding into
-    button state -- or None if the window holds no candles."""
+    Returns (png, resolved_end, end_ts) -- the clamped end tick for
+    button state and the newest candle's timestamp for footers -- or
+    None if the window holds no candles."""
+    if axis not in ("time", "ticks"):
+        axis = "time"
     rows, resolved_end = await _select_window_rows(
         conn, instrument_id, end, span
     )
@@ -149,12 +157,57 @@ async def render_candle_chart(
     # pyplot) keeps it off pyplot's shared global state, which isn't
     # thread-safe.
     bucket = bucket_for_span(span)
-    buf = await asyncio.to_thread(_render_png, rows, ticker, span, bucket)
-    return buf, resolved_end
+    buf = await asyncio.to_thread(_render_png, rows, ticker, span, bucket, axis)
+    end_ts = rows[0][8]  # newest-first: the window's true right edge
+    return buf, resolved_end, end_ts
+
+
+def _axis_formatter(
+    times: list[Any], ticks: list[int], axis: str
+) -> Any:
+    """X-label formatter for either axis mode. `time`: UTC HH:MM, with
+    "Sep 25" on the first candle of each new UTC day in multi-day
+    windows -- the compressed closed run then reads as a real overnight
+    gap (16:00 -> Sep 25) instead of a cryptic tick jump. Candles whose
+    market_ticks row is missing (synthetic data) fall back to the tick
+    index."""
+    if axis == "ticks":
+
+        def _tick_fmt(v: float, _pos: int) -> str:
+            i = int(round(v))
+            if abs(v - i) > 1e-6 or not (0 <= i < len(ticks)):
+                return ""
+            return str(ticks[i])
+
+        return _tick_fmt
+
+    days = {t.astimezone(UTC).date() for t in times if t is not None}
+    multi_day = len(days) > 1
+
+    def _fmt(v: float, _pos: int) -> str:
+        i = int(round(v))
+        if abs(v - i) > 1e-6 or not (0 <= i < len(times)):
+            return ""
+        t = times[i]
+        if t is None:
+            return str(ticks[i])
+        t = t.astimezone(UTC)
+        prev = next(
+            (times[j] for j in range(i - 1, -1, -1) if times[j] is not None),
+            None,
+        )
+        if multi_day and (
+            prev is None or t.date() != prev.astimezone(UTC).date()
+        ):
+            return str(t.strftime("%b %d"))
+        return str(t.strftime("%H:%M"))
+
+    return _fmt
 
 
 def _render_png(
-    rows: list[Any], ticker: str, span: int = 240, bucket: int = 1
+    rows: list[Any], ticker: str, span: int = 240, bucket: int = 1,
+    axis: str = "time",
 ) -> io.BytesIO:
     rows = list(reversed(rows))
 
@@ -166,6 +219,7 @@ def _render_png(
     volumes = [int(r[5]) for r in rows]
     halts = [r[6] for r in rows]
     sessions = [str(r[7]) for r in rows]
+    times = [r[8] for r in rows]
 
     up = [c >= o for o, c in zip(opens, closes, strict=True)]
     price_hi = max(highs)
@@ -276,18 +330,15 @@ def _render_png(
 
     axv.bar(pos, volumes, width=0.8, color=vol_colors, alpha=0.6)
     axv.set_ylim(bottom=0)
-    # Labels show the real tick_index at each ordinal position -- a skipped
-    # closed run reads as a jump in the axis, not a hole in the plot.
+    # Ordinal positions hold OPEN candles only (+ a closed tail): a skipped
+    # closed run reads as a jump in the axis labels, not a hole in the plot.
     axv.xaxis.set_major_locator(MaxNLocator(integer=True))
-
-    def _tick_label(v: float, _pos: int) -> str:
-        i = int(round(v))
-        if abs(v - i) > 1e-6 or not (0 <= i < len(ticks)):
-            return ""
-        return str(ticks[i])
-
-    axv.xaxis.set_major_formatter(FuncFormatter(_tick_label))
-    axv.set_xlabel("tick", color=_TEXT, fontsize=8)
+    axv.xaxis.set_major_formatter(
+        FuncFormatter(_axis_formatter(times, ticks, axis))
+    )
+    axv.set_xlabel(
+        "tick" if axis == "ticks" else "time (UTC)", color=_TEXT, fontsize=8
+    )
     axv.set_ylabel("volume", color=_TEXT, fontsize=8)
     axv.yaxis.set_major_formatter(
         FuncFormatter(

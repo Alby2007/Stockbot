@@ -1,21 +1,24 @@
-"""Interactive chart controls: pan / zoom / timeframe buttons.
+"""Interactive chart controls: pan / zoom / timeframe / axis buttons.
 
 Stateless by construction -- the whole window state rides inside each
-button's custom_id (`cbt:{action}:{iid}:{end}:{span}`), so a click needs
-no server-side session. Two entry paths reach `handle_chart_component`:
-the View's item callbacks while the sending process lives, and
-`StockBotClient.on_interaction` as the post-restart fallback (discord.py
-dispatches a component interaction to both; the handler's is_done()
-guard makes the second call a no-op).
+button's custom_id (`cbt:{action}:{iid}:{end}:{span}:{axis}`), so a click
+needs no server-side session. Two entry paths reach
+`handle_chart_component`: the View's item callbacks while the sending
+process lives, and `StockBotClient.on_interaction` as the post-restart
+fallback (discord.py dispatches a component interaction to both; the
+handler's is_done() guard makes the second call a no-op).
 
 Actions: panl/panr (shift the window half a span), zin/zout (halve/double
 the span), home (re-anchor to the last open tick), s<span> (timeframe
-presets: set span, re-anchor).
+presets: set span, re-anchor), ax (toggle the x-axis between real time
+and raw ticks). `axis` is "time" (UTC wall-clock labels) or "ticks";
+legacy 5-field cids parse as "time" -- an in-place upgrade.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import UTC
 from typing import Any
 
 import discord
@@ -45,16 +48,25 @@ _BUTTONS = [
 ]
 
 
-def encode_cid(action: str, iid: int, end: int, span: int) -> str:
-    return f"cbt:{action}:{iid}:{end}:{span}"
+AXES = ("time", "ticks")
 
 
-def parse_cid(custom_id: str) -> tuple[str, int, int, int] | None:
+def encode_cid(
+    action: str, iid: int, end: int, span: int, axis: str = "time"
+) -> str:
+    return f"cbt:{action}:{iid}:{end}:{span}:{axis}"
+
+
+def parse_cid(custom_id: str) -> tuple[str, int, int, int, str] | None:
     parts = custom_id.split(":")
-    if len(parts) != 5 or parts[0] != "cbt":
+    if parts[0] != "cbt" or len(parts) not in (5, 6):
+        return None
+    # Legacy 5-field ids predate the axis mode -- parse as the default.
+    axis = parts[5] if len(parts) == 6 else "time"
+    if axis not in AXES:
         return None
     try:
-        return parts[1], int(parts[2]), int(parts[3]), int(parts[4])
+        return parts[1], int(parts[2]), int(parts[3]), int(parts[4]), axis
     except ValueError:
         return None
 
@@ -159,19 +171,31 @@ class _ChartButton(discord.ui.Button[discord.ui.View]):
         await handle_chart_component(interaction)
 
 
-def build_chart_view(iid: int, end: int, span: int) -> discord.ui.View:
+def build_chart_view(
+    iid: int, end: int, span: int, axis: str = "time"
+) -> discord.ui.View:
     """Button rows encoding the current window -- every button's custom_id
-    carries (action, iid, end, span) so no state lives process-side."""
+    carries (action, iid, end, span, axis) so no state lives process-side."""
     view = discord.ui.View(timeout=None)
     for label, action, row in _BUTTONS:
         view.add_item(
             _ChartButton(
                 style=discord.ButtonStyle.secondary,
                 label=label,
-                custom_id=encode_cid(action, iid, end, span),
+                custom_id=encode_cid(action, iid, end, span, axis),
                 row=row,
             )
         )
+    # The toggle labels the mode a click switches TO, not the current one.
+    other = "ticks" if axis == "time" else "time"
+    view.add_item(
+        _ChartButton(
+            style=discord.ButtonStyle.secondary,
+            label=f"Axis: {other}",
+            custom_id=encode_cid("ax", iid, end, span, axis),
+            row=1,
+        )
+    )
     return view
 
 
@@ -208,7 +232,7 @@ async def _handle(interaction: discord.Interaction) -> None:
             "That chart is stale — run /chart for a fresh one.", ephemeral=True
         )
         return
-    action, iid, end, span = parsed
+    action, iid, end, span, axis = parsed
 
     # Payload-free type-6 ACK up front. New file attachments cannot ride
     # the type-7 edit_message interaction callback (Discord rejects it --
@@ -233,9 +257,14 @@ async def _handle(interaction: discord.Interaction) -> None:
             )
             return
         ticker, name = str(info[0]), str(info[1])
-        new_end, new_span = await next_window(conn, action, iid, end, span)
+        if action == "ax":
+            # Axis toggle: same window, flipped label mode.
+            new_end, new_span = end, span
+            axis = "ticks" if axis == "time" else "time"
+        else:
+            new_end, new_span = await next_window(conn, action, iid, end, span)
         result = await render_candle_chart(
-            conn, iid, ticker, end=new_end, span=new_span
+            conn, iid, ticker, end=new_end, span=new_span, axis=axis
         )
     if result is None:
         await interaction.followup.send(
@@ -243,18 +272,22 @@ async def _handle(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
-    buf, resolved_end = result
+    buf, resolved_end, end_ts = result
 
     filename = f"{ticker}.png"
     embed = discord.Embed(title=f"{ticker} \u2014 {name}")
     embed.set_image(url=f"attachment://{filename}")
+    if axis == "time" and end_ts is not None:
+        ending = end_ts.astimezone(UTC).strftime("%b %d %H:%M UTC")
+    else:
+        ending = str(resolved_end)
     embed.set_footer(
         text=(
-            f"{new_span} open ticks ending {resolved_end}"
+            f"{new_span} open ticks ending {ending}"
             f" · {bucket_for_span(new_span)}t/candle"
         )
     )
-    view = build_chart_view(iid, resolved_end, new_span)
+    view = build_chart_view(iid, resolved_end, new_span, axis)
     file = discord.File(buf, filename=filename)
     msg = interaction.message
     try:

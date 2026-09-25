@@ -26,7 +26,7 @@ async def test_render_returns_a_png_after_a_tick(conn: AsyncConnection) -> None:
 
     result = await render_candle_chart(conn, instrument_id, "TEST")
     assert result is not None
-    buf, _end = result
+    buf, _end, _end_ts = result
     data = buf.read()
     assert data[:8] == b"\x89PNG\r\n\x1a\n"
 
@@ -60,7 +60,7 @@ async def test_render_covers_closed_session_rows(conn: AsyncConnection) -> None:
 
     result = await render_candle_chart(conn, instrument_id, "TEST")
     assert result is not None
-    buf, _end = result
+    buf, _end, _end_ts = result
     assert buf.read()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
@@ -96,7 +96,7 @@ async def test_closed_window_anchors_to_last_open_tick(
     captured: list[list[Any]] = []
 
     def fake_render(
-        rows: list[Any], ticker: str, span: int, bucket: int
+        rows: list[Any], ticker: str, span: int, bucket: int, axis: str
     ) -> io.BytesIO:
         captured.append(rows)
         return io.BytesIO(b"png")
@@ -227,3 +227,142 @@ async def test_window_end_pins_and_clamps(conn: AsyncConnection) -> None:
     rows, _ = await charts._select_window_rows(conn, iid, None, 60)
     assert len(rows) == 60
     assert int(rows[0][0]) == 299 and int(rows[-1][0]) == 240
+
+
+async def test_window_rows_carry_tick_timestamps(conn: AsyncConnection) -> None:
+    """Each bucket labels by its newest tick's market_ticks.ts."""
+    iid = await _instrument_id(conn)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO market_ticks (tick_index, market_factor, sector_factors, ts) "
+            "SELECT g, 0, '{}'::jsonb, "
+            "'2025-01-06 14:00+00'::timestamptz + g * interval '1 minute' "
+            "FROM generate_series(0, 9) g"
+        )
+        await cur.execute(
+            "INSERT INTO candles "
+            "(instrument_id, tick_index, open, high, low, close, volume) "
+            "SELECT %s, g, 100, 101, 99, 100, 0 FROM generate_series(0, 9) g",
+            (iid,),
+        )
+
+    rows, end = await charts._select_window_rows(conn, iid, None, 10)
+    assert end == 9
+    # bucket=1: the row's ts is that tick's own market_ticks.ts.
+    newest = rows[0]
+    assert int(newest[0]) == 9
+    assert newest[8].hour == 14 and newest[8].minute == 9
+    assert int(rows[-1][0]) == 0
+    assert rows[-1][8].minute == 0
+
+
+async def test_bucketed_rows_label_by_newest_tick_ts(
+    conn: AsyncConnection,
+) -> None:
+    """Aggregated candles label by the bucket's LAST tick's ts."""
+    iid = await _instrument_id(conn)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO market_ticks (tick_index, market_factor, sector_factors, ts) "
+            "SELECT g, 0, '{}'::jsonb, "
+            "'2025-01-06 14:00+00'::timestamptz + g * interval '1 minute' "
+            "FROM generate_series(0, 299) g"
+        )
+        await cur.execute(
+            "INSERT INTO candles "
+            "(instrument_id, tick_index, open, high, low, close, volume) "
+            "SELECT %s, g, 100, 101, 99, 100, 0 FROM generate_series(0, 299) g",
+            (iid,),
+        )
+
+    rows, end = await charts._select_window_rows(conn, iid, None, 480)
+    assert end == 299 and len(rows) == 150  # 2-tick buckets
+    # Newest bucket {299,298}: labels by tick 299's ts = 14:00 + 299min.
+    ts = rows[0][8]
+    assert ts.hour * 60 + ts.minute == 14 * 60 + 299  # 18:59
+    # The bucket's ts must be >= its members' -- newest tick's own row
+    # (unbucketed query) carries the identical ts.
+    solo, _ = await charts._select_window_rows(conn, iid, 299, 1)
+    assert solo[0][8] == ts
+
+
+async def test_render_returns_end_ts(conn: AsyncConnection) -> None:
+    iid = await _instrument_id(conn)
+    await _seed_synthetic_candles(conn, iid, 30)
+    result = await render_candle_chart(conn, iid, "TEST", span=10)
+    assert result is not None
+    _buf, end, end_ts = result
+    assert end == 29
+    assert end_ts is not None  # newest candle's tick timestamp
+
+
+async def test_render_axis_ticks_still_works(conn: AsyncConnection) -> None:
+    iid = await _instrument_id(conn)
+    await _seed_synthetic_candles(conn, iid, 30)
+    result = await render_candle_chart(
+        conn, iid, "TEST", span=10, axis="ticks"
+    )
+    assert result is not None
+    buf, _end, _ts = result
+    assert buf.read()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_axis_formatter_time_labels() -> None:
+    from datetime import UTC, datetime
+
+    fmt = charts._axis_formatter(
+        [datetime(2025, 1, 6, 14, 30, tzinfo=UTC)],
+        [1234],
+        "time",
+    )
+    assert fmt(0, 0) == "14:30"
+    assert fmt(0.5, 0) == ""  # non-integer positions unlabeled
+    assert fmt(5, 0) == ""  # out of range
+
+
+def test_axis_formatter_marks_day_boundaries() -> None:
+    """A multi-day window labels each new UTC day with the date -- a
+    compressed overnight reads 16:00 -> 'Jan 07' rather than 16:00->09:30."""
+    from datetime import UTC, datetime
+
+    times = [
+        datetime(2025, 1, 6, 15, 0, tzinfo=UTC),
+        datetime(2025, 1, 6, 16, 0, tzinfo=UTC),
+        datetime(2025, 1, 7, 9, 30, tzinfo=UTC),
+    ]
+    fmt = charts._axis_formatter(times, [10, 11, 12], "time")
+    assert fmt(0, 0) == "Jan 06"  # first candle of a multi-day window
+    assert fmt(1, 0) == "16:00"
+    assert fmt(2, 0) == "Jan 07"  # day boundary gets the date
+
+
+def test_axis_formatter_single_day_window() -> None:
+    """Intraday windows stay HH:MM -- a date label would be noise."""
+    from datetime import UTC, datetime
+
+    times = [
+        datetime(2025, 1, 6, 14, 0, tzinfo=UTC),
+        datetime(2025, 1, 6, 14, 1, tzinfo=UTC),
+    ]
+    fmt = charts._axis_formatter(times, [10, 11], "time")
+    assert fmt(0, 0) == "14:00"
+    assert fmt(1, 0) == "14:01"
+
+
+def test_axis_formatter_falls_back_to_tick() -> None:
+    """Candles without a market_ticks row (synthetic data) show the tick."""
+    from datetime import UTC, datetime
+
+    fmt = charts._axis_formatter(
+        [datetime(2025, 1, 6, 14, 0, tzinfo=UTC), None],
+        [10, 11],
+        "time",
+    )
+    assert fmt(0, 0) == "14:00"
+    assert fmt(1, 0) == "11"
+
+
+def test_axis_formatter_ticks_mode() -> None:
+    fmt = charts._axis_formatter([None, None], [4323, 4324], "ticks")
+    assert fmt(0, 0) == "4323"
+    assert fmt(1, 0) == "4324"

@@ -47,8 +47,17 @@ async def _instrument_id(conn: AsyncConnection) -> int:
 
 def test_cid_roundtrip() -> None:
     cid = encode_cid("panl", 21, 1528, 240)
-    assert parse_cid(cid) == ("panl", 21, 1528, 240)
+    assert parse_cid(cid) == ("panl", 21, 1528, 240, "time")
     assert len(cid) < 100  # Discord's custom_id cap
+
+    cid2 = encode_cid("zin", 7, 300, 120, "ticks")
+    assert parse_cid(cid2) == ("zin", 7, 300, 120, "ticks")
+
+
+def test_parse_cid_legacy_defaults_to_time() -> None:
+    """Buttons on pre-axis charts carry 5-field cids; they parse as the
+    default axis so old messages keep working after the upgrade."""
+    assert parse_cid("cbt:panr:5:640:240") == ("panr", 5, 640, 240, "time")
 
 
 @pytest.mark.parametrize(
@@ -57,7 +66,9 @@ def test_cid_roundtrip() -> None:
         "bogus",
         "other:panl:1:2:3",
         "cbt:panl:1:2",  # missing a field
-        "cbt:panl:1:2:3:4",  # extra field
+        "cbt:panl:1:2:3:4",  # unknown axis value
+        "cbt:panl:1:2:3:bogus",
+        "cbt:panl:1:2:3:time:extra",  # too many fields
         "cbt:panl:x:2:3",
         "cbt:panl:1:2:x",
         "",
@@ -107,9 +118,9 @@ async def test_next_window_unknown_action_is_noop(conn: AsyncConnection) -> None
 def test_build_chart_view_encodes_window() -> None:
     view = build_chart_view(21, 1528, 240)
     buttons = [c for c in view.children if isinstance(c, discord.ui.Button)]
-    assert len(buttons) == 9
+    assert len(buttons) == 10
     parsed = [parse_cid(str(b.custom_id)) for b in buttons]
-    assert all(p is not None and p[1:] == (21, 1528, 240) for p in parsed)
+    assert all(p is not None and p[1:] == (21, 1528, 240, "time") for p in parsed)
     assert {p[0] for p in parsed if p} == {
         "panl",
         "panr",
@@ -120,7 +131,26 @@ def test_build_chart_view_encodes_window() -> None:
         "s240",
         "s960",
         "s4800",
+        "ax",
     }
+
+
+def test_build_chart_view_axis_state() -> None:
+    """The axis rides every button's cid, and the toggle button labels
+    the mode a click switches TO."""
+    view = build_chart_view(21, 1528, 240, axis="ticks")
+    buttons = {str(b.custom_id).split(":")[1]: b for b in view.children}
+    assert parse_cid(str(buttons["panl"].custom_id)) == (
+        "panl", 21, 1528, 240, "ticks"
+    )
+    ax = buttons["ax"]
+    # cid still encodes the CURRENT axis; the label advertises the target.
+    assert parse_cid(str(ax.custom_id)) == ("ax", 21, 1528, 240, "ticks")
+    assert ax.label == "Axis: time"
+
+    view_time = build_chart_view(21, 1528, 240, axis="time")
+    ax_t = {str(b.custom_id).split(":")[1]: b for b in view_time.children}["ax"]
+    assert ax_t.label == "Axis: ticks"
 
 
 class _FakeResponse:

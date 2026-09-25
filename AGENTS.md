@@ -143,8 +143,14 @@ orders for weeks before this was noticed).
 
 Chart UI notes: `/chart` attaches a stateless `discord.ui.View`
 (`bot/chart_view.py`) -- every button's custom_id encodes
-`cbt:{action}:{iid}:{end}:{span}` so clicks need no server-side session
-and survive nothing except the message itself. Two paths reach
+`cbt:{action}:{iid}:{end}:{span}:{axis}` so clicks need no server-side
+session and survive nothing except the message itself. `axis` is `time`
+(default; UTC wall-clock labels from `market_ticks.ts`, bucketed candles
+label by the bucket's last tick, day boundaries get a `Mon DD` label so a
+compressed close reads as an overnight gap) or `ticks` (raw tick_index);
+legacy 5-field cids parse as `time` so old chart messages keep working.
+The `ax` action toggles the axis in place; `/chart` also takes an `axis`
+choice. Two paths reach
 `handle_chart_component`: the live View's item callback and
 `StockBotClient.on_interaction` (discord.py fires BOTH for one click on
 the SAME Interaction object -- the `_INFLIGHT` id set claims the first

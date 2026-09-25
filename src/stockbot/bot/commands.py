@@ -383,6 +383,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     @app_commands.describe(
         ticker="Instrument ticker, e.g. NORT",
         timeframe="Window to show (default 4h; the buttons pan/zoom after)",
+        axis="X-axis labels (default real time; toggleable on the chart)",
     )
     @app_commands.choices(
         timeframe=[
@@ -390,17 +391,24 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             app_commands.Choice(name="4 hours", value="4h"),
             app_commands.Choice(name="1 day", value="1d"),
             app_commands.Choice(name="1 week", value="1w"),
-        ]
+        ],
+        axis=[
+            app_commands.Choice(name="Time (UTC)", value="time"),
+            app_commands.Choice(name="Ticks", value="ticks"),
+        ],
     )
     async def chart(
         interaction: discord.Interaction,
         ticker: str,
         timeframe: str = "4h",
+        axis: str = "time",
     ) -> None:
         # Defer up front: the render is slow enough to risk blowing the 3s
         # response window on a cold pool.
         await interaction.response.defer()
         span = TIMEFRAME_SPANS.get(timeframe, 240)
+        if axis not in ("time", "ticks"):
+            axis = "time"
         async with db.connection() as conn:
             snapshot = await get_instrument_snapshot(conn, ticker)
             if snapshot is None:
@@ -409,25 +417,29 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 )
                 return
             result = await render_candle_chart(
-                conn, snapshot.id, snapshot.ticker, span=span
+                conn, snapshot.id, snapshot.ticker, span=span, axis=axis
             )
 
         if result is None:
             await interaction.followup.send("No price history yet.", ephemeral=True)
             return
-        buf, end = result
+        buf, end, end_ts = result
 
         filename = f"{snapshot.ticker}.png"
         file = discord.File(buf, filename=filename)
         embed = discord.Embed(title=f"{snapshot.ticker} \u2014 {snapshot.name}")
         embed.set_image(url=f"attachment://{filename}")
+        if axis == "time" and end_ts is not None:
+            ending = end_ts.astimezone(UTC).strftime("%b %d %H:%M UTC")
+        else:
+            ending = str(end)
         embed.set_footer(
-            text=f"{span} open ticks ending {end} · pan/zoom buttons below"
+            text=f"{span} open ticks ending {ending} · pan/zoom buttons below"
         )
         await interaction.followup.send(
             embed=embed,
             file=file,
-            view=build_chart_view(snapshot.id, end, span),
+            view=build_chart_view(snapshot.id, end, span, axis),
         )
 
     @tree.command(name="movers", description="Show today's biggest gainers and losers")
