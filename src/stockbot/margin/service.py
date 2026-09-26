@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 from typing import Any
 
 from psycopg import AsyncConnection
@@ -281,6 +281,7 @@ async def _liquidate_leg(
     maint_before: int,
     tick_index: int | None,
     penalty_bps: Decimal,
+    kind: str = "LIQUIDATION",
 ) -> None:
     """Force-close `close_qty` of one position at the impact-adjusted price.
 
@@ -288,6 +289,11 @@ async def _liquidate_leg(
     fund, then implicitly by MARKET_MAKER (recorded as an ADL flow). For longs
     (SELL leg) MARKET_MAKER pays out proceeds. The penalty is taken from the
     account's cash when it can cover it.
+
+    `kind="RECALL"` reuses the same settlement for a borrow recall: caller
+    passes penalty_bps=0 and cash-caps close_qty (so the fund/ADL backstop
+    is unreachable), the cover posts as RECALL_COVER, no `liquidations` row
+    is written, and the user gets SHORT_RECALL instead of LIQUIDATION.
     """
     # Lazy: trading.service imports this module, so a top-level import here
     # would be circular.
@@ -361,7 +367,7 @@ async def _liquidate_leg(
                     from_account_id=account_id,
                     to_account_id=mm_id,
                     amount=user_pays,
-                    reason="LIQ_COVER",
+                    reason="LIQ_COVER" if kind == "LIQUIDATION" else "RECALL_COVER",
                     memo=str(position["ticker"]),
                 )
             if shortfall > 0:
@@ -474,60 +480,61 @@ async def _liquidate_leg(
             ),
         )
 
-        await cur.execute(
-            """
-            INSERT INTO liquidations (
-                user_id, season_id, account_id, instrument_id, side,
-                quantity_closed, fill_price, notional_minor, penalty_minor,
-                equity_before_minor, maint_req_before_minor, tick_index
+        if kind == "LIQUIDATION":
+            await cur.execute(
+                """
+                INSERT INTO liquidations (
+                    user_id, season_id, account_id, instrument_id, side,
+                    quantity_closed, fill_price, notional_minor, penalty_minor,
+                    equity_before_minor, maint_req_before_minor, tick_index
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    user_id,
+                    season_id,
+                    account_id,
+                    instrument_id,
+                    "BUY" if qty < 0 else "SELL",
+                    close_qty,
+                    fill,
+                    notional_minor,
+                    paid_penalty,
+                    equity_before,
+                    maint_before,
+                    tick_index,
+                ),
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-            """,
-            (
-                user_id,
-                season_id,
-                account_id,
-                instrument_id,
-                "BUY" if qty < 0 else "SELL",
-                close_qty,
-                fill,
-                notional_minor,
-                paid_penalty,
-                equity_before,
-                maint_before,
-                tick_index,
-            ),
-        )
-        row = await cur.fetchone()
-        assert row is not None
-        liquidation_id = int(row[0])
+            row = await cur.fetchone()
+            assert row is not None
+            liquidation_id = int(row[0])
 
-        # Outbox: written in the same transaction as the liquidations row
+        # Outbox: written in the same transaction as the liquidation/recall
         # above, so a rollback can never leave a notification for an
         # event that didn't happen. The poller coalesces per tick_index
         # -- a multi-leg liquidation sends one DM, not N.
+        payload: dict[str, Any] = {
+            "tick_index": tick_index,
+            "ticker": position["ticker"],
+            "side": "BUY" if qty < 0 else "SELL",
+            "qty": close_qty,
+            "fill": float(fill),
+        }
+        if kind == "LIQUIDATION":
+            payload["penalty"] = paid_penalty
+            payload["equity_before"] = equity_before
         await cur.execute(
             """
             INSERT INTO notifications (user_id, kind, payload)
-            VALUES (%s, 'LIQUIDATION', %s)
+            VALUES (%s, %s, %s)
             """,
-            (
-                user_id,
-                json.dumps(
-                    {
-                        "tick_index": tick_index,
-                        "ticker": position["ticker"],
-                        "side": "BUY" if qty < 0 else "SELL",
-                        "qty": close_qty,
-                        "fill": float(fill),
-                        "penalty": paid_penalty,
-                        "equity_before": equity_before,
-                    }
-                ),
-            ),
+            (user_id, "LIQUIDATION" if kind == "LIQUIDATION" else "SHORT_RECALL",
+             json.dumps(payload)),
         )
 
+    if kind != "LIQUIDATION":
+        return
     if paid_penalty > 0:
         await _record_fund_flow(
             conn, paid_penalty, "LIQUIDATION_PENALTY", liquidation_id, tick_index
@@ -793,13 +800,21 @@ async def check_and_liquidate(
             return 0
         account_id = int(row[0])
         tick = await _current_tick(conn)
-        return await _liquidate_account(
+        legs = await _liquidate_account(
             conn,
             user_id=user_id,
             season_id=season_id,
             account_id=account_id,
             tick_index=tick,
         )
+        await _warn_margin_risk(
+            conn,
+            user_id=user_id,
+            season_id=season_id,
+            account_id=account_id,
+            tick_index=tick,
+        )
+        return legs
 
 
 async def sweep_undermargined(conn: AsyncConnection, tick_index: int) -> int:
@@ -822,13 +837,200 @@ async def sweep_undermargined(conn: AsyncConnection, tick_index: int) -> int:
 
     legs = 0
     for user_id, season_id, account_id in candidates:
+        uid = int(user_id)
+        sid = int(season_id) if season_id is not None else None
         legs += await _liquidate_account(
             conn,
-            user_id=int(user_id),
-            season_id=int(season_id) if season_id is not None else None,
+            user_id=uid,
+            season_id=sid,
             account_id=int(account_id),
             tick_index=tick_index,
         )
+        await _warn_margin_risk(
+            conn,
+            user_id=uid,
+            season_id=sid,
+            account_id=int(account_id),
+            tick_index=tick_index,
+        )
+    return legs
+
+
+async def _warn_margin_risk(
+    conn: AsyncConnection,
+    *,
+    user_id: int,
+    season_id: int | None,
+    account_id: int,
+    tick_index: int | None,
+) -> None:
+    """One MARGIN_CALL DM per approach-episode. `accounts.margin_warned`
+    latches on warn and clears on recovery, so hovering across the
+    threshold doesn't DM every tick. Warns only in the approaching band
+    -- an undermargined account gets liquidation DMs, not warnings."""
+    cfg = await margin_config(conn)
+    warn_ratio = cfg["margin.warn_ratio"]
+    if warn_ratio <= 0:
+        return
+    health = await compute_health(conn, user_id, season_id)
+    risky = (
+        health.margined
+        and not health.undermargined
+        and Decimal(health.equity_minor)
+        < warn_ratio * Decimal(health.maint_req_minor)
+    )
+    async with conn.cursor() as cur:
+        if risky:
+            # UPDATE-first: rowcount is the atomic claim on the episode.
+            await cur.execute(
+                "UPDATE accounts SET margin_warned = TRUE "
+                "WHERE id = %s AND NOT margin_warned",
+                (account_id,),
+            )
+            if cur.rowcount == 0:
+                return
+            await cur.execute(
+                """
+                INSERT INTO notifications (user_id, kind, payload)
+                VALUES (%s, 'MARGIN_CALL', %s)
+                """,
+                (
+                    user_id,
+                    json.dumps(
+                        {
+                            "tick_index": tick_index,
+                            "equity": health.equity_minor,
+                            "maint": health.maint_req_minor,
+                            "warn_ratio": float(warn_ratio),
+                        }
+                    ),
+                ),
+            )
+        else:
+            await cur.execute(
+                "UPDATE accounts SET margin_warned = FALSE "
+                "WHERE id = %s AND margin_warned",
+                (account_id,),
+            )
+
+
+def effective_borrow_bps_per_tick(
+    si_pct: Decimal, cfg: dict[str, Decimal]
+) -> Decimal:
+    """Current borrow rate for an instrument at short interest `si_pct`
+    (a fraction of float). Mirrors the SQL in `accrue_borrow_fees` --
+    keep the two formulas in sync: bps * (1 + k*(SI/max_SI)^2)."""
+    max_si = max(cfg["margin.max_short_interest_pct"], Decimal("0.0001"))
+    util = si_pct / max_si
+    return cfg["margin.borrow_fee_bps_per_tick"] * (
+        1 + cfg["margin.borrow_util_k"] * util * util
+    )
+
+
+async def sweep_recalls(
+    conn: AsyncConnection, tick_index: int
+) -> int:
+    """Borrow recalls on crowded shorts: when an instrument's short
+    interest exceeds margin.recall_si_pct, every open short covers a
+    pro-rata share of (SI - threshold) * margin.recall_fraction_per_tick
+    shares. Recall legs are cash-capped (an account covers only what it
+    can pay for) so the insurance-fund/ADL backstop in _liquidate_leg is
+    unreachable; a cashless account keeps its short until the real
+    liquidation sweep prices it. Bounded shorts are collateralized
+    derivatives, not borrows -- never recalled. Returns recall legs run."""
+    from stockbot.trading.service import FEE_BPS  # lazy: circular at top level
+
+    cfg = await margin_config(conn)
+    threshold = cfg["margin.recall_si_pct"]
+    frac = cfg["margin.recall_fraction_per_tick"]
+    if threshold <= 0 or frac <= 0:
+        return 0
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT id, short_interest_pct
+            FROM instruments
+            WHERE is_active AND short_interest_pct > %s
+            """,
+            (threshold,),
+        )
+        crowded = await cur.fetchall()
+
+    legs = 0
+    for inst in crowded:
+        si_pct = Decimal(inst["short_interest_pct"])
+        if si_pct <= 0:
+            continue
+        # Each short recalls this fraction of its size: the excess SI
+        # share, times the per-tick recall pace.
+        recall_frac = float((si_pct - threshold) / si_pct) * float(frac)
+
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT p.id, p.user_id, p.season_id, p.instrument_id,
+                       p.quantity, p.borrow_fees_accrued, p.dividends_accrued,
+                       i.ticker, i.base_price, i.impact, i.liquidity, i.adv,
+                       i.lambda_impact, i.max_impact, i.quoted_price,
+                       i.maint_margin_pct, i.vol_state, i.flow_skew,
+                       COALESCE(i.sigma_eff, i.sigma) AS sigma,
+                       i.next_event_tick, i.last_halt_end_tick,
+                       a.id AS account_id
+                FROM positions p
+                JOIN instruments i ON i.id = p.instrument_id
+                JOIN accounts a
+                  ON a.user_id = p.user_id
+                 AND a.season_id IS NOT DISTINCT FROM p.season_id
+                WHERE p.instrument_id = %s AND p.quantity < 0
+                ORDER BY p.id
+                FOR UPDATE OF p
+                """,
+                (int(inst["id"]),),
+            )
+            shorts = await cur.fetchall()
+
+        for pos in shorts:
+            qty = -int(pos["quantity"])
+            recall_qty = math.ceil(qty * recall_frac)
+            # Cash cap with a pessimistic per-share bound (mark at the
+            # impact ceiling plus fee): the balance CHECK must never be
+            # the thing that stops a recall leg.
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT balance FROM accounts WHERE id = %s",
+                    (int(pos["account_id"]),),
+                )
+                bal_row = await cur.fetchone()
+            cash = int(bal_row[0]) if bal_row else 0
+            per_share_ub = int(
+                (
+                    Decimal(pos["quoted_price"])
+                    * (1 + Decimal(pos["max_impact"]))
+                    * (1 + FEE_BPS / Decimal(10_000))
+                    * 100
+                ).to_integral_value(rounding=ROUND_CEILING)
+            )
+            affordable = cash // per_share_ub if per_share_ub > 0 else 0
+            close_qty = int(min(recall_qty, affordable, qty))
+            if close_qty <= 0:
+                continue
+            await _liquidate_leg(
+                conn,
+                user_id=int(pos["user_id"]),
+                season_id=(
+                    int(pos["season_id"]) if pos["season_id"] is not None else None
+                ),
+                account_id=int(pos["account_id"]),
+                position=pos,
+                close_qty=close_qty,
+                equity_before=0,
+                maint_before=0,
+                tick_index=tick_index,
+                penalty_bps=Decimal(0),
+                kind="RECALL",
+            )
+            legs += 1
     return legs
 
 

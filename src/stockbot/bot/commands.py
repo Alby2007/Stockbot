@@ -81,7 +81,9 @@ from stockbot.margin.errors import MarginError
 from stockbot.margin.service import (
     check_and_liquidate,
     compute_health,
+    effective_borrow_bps_per_tick,
     list_liquidations,
+    margin_config,
     margin_tier,
 )
 from stockbot.market.data import (
@@ -508,6 +510,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 if snapshot is not None
                 else None
             )
+            mcfg = await margin_config(conn)
+            tick_now = await current_tick_index(conn)
         if snapshot is None:
             await interaction.response.send_message(
                 f"No instrument found for `{ticker.upper()}`.", ephemeral=True
@@ -568,9 +572,38 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 value=f"~{format_money(quote10.notional_minor + quote10.fee_minor)} all-in",
             )
         embed.add_field(name="24h volume", value=f"{snapshot.day_volume:,} shares")
+        si_pct = float(snapshot.short_interest_pct)
+        si_shares = si_pct * snapshot.float_shares
+        si_line1 = f"{si_pct * 100:.1f}% of float"
+        if float(snapshot.adv) > 0:
+            si_line1 += f" · {si_shares / float(snapshot.adv):.1f}d to cover"
+        borrow_pct_day = (
+            float(effective_borrow_bps_per_tick(snapshot.short_interest_pct, mcfg))
+            * TICKS_PER_DAY
+            / 100
+        )
+        si_line2 = f"borrow ~{borrow_pct_day:.2f}%/day"
+        if (
+            snapshot.shortable_after_tick is not None
+            and (tick_now or 0) < snapshot.shortable_after_tick
+        ):
+            si_line2 += (
+                f" · no borrow until ~tick {snapshot.shortable_after_tick}"
+            )
+        else:
+            capacity = max(
+                0.0,
+                float(mcfg["margin.max_short_interest_pct"])
+                * snapshot.float_shares
+                - si_shares,
+            )
+            si_line2 += (
+                f" · {capacity:,.0f} sh capacity"
+                if capacity > 0
+                else " · borrow closed (at cap)"
+            )
         embed.add_field(
-            name="Short interest",
-            value=f"{float(snapshot.short_interest_pct) * 100:.1f}% of float",
+            name="Short interest", value=si_line1 + "\n" + si_line2
         )
         if snapshot.is_halted:
             embed.add_field(name="Status", value="Halted (circuit breaker)")
@@ -1208,6 +1241,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ticker="Instrument ticker",
         quantity="Number of shares to short",
         dollars="Short ~this many dollars of notional instead of a share count",
+        knockout="Knockout % above entry — tighter is cheaper, wider is safer "
+        "(default: instrument's own)",
         league="Use your season league stake instead of your main portfolio",
     )
     @app_commands.autocomplete(ticker=ticker_autocomplete)
@@ -1216,6 +1251,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ticker: str,
         quantity: app_commands.Range[int, 1, 1_000_000_000] | None = None,
         dollars: app_commands.Range[float, 0.01, 1_000_000_000.0] | None = None,
+        knockout: float | None = None,
         league: bool = False,
     ) -> None:
         async with db.connection() as conn:
@@ -1261,6 +1297,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     quantity=quantity,
                     interaction_id=str(interaction.id),
                     season_id=season_id,
+                    knockout_pct=(
+                        Decimal(str(knockout)) / 100
+                        if knockout is not None
+                        else None
+                    ),
                 )
             except InsufficientFundsError:
                 bal = await get_balance(conn, account_id)

@@ -40,6 +40,19 @@ class ShortInterestLimitError(MarginError):
         super().__init__(f"short interest limit reached for {ticker}")
 
 
+class InstrumentNotShortableError(MarginError):
+    """New margin shorts are barred until shortable_after_tick (IPO borrow
+    lockout -- a fresh listing has no borrow to lend against)."""
+
+    def __init__(self, ticker: str, until_tick: int) -> None:
+        self.ticker = ticker
+        self.until_tick = until_tick
+        super().__init__(
+            f"{ticker} can't be shorted until ~tick {until_tick} "
+            "(fresh listing — no borrow yet)"
+        )
+
+
 class PositionLimitError(MarginError):
     """Gross notional would exceed the tier's leverage cap."""
 

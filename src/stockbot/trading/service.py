@@ -31,6 +31,7 @@ from stockbot.ledger.service import (
 )
 from stockbot.margin import service as margin
 from stockbot.margin.errors import (
+    InstrumentNotShortableError,
     InsufficientMarginError,
     MarginNotUnlockedError,
     PositionLimitError,
@@ -619,6 +620,18 @@ async def _apply_fill(
         if short_grew:
             if tier < 1:
                 raise MarginNotUnlockedError(user_id)
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT shortable_after_tick FROM instruments WHERE id = %s",
+                    (instrument_id,),
+                )
+                shortable_row = await cur.fetchone()
+            if (
+                shortable_row is not None
+                and shortable_row[0] is not None
+                and (current_tick or 0) < int(shortable_row[0])
+            ):
+                raise InstrumentNotShortableError(ticker, int(shortable_row[0]))
             si_shares, float_shares = await margin._instrument_short_interest(
                 conn, instrument_id
             )

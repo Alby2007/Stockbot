@@ -626,13 +626,14 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
 
         # Phase 2 margin maintenance, all inside the tick transaction where
         # every instrument is already locked: refresh published short
-        # interest, accrue borrow fees on shorts, then liquidate any account
-        # that fell below maintenance margin at the new marks. Note the SI
-        # refresh runs AFTER match_orders -- order fills this tick see last
-        # tick's short_interest_pct (one-tick lag on the squeeze boost,
-        # benign).
+        # interest, accrue borrow fees on shorts, recall borrow on crowded
+        # names, then liquidate any account that fell below maintenance
+        # margin at the new marks. Note the SI refresh runs AFTER
+        # match_orders -- order fills this tick see last tick's
+        # short_interest_pct (one-tick lag on the squeeze boost, benign).
         await margin.refresh_short_interest(conn)
         await margin.accrue_borrow_fees(conn)
+        recalls = await margin.sweep_recalls(conn, tick_index)
         liqs = await margin.sweep_undermargined(conn, tick_index)
 
         # H4: trailing ADV refresh -- a sliding-window SMA of per-tick
@@ -694,7 +695,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
 
     log.info(
         "tick=%d phase=OPEN steps=%d events=%d crosses=%d mm_fills=%d "
-        "stops=%d kos=%d liqs=%d auction=%d ms=%.1f",
+        "stops=%d kos=%d recalls=%d liqs=%d auction=%d ms=%.1f",
         tick_index,
         len(results),
         stats.get("events_resolved", 0),
@@ -702,6 +703,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         stats.get("mm_fills", 0),
         stats.get("stops_triggered", 0),
         kos,
+        recalls,
         liqs,
         stats.get("auction_fills", 0),
         duration_ms,

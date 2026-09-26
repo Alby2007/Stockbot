@@ -163,6 +163,20 @@ async def _current_tick(conn: AsyncConnection) -> int | None:
     return int(row[0]) if row and row[0] is not None else None
 
 
+async def _knockout_bounds(conn: AsyncConnection) -> tuple[Decimal, Decimal]:
+    """User-selectable knockout band (shorts.min/max_knockout_pct config)."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT key, value FROM config "
+            "WHERE key IN ('shorts.min_knockout_pct', 'shorts.max_knockout_pct')"
+        )
+        rows: dict[str, str] = dict(await cur.fetchall())
+    return (
+        Decimal(rows.get("shorts.min_knockout_pct", "0.02")),
+        Decimal(rows.get("shorts.max_knockout_pct", "0.9999")),
+    )
+
+
 async def open_bounded_short(
     conn: AsyncConnection,
     *,
@@ -171,9 +185,13 @@ async def open_bounded_short(
     quantity: int,
     interaction_id: str | None = None,
     season_id: int | None = None,
+    knockout_pct: Decimal | None = None,
 ) -> ShortResult:
     """Open a bounded short. Lock ordering: instrument, then accounts
     (via post_transfer's ascending-id locks).
+
+    `knockout_pct` overrides the instrument's default: tighter = less
+    collateral but a nearer knockout; wider = more skin for more room.
     """
     if quantity <= 0:
         raise ValueError("quantity must be positive")
@@ -219,7 +237,15 @@ async def open_bounded_short(
         await _assert_depth(
             conn, ticker, fill_price, quantity, liq_eff
         )
-        knockout_pct = Decimal(str(instrument["short_knockout_pct"]))
+        if knockout_pct is None:
+            knockout_pct = Decimal(str(instrument["short_knockout_pct"]))
+        else:
+            lo, hi = await _knockout_bounds(conn)
+            if not lo <= knockout_pct <= hi:
+                raise ValueError(
+                    f"knockout must be within {lo * 100:g}%–{hi * 100:g}% "
+                    f"of entry (got {knockout_pct * 100:g}%)"
+                )
         knockout_price = (fill_price * (1 + knockout_pct)).quantize(
             Decimal("0.000001"), rounding=ROUND_HALF_UP
         )

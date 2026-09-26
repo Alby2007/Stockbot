@@ -35,7 +35,10 @@ from stockbot.ledger.service import (
     post_transfer,
     record_idempotency_key,
 )
-from stockbot.margin.errors import MarginError
+from stockbot.margin.errors import (
+    InstrumentNotShortableError,
+    MarginError,
+)
 from stockbot.market import engine
 from stockbot.market.data import (
     assert_feature_enabled,
@@ -210,8 +213,8 @@ async def place_order(
         if trail_amount is not None:
             await _require_entitlement(conn, user_id, "order_trailing")
         await cur.execute(
-            "SELECT id, is_active, quoted_price, next_halting_event_tick "
-            "FROM instruments WHERE ticker = %s",
+            "SELECT id, is_active, quoted_price, next_halting_event_tick, "
+            "shortable_after_tick FROM instruments WHERE ticker = %s",
             (ticker,),
         )
         row = await cur.fetchone()
@@ -268,6 +271,16 @@ async def place_order(
             next_halt_tick, tick, await event_halt_lead_ticks(conn)
         ):
             raise EventHaltedError(ticker, int(next_halt_tick))
+        # Fail-fast borrow lockout (IPO listings): the fill-time gate in
+        # _apply_fill is authoritative, but letting a SELL+short order rest
+        # through the lockout would just churn fill_failures.
+        if (
+            side == "SELL"
+            and allow_short
+            and row[4] is not None
+            and (tick or 0) < int(row[4])
+        ):
+            raise InstrumentNotShortableError(ticker, int(row[4]))
         expires_tick = (
             None if expires_in_ticks is None else (tick or 0) + expires_in_ticks
         )

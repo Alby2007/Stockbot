@@ -4,6 +4,8 @@ one message per (user, kind, tick), and hand each off to an injectable
 
 Insert sites (all inside the event's own transaction):
     margin/service.py     _liquidate_leg   -> LIQUIDATION
+    margin/service.py     _liquidate_leg   -> SHORT_RECALL (kind="RECALL")
+    margin/service.py     _warn_margin_risk -> MARGIN_CALL
     shorts/service.py     sweep_knockouts  -> KNOCKOUT
     orders/service.py     fill sites       -> ORDER_FILLED
     seasons/service.py    close_season     -> SEASON_RESULT
@@ -77,6 +79,27 @@ def _fmt_liquidation(items: list[dict[str, Any]]) -> str:
     )
 
 
+def _fmt_margin_call(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    ratio = int(p["equity"]) / int(p["maint"]) if int(p["maint"]) else 0.0
+    return (
+        f"Margin warning: equity {format_money(p['equity'])} vs maintenance "
+        f"{format_money(p['maint'])} (x{ratio:.2f}) — liquidation below "
+        "x1.00. Cover shorts or add cash."
+    )
+
+
+def _fmt_short_recall(items: list[dict[str, Any]]) -> str:
+    parts = [
+        f"{p['qty']:,} {p['ticker']} @ {format_price(p['fill'])}" for p in items
+    ]
+    return (
+        "Borrow recall — crowded short forced-covered: "
+        + ", ".join(parts)
+        + "."
+    )
+
+
 def _fmt_knockout(items: list[dict[str, Any]]) -> str:
     parts = [
         f"{p['ticker']} {p['qty']:,} @ entry {format_price(p['entry'])} "
@@ -145,6 +168,8 @@ def _fmt_ipo_settled(items: list[dict[str, Any]]) -> str:
 
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "LIQUIDATION": _fmt_liquidation,
+    "MARGIN_CALL": _fmt_margin_call,
+    "SHORT_RECALL": _fmt_short_recall,
     "KNOCKOUT": _fmt_knockout,
     "ORDER_FILLED": _fmt_order_filled,
     "SEASON_RESULT": _fmt_season_result,

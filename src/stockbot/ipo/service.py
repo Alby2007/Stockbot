@@ -88,8 +88,20 @@ async def create_offering(
         open_tick = await _current_tick(conn)
         async with conn.cursor() as cur:
             await cur.execute(
-                "UPDATE instruments SET is_active = FALSE WHERE id = %s",
-                (instrument_id,),
+                "SELECT value FROM config WHERE key = 'ipo.short_lockout_ticks'"
+            )
+            cfg_row = await cur.fetchone()
+            lockout = int(cfg_row[0]) if cfg_row else 480
+            await cur.execute(
+                """
+                UPDATE instruments
+                SET is_active = FALSE,
+                    shortable_after_tick = %s
+                WHERE id = %s
+                """,
+                # Borrow lockout: a fresh listing has no borrow inventory,
+                # so margin shorts stay barred for a while after it trades.
+                (open_tick + duration_ticks + lockout, instrument_id),
             )
             await cur.execute(
                 """

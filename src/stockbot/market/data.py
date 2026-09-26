@@ -34,6 +34,9 @@ class InstrumentSnapshot:
     bid: Decimal | None = None
     ask: Decimal | None = None
     event_halted: bool = False  # T1 halt into a pending earnings print
+    adv: Decimal = Decimal(0)
+    float_shares: int = 0
+    shortable_after_tick: int | None = None  # borrow lockout (IPO listings)
 
     @property
     def day_change_pct(self) -> float | None:
@@ -76,7 +79,8 @@ async def _fetch_snapshots(
                    COALESCE(v.volume, 0),
                    COALESCE(i.sigma_eff, i.sigma) AS sigma, i.liquidity,
                    i.next_event_tick, i.last_halt_end_tick, i.flow_skew,
-                   i.next_halting_event_tick
+                   i.next_halting_event_tick,
+                   i.adv, i.float_shares, i.shortable_after_tick
             FROM instruments i
             JOIN sectors s ON s.id = i.sector_id
             LEFT JOIN LATERAL (
@@ -130,6 +134,9 @@ async def _fetch_snapshots(
                 bid=Decimal(str(round(bid_f, 6))),
                 ask=Decimal(str(round(ask_f, 6))),
                 event_halted=event_halted(r[16], current_tick, halt_lead),
+                adv=r[17],
+                float_shares=int(r[18]),
+                shortable_after_tick=r[19],
             )
         )
     return snapshots

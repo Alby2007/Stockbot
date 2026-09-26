@@ -1009,3 +1009,35 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   excess, upserts positions at offer avg_cost, and activates the listing.
   Zero subscriptions -> CANCELLED, instrument stays dormant. `/ipo list`
   + `/ipo subscribe` user-side; `/admin ipo-create`.
+- **Short-side mechanics** (0043): `accounts.margin_warned` latches when a
+  margined account's equity drops below `margin.warn_ratio` x maint_req --
+  `_warn_margin_risk` runs per candidate in `sweep_undermargined` (and at
+  the tail of `check_and_liquidate`), fires one MARGIN_CALL DM per
+  episode (UPDATE-first rowcount = atomic claim), clears on recovery, and
+  only warns in the approaching band (undermargined accounts get
+  LIQUIDATION, not warnings). `margin.sweep_recalls` sits between
+  `accrue_borrow_fees` and `sweep_undermargined` in apply_tick: when
+  `i.short_interest_pct` exceeds `margin.recall_si_pct` (deliberately
+  below the `max_short_interest_pct` hard cap -- a hard-to-borrow band,
+  not a cliff), every margin short covers ceil(qty * excess/si *
+  `recall_fraction_per_tick`), CASH-CAPPED per leg so the fund/ADL
+  backstop is unreachable (a cashless account keeps its short for the
+  liquidation sweep). Recalls reuse `_liquidate_leg` with
+  kind="RECALL": penalty 0, ledger reason RECALL_COVER, notification
+  SHORT_RECALL, no `liquidations` row. Bounded shorts are never
+  recalled (collateralized derivative, not a borrow). IPO lockout:
+  `instruments.shortable_after_tick` (NULL = always) is set by
+  `create_offering` to close_tick + `ipo.short_lockout_ticks`; the
+  authoritative gate is `_apply_fill`'s short_grew block, mirrored
+  fail-fast in `place_order` for SELL+allow_short so resting shorts
+  can't silently straddle the lockout (a fill-time check counts toward
+  fill_failures). `(current_tick or 0)` semantics: pre-history means any
+  future lockout still holds. `/short` takes optional `knockout:` pct ->
+  `open_bounded_short(knockout_pct)` validated against
+  `shorts.min/max_knockout_pct`; collateral + KO price follow the chosen
+  pct and everything downstream reads the stored `knockout_price`.
+  `effective_borrow_bps_per_tick` (margin/service.py) is the Python
+  mirror of `accrue_borrow_fees`' utilization formula -- keep in sync;
+  `/stock` reports borrow %/day, days-to-cover (si_shares/adv), and
+  remaining capacity / lockout tick from new InstrumentSnapshot fields
+  adv/float_shares/shortable_after_tick.
