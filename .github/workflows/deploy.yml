@@ -57,9 +57,13 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.STOCKBOT_VM_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          tar --exclude=.git --exclude=release.tar.gz -czf release.tar.gz .
+          # Write the tarball outside the checkout: archiving `.` while
+          # the output file lives inside it makes tar abort with "file
+          # changed as we read it".
+          tar --exclude=.git -czf "$RUNNER_TEMP/release.tar.gz" .
           scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
-            release.tar.gz opc@"$VM_HOST":/tmp/stockbot-release.tar.gz
+            "$RUNNER_TEMP/release.tar.gz" \
+            opc@"$VM_HOST":/tmp/stockbot-release.tar.gz
           ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key opc@"$VM_HOST" '
             set -e
             mkdir -p ~/stockbot ~/stockbot-release
