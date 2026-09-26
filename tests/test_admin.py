@@ -162,3 +162,20 @@ async def test_recalc_balances_repairs_cache_drift(conn: AsyncConnection) -> Non
     assert await get_balance(conn, account_id) == 0 + 10_000  # grant only
     # Clean run: nothing to fix.
     assert await recalc_balances(conn) == 0
+
+
+async def test_recalc_balances_heals_account_with_no_ledger_entries(
+    conn: AsyncConnection,
+) -> None:
+    """The audit flags entry-less drift via LEFT JOIN; the repair must use
+    the same shape or it can never heal the accounts the audit finds."""
+    async with conn.cursor() as cur:
+        await cur.execute("INSERT INTO users (id) VALUES (4006)")
+        await cur.execute(
+            "INSERT INTO accounts (kind, user_id, balance) "
+            "VALUES ('USER', 4006, 999) RETURNING id"
+        )
+        (account_id,) = await cur.fetchone()
+
+    assert await recalc_balances(conn) == 1
+    assert await get_balance(conn, account_id) == 0

@@ -3,7 +3,7 @@ user-chosen bounded-short knockouts, and the IPO borrow lockout."""
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 
 import pytest
 from psycopg import AsyncConnection
@@ -257,6 +257,75 @@ async def test_recall_cash_caps_instead_of_overdrawing(
     pos = await _position(conn, 9312, "RCLC")
     assert pos is not None and pos[0] == -300
     assert await _notifications(conn, 9312, "SHORT_RECALL") == 0
+
+
+async def test_recall_clamps_to_real_cost_fund_untouched(
+    conn: AsyncConnection,
+) -> None:
+    """The caller's cash bound omits the half-spread, so it can oversize
+    the recall. _liquidate_leg must re-clamp at the ACTUAL fill cost --
+    the insurance fund must never cover a recall shortfall (there is no
+    flow row for it, so fund_reconciles would break)."""
+    await _fund(conn, 9314)
+    await _grant_tier(conn, 9314)
+    await _make_stock(conn, "RCLF")
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE instruments SET float_shares = 1000, max_impact = 0.001 "
+            "WHERE ticker = 'RCLF'"
+        )
+        # 10% half-spread, every modifier coefficient off: the real cover
+        # costs ~quoted*1.10 while the caller's bound is ~quoted*1.001.
+        await cur.execute(
+            "UPDATE config SET value = '1000' WHERE key = 'spread.base_bps'"
+        )
+        await cur.execute(
+            "UPDATE config SET value = '0' WHERE key LIKE 'spread.%_coeff'"
+        )
+    # 300/1000 float is exactly at the short-interest cap (the gate is
+    # strict >): SI = 0.30 -> recall ~1.67% -> 5 shares.
+    await execute_trade(conn, user_id=9314, ticker="RCLF", side="SELL", quantity=300)
+    await refresh_short_interest(conn)
+
+    # Leave cash for 5 shares at the caller's bound but only 4 at the
+    # real fill: the leg must close 4, not draw the fund for 5.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT quoted_price FROM instruments WHERE ticker = 'RCLF'"
+        )
+        (quoted,) = await cur.fetchone()
+    est_per_share = int(
+        (
+            Decimal(quoted) * Decimal("1.001") * Decimal("1.001") * 100
+        ).to_integral_value(rounding=ROUND_CEILING)
+    )
+    target_cash = est_per_share * 5 + est_per_share // 5
+    account_id = await get_user_account_id(conn, 9314)
+    balance = await get_balance(conn, account_id)
+    await post_transfer(
+        conn,
+        from_account_id=account_id,
+        to_account_id=await get_system_account_id(conn, "SINK"),
+        amount=balance - target_cash,
+        reason="TEST_DRAIN",
+    )
+    fund_id = await get_system_account_id(conn, "INSURANCE_FUND")
+    fund_before = await get_balance(conn, fund_id)
+
+    legs = await sweep_recalls(conn, 924)
+    assert legs == 1
+    pos = await _position(conn, 9314, "RCLF")
+    # Fewer than the estimated 5 covered -- the real-cost clamp bit.
+    assert pos is not None and pos[0] < -(300 - 5)
+    assert await get_balance(conn, fund_id) == fund_before
+    # And no unaudited flow: nothing was recorded against the fund.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT COUNT(*) FROM insurance_fund_flows "
+            "WHERE tick_index = 924 AND reason = 'COVER_SHORTFALL'"
+        )
+        (n,) = await cur.fetchone()
+    assert int(n) == 0
 
 
 async def test_recall_leaves_bounded_shorts_alone(conn: AsyncConnection) -> None:

@@ -156,6 +156,22 @@ async def test_apply_tick_runs_knockout_sweep(conn: AsyncConnection) -> None:
     assert row[0] == "KNOCKED_OUT" and row[1] == 0
 
 
+async def test_cover_bypasses_participation_cap(conn: AsyncConnection) -> None:
+    """Covering is a single atomic close -- unlike a share sell it can't
+    be chunked across ticks, so the open-side participation cap must not
+    apply. Shrink liquidity after entry so the cover's notional is far
+    over the per-tick cap: the close must still succeed rather than
+    strand the position until knockout."""
+    result = await _open(conn, user_id=9, quantity=5)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE instruments SET liquidity = 1 WHERE ticker = 'NORT'"
+        )
+    covered = await cover_bounded_short(conn, user_id=9, short_id=result.short_id)
+    assert covered.quantity == 5
+    assert await list_open_shorts(conn, 9) == []
+
+
 async def test_cover_rejects_foreign_or_closed_short(conn: AsyncConnection) -> None:
     result = await _open(conn, user_id=8)
     with pytest.raises(ShortNotFoundError):

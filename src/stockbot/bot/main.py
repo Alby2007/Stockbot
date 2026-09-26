@@ -149,9 +149,10 @@ class StockBotClient(discord.Client):
 
     async def _notify_loop(self) -> None:
         """Transactional-outbox poller: one poll = one committed
-        transaction, so a mid-poll crash never double-sends (unsent rows
-        just stay unsent) or double-marks (sent rows are already
-        committed sent before the next poll can see them)."""
+        transaction, so a mid-poll crash never loses a row (undelivered
+        rows stay pending). Delivery is at-least-once: a crash after a
+        successful send but before the commit re-delivers on the next
+        poll -- duplicates are rare and harmless, so no dedup is kept."""
         while True:
             try:
                 async with db.connection() as conn, conn.transaction():

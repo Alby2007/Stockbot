@@ -165,7 +165,12 @@ async def subscribe(
         tick = await _current_tick(conn)
         if tick < open_tick:
             raise ValueError(f"the {ticker} IPO window opens at tick {open_tick}")
-        if tick >= close_tick:
+        # `tick` is the NEXT tick index (MAX+1): a commit landing between
+        # tick close_tick-1 and close_tick still makes it into settle_due's
+        # snapshot at close_tick, so the last tick of the window must stay
+        # subscribable. `>` rejects only once settle has actually run (the
+        # FOR UPDATE re-check also catches a settle racing this tx).
+        if tick > close_tick:
             raise ValueError(f"the {ticker} IPO window closed at tick {close_tick}")
 
         account_id = await get_user_account_id(conn, user_id)

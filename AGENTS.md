@@ -71,8 +71,10 @@ move the market nearly for free via the MM, which materially weakens
 impact as the anti-manipulation lever for large trades. User-initiated
 fills are capped at `liquidity.participation_cap`·liquidity notional
 (`InsufficientDepthError`, atomic — no partial market fills); forced
-liquidation (`_liquidate_leg`) and KO closes bypass the cap so positions
-can't be stranded. Resting orders work over multiple ticks — pass-2 MM
+liquidation (`_liquidate_leg`), KO closes, AND voluntary
+`cover_bounded_short` bypass the cap so positions can't be stranded --
+a bounded-short cover is atomic (no partial close exists), so capping it
+could trap a position opened near the cap after ordinary drift. Resting orders work over multiple ticks — pass-2 MM
 fills clamp to the cap and leave `filled_quantity` short. MM limit fills
 also need the mark to cross the limit by `order_book.fill_epsilon_bps`,
 not merely touch it (no free trade-throughs). When resizing tests: a
@@ -1003,7 +1005,13 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   then flips is_active=FALSE -- dormant instruments are invisible to the
   engine/candles/events until settlement; `subscribe` escrows cash into
   the IPO_ESCROW system account (SYSTEM_ACCOUNTS allowlist in
-  ledger/service.py must include it); `settle_due` in apply_tick's
+  ledger/service.py must include it); the subscribe window is
+  `[open_tick, close_tick)` measured against the NEXT tick index
+  (MAX+1) -- a commit at MAX+1 == close_tick still lands before
+  settle's snapshot, so subscribe rejects only when MAX+1 > close_tick
+  (the `FOR UPDATE OF o` on the offering row serializes a racing
+  settle: the loser sees SETTLED, never a committed-but-missed sub);
+  `settle_due` in apply_tick's
   lifecycle block allocates pro-rata-by-commitment capped at affordability
   (largest-remainder dust pass), burns proceeds escrow->SINK, refunds the
   excess, upserts positions at offer avg_cost, and activates the listing.
@@ -1022,7 +1030,14 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   not a cliff), every margin short covers ceil(qty * excess/si *
   `recall_fraction_per_tick`), CASH-CAPPED per leg so the fund/ADL
   backstop is unreachable (a cashless account keeps its short for the
-  liquidation sweep). Recalls reuse `_liquidate_leg` with
+  liquidation sweep). The cap is enforced TWICE: `sweep_recalls` sizes
+  with a pessimistic `(1+max_impact)*(1+fee)` bound (no half-spread --
+  it can undershoot), then `_liquidate_leg` re-clamps `close_qty` at the
+  ACTUAL fill's per-share cost. The in-leg clamp is what makes the
+  backstop unreachable in fact: before it, an undershooting estimate
+  produced `shortfall > 0` and the fund paid for a recall with no
+  `insurance_fund_flows` row (LIQUIDATION-gated), breaking
+  `fund_reconciles`. Recalls reuse `_liquidate_leg` with
   kind="RECALL": penalty 0, ledger reason RECALL_COVER, notification
   SHORT_RECALL, no `liquidations` row. Bounded shorts are never
   recalled (collateralized derivative, not a borrow). IPO lockout:

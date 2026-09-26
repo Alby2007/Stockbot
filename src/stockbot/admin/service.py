@@ -463,11 +463,12 @@ async def recalc_balances(conn: AsyncConnection) -> int:
             UPDATE accounts a
             SET balance = s.total
             FROM (
-                SELECT account_id, SUM(amount) AS total
-                FROM ledger_entries
-                GROUP BY account_id
+                SELECT a2.id, COALESCE(SUM(le.amount), 0) AS total
+                FROM accounts a2
+                LEFT JOIN ledger_entries le ON le.account_id = a2.id
+                GROUP BY a2.id
             ) s
-            WHERE a.id = s.account_id AND a.balance <> s.total
+            WHERE a.id = s.id AND a.balance <> s.total
             """
         )
         return cur.rowcount
@@ -775,12 +776,28 @@ async def delist_instrument(conn: AsyncConnection, ticker: str) -> DelistReport:
                 "have no matching account -- refusing to strand them"
             )
 
+        # Lock the involved accounts in ascending id order and re-read
+        # balances post-lock: the JOIN's a.balance is a statement-time
+        # snapshot, and a concurrent debit committed between it and the
+        # leg's post_transfer would make min(cost, cash) overshoot into
+        # the nonneg CHECK -- rolling back the whole delist.
+        balances: dict[int, int] = {}
+        for account_id in sorted({int(p["account_id"]) for p in positions}):
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT id, balance FROM accounts WHERE id = %s FOR UPDATE",
+                    (account_id,),
+                )
+                acc_row = await cur.fetchone()
+            assert acc_row is not None
+            balances[account_id] = int(acc_row[1])
+
         settled = covered = 0
         fund_paid = mm_absorbed = 0
         for pos in positions:
             qty = int(pos["quantity"])
             account_id = int(pos["account_id"])
-            cash = int(pos["balance"])
+            cash = balances[account_id]
             if qty > 0:
                 payout = int(
                     (Decimal(qty) * mark * 100).quantize(Decimal("1"), ROUND_HALF_UP)

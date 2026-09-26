@@ -291,9 +291,11 @@ async def _liquidate_leg(
     account's cash when it can cover it.
 
     `kind="RECALL"` reuses the same settlement for a borrow recall: caller
-    passes penalty_bps=0 and cash-caps close_qty (so the fund/ADL backstop
-    is unreachable), the cover posts as RECALL_COVER, no `liquidations` row
-    is written, and the user gets SHORT_RECALL instead of LIQUIDATION.
+    passes penalty_bps=0 and this leg cash-caps close_qty at the ACTUAL
+    fill's per-share cost (so the fund/ADL backstop is unreachable in fact,
+    not just by the caller's estimate), the cover posts as RECALL_COVER,
+    no `liquidations` row is written, and the user gets SHORT_RECALL
+    instead of LIQUIDATION.
     """
     # Lazy: trading.service imports this module, so a top-level import here
     # would be circular.
@@ -347,7 +349,7 @@ async def _liquidate_leg(
     liquidation_id: int | None = None
     async with conn.cursor() as cur:
         await cur.execute(
-            "SELECT balance FROM accounts WHERE id = %s", (account_id,)
+            "SELECT balance FROM accounts WHERE id = %s FOR UPDATE", (account_id,)
         )
         cash_row = await cur.fetchone()
         assert cash_row is not None
@@ -356,6 +358,34 @@ async def _liquidate_leg(
         fund_pays = 0
         residual = 0
         shortfall = 0
+        if qty < 0 and kind != "LIQUIDATION":
+            # Cash-capped cover at the REAL per-share cost. The caller's
+            # estimate is only a bound guess (it omits the half-spread and
+            # uses the linear impact bound, not the exp); when it
+            # undershoots, shortfall>0 below would draw the insurance fund
+            # for a recall -- unaudited, since flow rows are
+            # LIQUIDATION-gated. Clamping here makes the backstop
+            # unreachable in fact. A smaller close_qty only lowers the
+            # fill (less buy pressure), so this bound stays conservative
+            # even though `fill` was priced at the larger quantity.
+            per_share_minor = int(
+                (fill * 100 * (1 + FEE_BPS / 10_000)).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
+            )
+            affordable = cash // per_share_minor if per_share_minor > 0 else 0
+            if close_qty > affordable:
+                close_qty = int(affordable)
+                if close_qty <= 0:
+                    return
+                notional_minor = int(
+                    (fill * close_qty * 100).quantize(Decimal("1"), ROUND_HALF_UP)
+                )
+                fee_minor = int(
+                    (notional_minor * FEE_BPS / 10_000).quantize(
+                        Decimal("1"), ROUND_HALF_UP
+                    )
+                )
         if qty < 0:
             # Covering a short: cash leaves the account.
             cost = notional_minor + fee_minor
@@ -819,8 +849,10 @@ async def check_and_liquidate(
 
 async def sweep_undermargined(conn: AsyncConnection, tick_index: int) -> int:
     """Tick-time liquidation sweep. Runs inside apply_tick's transaction where
-    every instrument is already locked; locks accounts afterwards. Returns the
-    number of liquidation legs executed across all accounts."""
+    every instrument is already locked; each account row is taken FOR UPDATE
+    lazily on its first write/read inside the legs (instruments-then-accounts
+    ordering holds because all instrument locks are already held). Returns
+    the number of liquidation legs executed across all accounts."""
     async with conn.cursor() as cur:
         await cur.execute(
             """
@@ -995,10 +1027,13 @@ async def sweep_recalls(
             recall_qty = math.ceil(qty * recall_frac)
             # Cash cap with a pessimistic per-share bound (mark at the
             # impact ceiling plus fee): the balance CHECK must never be
-            # the thing that stops a recall leg.
+            # the thing that stops a recall leg. This is only a sizing
+            # hint -- _liquidate_leg re-clamps close_qty against the
+            # ACTUAL fill, which is what makes the fund backstop
+            # unreachable (this bound misses the half-spread).
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT balance FROM accounts WHERE id = %s",
+                    "SELECT balance FROM accounts WHERE id = %s FOR UPDATE",
                     (int(pos["account_id"]),),
                 )
                 bal_row = await cur.fetchone()

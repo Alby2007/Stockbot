@@ -173,6 +173,36 @@ async def test_settle_oversubscribed_prorata_refund_and_activate(
     assert dm_count == 2
 
 
+async def test_subscribe_on_last_window_tick_still_counts(
+    conn: AsyncConnection,
+) -> None:
+    """close_tick is exclusive at SETTLE, not at subscribe: a commit made
+    while the next tick is still inside [open_tick, close_tick) lands in
+    settle_due's snapshot and must be accepted."""
+    await _fund(conn, 9250)
+    offering_id = await _make_ipo(conn, "IPOJ", price=10.0, shares=10, duration=3)
+    offering = await _offering(conn, offering_id)
+    close_tick = int(offering["close_tick"])
+    # Advance the market so the NEXT tick is close_tick-1's successor:
+    # MAX+1 == close_tick, the final instant a commit still precedes settle.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO market_ticks (tick_index, market_factor, sector_factors) "
+            "VALUES (%s, 0, '{}')",
+            (close_tick - 1,),
+        )
+    r = await subscribe(conn, user_id=9250, ticker="IPOJ", amount_minor=10_000)
+    assert r.committed_minor == 10_000
+
+    await settle_due(conn, close_tick)
+    pos = await _position(conn, 9250, "IPOJ")
+    assert pos is not None and int(pos["quantity"]) == 10
+
+    # After settlement the window is genuinely gone.
+    with pytest.raises(ValueError, match="no open IPO"):
+        await subscribe(conn, user_id=9250, ticker="IPOJ", amount_minor=100)
+
+
 async def test_settle_undersubscribed_full_allocation(conn: AsyncConnection) -> None:
     await _fund(conn, 9220)
     offering_id = await _make_ipo(conn, "IPOF", price=10.0, shares=100)

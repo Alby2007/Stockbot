@@ -71,9 +71,11 @@ async def _assert_depth(
     quantity: int,
     liquidity: float,
 ) -> None:
-    """Participation cap for user-initiated bounded-short fills. The
-    knockout sweep doesn't come through here -- forced closes bypass the
-    cap by design (a capped KO would strand collateral)."""
+    """Participation cap for OPENING a bounded short only. Closes never
+    come through here: the knockout sweep bypasses the cap by design, and
+    `cover_bounded_short` must too -- the cover is atomic (no partial
+    close exists), so a cap on it could strand a position forever once
+    price drift pushed its notional past the limit."""
     cap = await participation_cap(conn)
     cap_minor = _to_minor_units(Decimal(str(cap)) * Decimal(str(liquidity)))
     notional_minor = _to_minor_units(fill_price * quantity)
@@ -395,13 +397,10 @@ async def cover_bounded_short(
             tick_size=engine.tick_size(base_price, spread_cfg),
         )
         close_price = Decimal(str(round(fill_price_f, 6)))
-        await _assert_depth(
-            conn,
-            str(short["ticker"]),
-            close_price,
-            quantity,
-            liq_eff,
-        )
+        # No participation cap on the close: covering is risk-reducing,
+        # and an oversized position can't be split across smaller covers
+        # the way a share position can be chunked -- a cap here would
+        # strand it until knockout (same reason _liquidate_leg bypasses).
 
         entry_price = Decimal(short["entry_price"])
         collateral_minor = int(short["collateral_minor"])
