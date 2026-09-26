@@ -47,6 +47,9 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
+      # The repo is private, so the VM can't fetch it itself: package the
+      # checked-out SHA in the runner (which already has auth) and scp it.
+      - uses: actions/checkout@v4
       - name: Deploy to VM
         env:
           VM_HOST: ${{ secrets.STOCKBOT_VM_HOST }}
@@ -54,9 +57,19 @@ jobs:
           mkdir -p ~/.ssh
           echo "${{ secrets.STOCKBOT_VM_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+          tar --exclude=.git --exclude=release.tar.gz -czf release.tar.gz .
+          scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key \
+            release.tar.gz opc@"$VM_HOST":/tmp/stockbot-release.tar.gz
           ssh -o StrictHostKeyChecking=accept-new -i ~/.ssh/deploy_key opc@"$VM_HOST" '
             set -e
+            mkdir -p ~/stockbot ~/stockbot-release
+            tar xzf /tmp/stockbot-release.tar.gz -C ~/stockbot-release
+            # rsync --delete so files removed from the repo disappear on the
+            # VM too; .env (VM-only secrets) is preserved. cp -a fallback is
+            # an overlay if the image lacks rsync.
+            rsync -a --delete --exclude=.env ~/stockbot-release/ ~/stockbot/ \
+              2>/dev/null || cp -a ~/stockbot-release/. ~/stockbot/
+            rm -rf ~/stockbot-release /tmp/stockbot-release.tar.gz
             cd ~/stockbot
-            curl -sL "https://github.com/Alby2007/Stockbot/archive/${{ github.sha }}.tar.gz" | tar xz --strip-components=1
-            docker compose up -d --build bot market
+            docker compose up -d --build postgres bot market backup
           '

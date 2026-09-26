@@ -62,6 +62,25 @@ pytest
 Migrations are applied to `TEST_DATABASE_URL` automatically at the start of
 the test session (see `tests/conftest.py`).
 
+## Deploy
+
+Pushing to `master` runs the test suite, then ships the checked-out SHA to
+the VM over SSH (`.github/workflows/deploy.yml`) and rebuilds
+`postgres`/`bot`/`market`/`backup`. The repo is private — the tarball is
+packaged inside the Actions runner, not fetched by the VM.
+
+Required GitHub secrets: `STOCKBOT_VM_HOST`, `STOCKBOT_VM_SSH_KEY` (SSH
+private key for `opc@<host>`).
+
+Required `~/stockbot/.env` on the VM (survives deploys — excluded from the
+rsync): `DISCORD_TOKEN`, `MASTER_SEED`, `ADMIN_USER_IDS`, `POSTGRES_PASSWORD`.
+Set `MASTER_SEED` and `POSTGRES_PASSWORD` before the *first* boot — Postgres
+only applies the password on an empty data dir, and the seed is baked into
+all price history.
+
+Postgres is bound to `127.0.0.1:5450` only — unreachable from outside the
+host.
+
 ## Lint / type-check
 
 ```bash

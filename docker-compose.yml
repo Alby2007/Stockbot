@@ -3,12 +3,18 @@ services:
     image: postgres:17
     environment:
       POSTGRES_USER: stockbot
-      POSTGRES_PASSWORD: stockbot
+      # Set POSTGRES_PASSWORD in .env for any real deployment -- and do it
+      # BEFORE the first boot: Postgres only applies it when initializing
+      # an empty data dir, so changing it on an existing volume is a no-op
+      # (use ALTER ROLE there instead).
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stockbot}
       POSTGRES_DB: stockbot
     ports:
-      # Host port 5450: this machine already has native Postgres services
-      # bound to 5432 and 5433, so both are avoided here.
-      - "5450:5432"
+      # Localhost-only: the other services reach Postgres over the compose
+      # network, so this mapping exists purely for local psql/tests and
+      # must never be publicly reachable on the VM. Host port 5450 avoids
+      # this machine's native Postgres services on 5432/5433.
+      - "127.0.0.1:5450:5432"
     volumes:
       - stockbot-postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -21,7 +27,7 @@ services:
     build: .
     command: ["python", "-m", "stockbot.migrate"]
     environment:
-      DATABASE_URL: postgresql://stockbot:stockbot@postgres:5432/stockbot
+      DATABASE_URL: postgresql://stockbot:${POSTGRES_PASSWORD:-stockbot}@postgres:5432/stockbot
     depends_on:
       postgres:
         condition: service_healthy
@@ -30,7 +36,7 @@ services:
     build: .
     command: ["python", "-m", "stockbot.bot.main"]
     environment:
-      DATABASE_URL: postgresql://stockbot:stockbot@postgres:5432/stockbot
+      DATABASE_URL: postgresql://stockbot:${POSTGRES_PASSWORD:-stockbot}@postgres:5432/stockbot
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}
     depends_on:
       postgres:
@@ -43,7 +49,10 @@ services:
     build: .
     command: ["python", "-m", "stockbot.market.main"]
     environment:
-      DATABASE_URL: postgresql://stockbot:stockbot@postgres:5432/stockbot
+      DATABASE_URL: postgresql://stockbot:${POSTGRES_PASSWORD:-stockbot}@postgres:5432/stockbot
+      # MUST be a real secret before the first tick: the entire price
+      # history is HMAC(master_seed, tick)-derived, so the default makes
+      # the market predictable, and rotating it later forks history.
       MASTER_SEED: ${MASTER_SEED:-change-me-in-production}
     depends_on:
       postgres:
@@ -57,13 +66,15 @@ services:
   # .sql.gz out, `gunzip | psql`.
   backup:
     image: postgres:17-alpine
+    environment:
+      DATABASE_URL: postgresql://stockbot:${POSTGRES_PASSWORD:-stockbot}@postgres:5432/stockbot
     command:
       - sh
       - -c
       - |
         while true; do
           ts=$$(date +%Y%m%d-%H%M%S)
-          pg_dump -Fc "postgresql://stockbot:stockbot@postgres:5432/stockbot" \
+          pg_dump -Fc "$$DATABASE_URL" \
             -f "/backups/stockbot-$$ts.dump" && \
           find /backups -name 'stockbot-*.dump' -mtime +14 -delete
           sleep 86400
