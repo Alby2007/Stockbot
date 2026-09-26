@@ -14,6 +14,7 @@ import discord
 from stockbot import db
 from stockbot.bot.chart_view import CHART_CID_PREFIX, handle_chart_component
 from stockbot.bot.commands import guild_welcome_message, register_commands
+from stockbot.bot.leaderboard import sync_leaderboard_boards
 from stockbot.bot.notify import DeliveryForbidden, poll_once
 from stockbot.config import get_settings
 from stockbot.logging import setup_logging
@@ -24,6 +25,7 @@ log = logging.getLogger("stockbot.bot")
 
 HEARTBEAT_INTERVAL_SECONDS = 30
 NOTIFY_POLL_INTERVAL_SECONDS = 5
+LEADERBOARD_INTERVAL_SECONDS = 60
 
 
 class StockBotTree(discord.app_commands.CommandTree["StockBotClient"]):
@@ -204,11 +206,24 @@ class StockBotClient(discord.Client):
                 return
         log.info("no writable channel for welcome in guild %s", guild.id)
 
+    async def _leaderboard_loop(self) -> None:
+        """Refresh bound leaderboard boards every minute. Net-worth
+        freshness at 60s is fine -- not gated on market ticks (overnight
+        the board is flat and unchanged embeds skip the REST edit)."""
+        while True:
+            try:
+                await sync_leaderboard_boards(self)
+            except Exception:
+                log.exception("leaderboard board sync pass failed")
+            await asyncio.sleep(LEADERBOARD_INTERVAL_SECONDS)
+
     async def on_ready(self) -> None:
         if getattr(self, "_heartbeat_task", None) is None:
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         if getattr(self, "_notify_task", None) is None:
             self._notify_task = asyncio.create_task(self._notify_loop())
+        if getattr(self, "_leaderboard_task", None) is None:
+            self._leaderboard_task = asyncio.create_task(self._leaderboard_loop())
 
 
 async def run() -> None:

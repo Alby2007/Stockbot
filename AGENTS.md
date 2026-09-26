@@ -184,11 +184,18 @@ s<span> presets (re-anchor to last open). Action names starting `s`
 carry the target span (`s960` = 1D at 960-tick sessions).
 Render aesthetics live in `_render_png` helpers, all pure:
 `_span_label(span)` maps spans to `1h`/`4h`/`1d`/`1w` (`~Nd`/`Nt`
-fallbacks) for the title, and `_session_boundaries(ticks, bucket)`
-returns `i - 0.5` positions wherever `ticks[i] - ticks[i-1] > bucket`
-(compressed open-open gaps from overnights/halts) for dashed separators
-— the open→closed-tail transition is tick-adjacent so the shading marks
-it, not a separator. The legend (`O/H/L/C Δ%` in the window's direction
+fallbacks) for the title, and `_session_boundaries(ticks, times, bucket)`
+returns candle indexes at compressed open-phase discontinuities:
+`ticks[i] - ticks[i-1] > bucket` (overnights/halts/missing rows) OR a
+wall-clock gap > 6x the window's median candle spacing with a 10m floor
+(service downtime between ticks leaves contiguous tick_indexes that
+still span days). Each draws a `_MUTED` dashed separator at `i - 0.5`
+plus a `_gap_tag` duration label ("45m"/"8.5h"/"2d", tick-span fallback
+when ts is NULL). The legibility matters: a same-UTC-day close teleports
+the axis (07:17 → 15:44) and the `Mon DD` day labels only fire across
+UTC dates, so without a visible boundary + duration the compressed gap
+reads as a bad tick. The open→closed-tail transition is tick-adjacent
+so the shading marks it, not a separator. The legend (`O/H/L/C Δ%` in the window's direction
 color), right-edge last-price pill (`rect=(0,0,0.94,1)` reserves its
 gutter), and faint ticker watermark are all derived from `rows` — no
 protocol/signature change. Candle/wick/volume widths drop to 0.6 above
@@ -692,10 +699,19 @@ can't be referenced in its own transaction -- that's why the enum lives in
   safe to leave in.
 - This dev machine already has native Postgres services bound to ports 5432
   and 5433 (`postgresql-x64-13`, `postgresql-x64-18` Windows services). The
-  docker-compose Postgres is mapped to host port **5450** instead. If you hit
-  `password authentication failed` or `role ... does not exist` against a
-  `localhost` connection, suspect a port clash first — check
-  `netstat -ano | grep <port>` on Windows.
+  docker-compose Postgres is mapped to **localhost-only** port **5450**
+  (`127.0.0.1:5450:5432` — never publicly reachable on the VM; services use
+  the compose network). If you hit `password authentication failed` or
+  `role ... does not exist` against a `localhost` connection, suspect a port
+  clash first — check `netstat -ano | grep <port>` on Windows. The compose
+  `POSTGRES_PASSWORD` env var feeds every service's internal DATABASE_URL;
+  Postgres only applies it on an empty data dir, so set it before first boot.
+  `MASTER_SEED` is likewise a set-before-first-tick secret — it seeds all
+  HMAC-derived price history and can't be rotated without forking it.
+  Deploy (`.github/workflows/deploy.yml`) tarballs the checkout in the
+  runner and scps it to the VM — the repo is private, so the VM can't pull
+  it — then `docker compose up -d --build postgres bot market backup` (the
+  `backup` service must be named or it never starts).
 
 ## Commands
 
@@ -936,6 +952,18 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   each deploy ("This command is outdated", interactions never reaching
   the gateway). If the registry is ever wiped server-side, delete the
   config row to force a re-publish.
+- **Persistent leaderboard boards**: `leaderboard_channels` (0039) binds
+  one channel per guild to a bot-owned message; `_leaderboard_loop`
+  (60s, started in `on_ready`) edits it in place via
+  `sync_leaderboard_boards`. The loop hashes the *ranking rows* (not the
+  embed — the Updated footer would defeat it) and skips the REST edit
+  when unchanged. `message_id` NULL → post + pin; `NotFound` on fetch →
+  repost. Per-channel try/except so a deleted/locked channel never kills
+  the pass; `message_id` commits per binding (a later channel's failure
+  must not roll back an earlier board's stored id → double-post).
+  `/leaderboard-setup` (default_permissions manage_guild) binds +
+  posts immediately; `/leaderboard` shares `leaderboard_embed` with a
+  caller-rank footer param.
 - **Rate limits** (H4): `/chart` has `@app_commands.checks.cooldown(1,
   10)` (per-user default); `StockBotTree.on_error` maps
   `CommandOnCooldown` to "Slow down -- retry in Ns". `_instrument_one`

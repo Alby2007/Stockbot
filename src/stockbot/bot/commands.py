@@ -61,6 +61,11 @@ from stockbot.bot.chart_view import (
 )
 from stockbot.bot.charts import render_candle_chart
 from stockbot.bot.format import format_money, format_pct, format_price
+from stockbot.bot.leaderboard import (
+    bind_leaderboard_channel,
+    leaderboard_embed,
+    post_leaderboard_board,
+)
 from stockbot.claims.errors import (
     AccountTooYoungError,
     AlreadyClaimedTodayError,
@@ -884,20 +889,37 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         if not rows:
             await interaction.response.send_message("No accounts yet.", ephemeral=True)
             return
-        lines = [
-            f"{r.rank:>3}. <@{r.user_id}>  {format_money(r.equity_minor):>14}"
-            for r in rows[:15]
-        ]
         caller = next((r for r in rows if r.user_id == interaction.user.id), None)
-        embed = discord.Embed(title="Leaderboard \u2014 net worth")
-        embed.description = "\n".join(lines)
-        if caller is not None and caller.rank > 15:
-            embed.set_footer(
-                text=f"You: rank {caller.rank} of {caller.total} "
-                f"\u2014 {format_money(caller.equity_minor)}"
-            )
+        embed = leaderboard_embed(rows, caller=caller)
         await interaction.response.send_message(
             content=_welcome_suffix(bootstrap) or None, embed=embed
+        )
+
+    @tree.command(
+        name="leaderboard-setup",
+        description="Pin a live net-worth leaderboard board in this channel",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def leaderboard_setup(interaction: discord.Interaction) -> None:
+        channel = interaction.channel
+        if interaction.guild_id is None or not isinstance(
+            channel, (discord.TextChannel, discord.Thread)
+        ):
+            await interaction.response.send_message(
+                "Run this in the channel that should host the board.",
+                ephemeral=True,
+            )
+            return
+        async with db.connection() as conn, conn.transaction():
+            await bind_leaderboard_channel(conn, interaction.guild_id, channel.id)
+            message = await post_leaderboard_board(
+                conn, interaction.guild_id, channel
+            )
+        await interaction.response.send_message(
+            f"Leaderboard board live in {channel.mention} — it refreshes "
+            "every minute. "
+            f"[Jump to it]({message.jump_url})",
+            ephemeral=True,
         )
 
     @tree.command(name="history", description="Show your recent trades")
