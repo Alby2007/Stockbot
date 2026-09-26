@@ -11,6 +11,7 @@ import time
 from psycopg import AsyncConnection, sql
 from psycopg.rows import dict_row
 
+from stockbot.ipo import service as ipo
 from stockbot.maintenance import run_maintenance_if_due
 from stockbot.margin import service as margin
 from stockbot.market import data, engine, events
@@ -22,7 +23,7 @@ from stockbot.observability import (
 from stockbot.orders import service as orders
 from stockbot.seasons import service as seasons
 from stockbot.shorts import service as shorts
-from stockbot.status.service import snapshot_net_worth_if_due
+from stockbot.status.service import evaluate_badges, snapshot_net_worth_if_due
 
 log = logging.getLogger("stockbot.market.tick")
 
@@ -96,6 +97,8 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             await margin.accrue_borrow_fees(conn)
             await seasons.on_tick(conn, tick_index)
             await snapshot_net_worth_if_due(conn, tick_index)
+            await evaluate_badges(conn, tick_index)
+            await ipo.settle_due(conn, tick_index)
             duration_ms = (time.perf_counter() - started) * 1000
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -660,6 +663,8 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # N2: same day-boundary cadence, but for every main-portfolio USER
         # account -- feeds /compare and /profile's 24h change.
         await snapshot_net_worth_if_due(conn, tick_index)
+        await evaluate_badges(conn, tick_index)
+        await ipo.settle_due(conn, tick_index)
 
         duration_ms = (time.perf_counter() - started) * 1000
         async with conn.cursor() as cur:

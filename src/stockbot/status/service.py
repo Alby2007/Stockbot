@@ -97,6 +97,84 @@ async def snapshot_net_worth_if_due(
         )
 
 
+async def evaluate_badges(
+    conn: AsyncConnection, tick_index: int, *, interval_ticks: int = TICKS_PER_DAY
+) -> int:
+    """Day-boundary milestone grant -- one INSERT ... SELECT per metric
+    class, not a per-user loop (same shape as snapshot_net_worth_if_due,
+    called right after it in apply_tick's lifecycle block).
+
+    Badge catalog rows carry {"metric": ..., "threshold_minor"|"threshold"}
+    in shop_items.metadata; grants land in `entitlements` where the PK is
+    the idempotency key (ON CONFLICT DO NOTHING -- re-running a day can
+    never double-grant). Each NEW grant also enqueues a BADGE_EARNED
+    outbox row so the DM names what was earned. Returns grants issued.
+    """
+    if tick_index % interval_ticks != 0:
+        return 0
+    granted: list[tuple[int, str]] = []
+    async with conn.cursor() as cur:
+        # Net worth: the exact aggregate the leaderboard ranks by.
+        await cur.execute(
+            f"""
+            INSERT INTO entitlements (user_id, item_key)
+            SELECT x.user_id, x.key FROM (
+                SELECT a.user_id, s.key, {_NET_WORTH_EXPR} AS metric_value,
+                       (s.metadata->>'threshold_minor')::bigint AS threshold
+                FROM accounts a
+                {_NET_WORTH_JOINS}
+                JOIN shop_items s
+                  ON s.kind = 'BADGE' AND s.metadata->>'metric' = 'net_worth'
+                WHERE a.kind = 'USER'
+            ) x WHERE x.metric_value >= x.threshold
+            ON CONFLICT DO NOTHING
+            RETURNING user_id, item_key
+            """
+        )
+        granted += [(int(r[0]), str(r[1])) for r in await cur.fetchall()]
+        # Lifetime traded notional (users.total_traded_minor, main+league).
+        await cur.execute(
+            """
+            INSERT INTO entitlements (user_id, item_key)
+            SELECT u.id, s.key
+            FROM users u
+            JOIN shop_items s
+              ON s.kind = 'BADGE' AND s.metadata->>'metric' = 'volume'
+            WHERE u.total_traded_minor >= (s.metadata->>'threshold_minor')::bigint
+            ON CONFLICT DO NOTHING
+            RETURNING user_id, item_key
+            """
+        )
+        granted += [(int(r[0]), str(r[1])) for r in await cur.fetchall()]
+        # Daily claim streak (claims.streak is current, not best-ever --
+        # a broken streak waits for the next run of consecutive days).
+        await cur.execute(
+            """
+            INSERT INTO entitlements (user_id, item_key)
+            SELECT c.user_id, s.key
+            FROM claims c
+            JOIN shop_items s
+              ON s.kind = 'BADGE' AND s.metadata->>'metric' = 'streak'
+            WHERE c.streak >= (s.metadata->>'threshold')::int
+            ON CONFLICT DO NOTHING
+            RETURNING user_id, item_key
+            """
+        )
+        granted += [(int(r[0]), str(r[1])) for r in await cur.fetchall()]
+        for user_id, item_key in granted:
+            await cur.execute(
+                """
+                INSERT INTO notifications (user_id, kind, payload)
+                SELECT %s, 'BADGE_EARNED',
+                       jsonb_build_object('tick_index', %s, 'item_key', %s::text,
+                                          'name', s.name)
+                FROM shop_items s WHERE s.key = %s
+                """,
+                (user_id, tick_index, item_key, item_key),
+            )
+    return len(granted)
+
+
 async def day_change_pct(
     conn: AsyncConnection, user_id: int, current_equity_minor: int, tick_index: int
 ) -> float | None:
@@ -220,7 +298,7 @@ async def profile_stats(conn: AsyncConnection, user_id: int) -> ProfileStats | N
             """
             SELECT s.name FROM entitlements e
             JOIN shop_items s ON s.key = e.item_key
-            WHERE e.user_id = %s AND s.kind = 'TROPHY'
+            WHERE e.user_id = %s AND s.kind IN ('TROPHY', 'BADGE')
             ORDER BY e.item_key
             """,
             (user_id,),

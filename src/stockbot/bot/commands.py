@@ -74,6 +74,7 @@ from stockbot.claims.errors import (
 from stockbot.claims.service import claim_daily
 from stockbot.compliance.wash_trade import scan_for_wash_trades
 from stockbot.config import get_settings
+from stockbot.ipo import service as ipo_svc
 from stockbot.ledger.errors import InsufficientFundsError
 from stockbot.ledger.service import get_balance
 from stockbot.margin.errors import MarginError
@@ -93,7 +94,12 @@ from stockbot.market.data import (
     session_parts,
 )
 from stockbot.market.engine import TICKS_PER_DAY, ticks_until_close, ticks_until_open
-from stockbot.orders.service import cancel_order, list_open_orders, place_order
+from stockbot.orders.service import (
+    cancel_order,
+    list_open_orders,
+    place_oco,
+    place_order,
+)
 from stockbot.seasons.errors import SeasonError
 from stockbot.seasons.service import (
     close_season,
@@ -1007,7 +1013,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             name="Lifetime volume", value=format_money(stats.lifetime_volume_minor)
         )
         if stats.trophies:
-            embed.add_field(name="Trophies", value="\n".join(stats.trophies), inline=False)
+            embed.add_field(
+                name="Trophies & badges",
+                value="\n".join(stats.trophies),
+                inline=False,
+            )
         if stats.active_season_equity_minor is not None:
             embed.add_field(
                 name="Active season equity",
@@ -1485,10 +1495,12 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         league: bool,
         display: int | None,
         short: bool = False,
+        trail: float | None = None,
     ) -> None:
-        if limit is None and stop is None:
+        if limit is None and stop is None and trail is None:
             await interaction.response.send_message(
-                "Give a `limit` price, a `stop` price, or both (stop-limit).",
+                "Give a `limit` price, a `stop` price, a `trail` distance, "
+                "or limit+stop (stop-limit).",
                 ephemeral=True,
             )
             return
@@ -1511,8 +1523,25 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 season_id = entry[0]
             if dollars is not None:
                 # Size against the order's anchor: the limit for
-                # limit/stop-limit orders, the stop for pure stops.
-                anchor = Decimal(str(limit if limit is not None else stop))
+                # limit/stop-limit orders, the stop for pure stops, and
+                # the live mark for a trail-only stop (it has no resting
+                # price yet -- the stop anchors off the mark anyway).
+                anchor_arg = limit if limit is not None else stop
+                if anchor_arg is None:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT quoted_price FROM instruments WHERE ticker = %s",
+                            (ticker.upper(),),
+                        )
+                        mark_row = await cur.fetchone()
+                    if mark_row is None:
+                        await interaction.response.send_message(
+                            f"Unknown instrument {ticker.upper()}.", ephemeral=True
+                        )
+                        return
+                    anchor = Decimal(mark_row[0])
+                else:
+                    anchor = Decimal(str(anchor_arg))
                 qty = await shares_for_dollars(
                     conn,
                     user_id=interaction.user.id,
@@ -1570,6 +1599,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     stop_price=None if stop is None else Decimal(str(stop)),
                     display_qty=display,
                     allow_short=short,
+                    trail_amount=None if trail is None else Decimal(str(trail)),
                 )
             except (TradingError, ValueError) as exc:
                 await interaction.response.send_message(str(exc), ephemeral=True)
@@ -1581,6 +1611,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
         if result.order_type == "STOP":
             price_part = f"stop {format_price(result.stop_price or 0)}"
+            if result.trail_amount is not None:
+                price_part += f" (trails {format_price(result.trail_amount)})"
         elif result.order_type == "STOP_LIMIT":
             price_part = (
                 f"stop {format_price(result.stop_price or 0)} "
@@ -1626,9 +1658,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         dollars="Size the order for ~this many dollars instead of a share count",
         limit="Max price you'll pay (omit for a pure stop order)",
         stop="Trigger once the mark rises to this price",
+        trail="Paid unlock: stop trails this many dollars below the mark",
         hours="Auto-expire after this many hours (omit for GTC)",
         league="Place the order in your league portfolio",
-        display="Iceberg: show only this many shares in the book",
+        display="Iceberg (paid unlock): show only this many shares in the book",
     )
     @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def order_buy(
@@ -1639,13 +1672,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         # NUMERIC(18, 6) tops out just under 1e12; keep the bound inside it.
         limit: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
         stop: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
+        trail: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
         hours: app_commands.Range[float, 0.02, 8760.0] | None = None,
         league: bool = False,
         display: app_commands.Range[int, 1, 1_000_000_000] | None = None,
     ) -> None:
         await _place_order(
             interaction, ticker, "BUY", quantity, dollars,
-            limit, stop, hours, league, display
+            limit, stop, hours, league, display, False, trail
         )
 
     @order_group.command(
@@ -1658,9 +1692,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         dollars="Size the order for ~this many dollars instead of a share count",
         limit="Min price you'll accept (omit for a pure stop order)",
         stop="Trigger once the mark falls to this price (stop-loss)",
+        trail="Paid unlock: stop trails this many dollars behind the mark",
         hours="Auto-expire after this many hours (omit for GTC)",
         league="Place the order in your league portfolio",
-        display="Iceberg: show only this many shares in the book",
+        display="Iceberg (paid unlock): show only this many shares in the book",
         short="Opt in to selling past your position (opens a margin short)",
     )
     @app_commands.autocomplete(ticker=ticker_autocomplete)
@@ -1671,6 +1706,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         dollars: app_commands.Range[float, 0.01, 1_000_000_000.0] | None = None,
         limit: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
         stop: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
+        trail: app_commands.Range[float, 0.0001, 999_999_999_999.0] | None = None,
         hours: app_commands.Range[float, 0.02, 8760.0] | None = None,
         league: bool = False,
         display: app_commands.Range[int, 1, 1_000_000_000] | None = None,
@@ -1678,7 +1714,80 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     ) -> None:
         await _place_order(
             interaction, ticker, "SELL", quantity, dollars,
-            limit, stop, hours, league, display, short,
+            limit, stop, hours, league, display, short, trail,
+        )
+
+    @order_group.command(
+        name="bracket",
+        description="Paid unlock: take-profit + stop-loss pair — first hit cancels the other",
+    )
+    @app_commands.describe(
+        ticker="Instrument ticker",
+        quantity="Shares on each leg",
+        take_profit="Limit price of the profit leg",
+        stop_loss="Trigger price of the stop leg",
+        side="SELL exits a long (default); BUY exits a short",
+        hours="Auto-expire after this many hours (omit for GTC)",
+        league="Place the bracket in your league portfolio",
+        short="Allow the legs to sell past your position (margin short)",
+    )
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
+    async def order_bracket(
+        interaction: discord.Interaction,
+        ticker: str,
+        quantity: app_commands.Range[int, 1, 1_000_000_000],
+        take_profit: app_commands.Range[float, 0.0001, 999_999_999_999.0],
+        stop_loss: app_commands.Range[float, 0.0001, 999_999_999_999.0],
+        side: str = "SELL",
+        hours: app_commands.Range[float, 0.02, 8760.0] | None = None,
+        league: bool = False,
+        short: bool = False,
+    ) -> None:
+        side = side.upper()
+        if side not in ("SELL", "BUY"):
+            await interaction.response.send_message(
+                "`side` must be SELL or BUY.", ephemeral=True
+            )
+            return
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            season_id: int | None = None
+            if league:
+                entry = await get_active_entry(conn, interaction.user.id)
+                if entry is None:
+                    await interaction.response.send_message(
+                        "You're not entered in an active season. "
+                        "`/league join` first.",
+                        ephemeral=True,
+                    )
+                    return
+                season_id = entry[0]
+            try:
+                tp_leg, sl_leg = await place_oco(
+                    conn,
+                    user_id=interaction.user.id,
+                    ticker=ticker,
+                    side=side,  # type: ignore[arg-type]
+                    quantity=quantity,
+                    take_profit=Decimal(str(take_profit)),
+                    stop_price=Decimal(str(stop_loss)),
+                    season_id=season_id,
+                    expires_in_ticks=(
+                        None if hours is None else int(hours * TICKS_PER_DAY / 24)
+                    ),
+                    interaction_id=str(interaction.id),
+                    allow_short=short,
+                )
+            except (TradingError, ValueError) as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Bracket resting on **{ticker.upper()}**: "
+            f"**#{tp_leg.order_id}** {side} {quantity:,} @ "
+            f"{format_price(tp_leg.limit_price or 0)} take-profit, "
+            f"**#{sl_leg.order_id}** stop {format_price(sl_leg.stop_price or 0)} "
+            "— whichever resolves first cancels the other."
+            + _welcome_suffix(bootstrap)
         )
 
     @order_group.command(name="list", description="Show your resting orders")
@@ -1719,10 +1828,16 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 if r["display_qty"] is not None
                 else ""
             )
+            trail = (
+                f" [trail {format_price(r['trail_amount'])}]"
+                if r["trail_amount"] is not None
+                else ""
+            )
+            oco = " [OCO]" if r["oco_group"] is not None else ""
             return (
                 f"#{r['id']:<4} {r['side']:<4} {remaining:>5} {r['ticker']:<6} "
                 f"{price:>24} (mark {format_price(r['quoted_price'])})"
-                f"{triggered}{iceberg}"
+                f"{triggered}{iceberg}{trail}{oco}"
             )
 
         lines = [
@@ -1784,9 +1899,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                         f"(tier {tier} -> {tier + 1})"
                     )
                 continue
+            if item.price_minor is None:
+                # Grant-only catalog rows (trophies, badges) aren't for sale.
+                continue
             marker = " (owned)" if item.key in owned_keys and item.duration_days is None else ""
             recurring = f" every {item.duration_days}d" if item.duration_days else ""
-            assert item.price_minor is not None
             lines.append(
                 f"{item.key:<15} {format_money(item.price_minor):>10}{recurring}{marker}"
             )
@@ -1830,6 +1947,99 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
 
     tree.add_command(shop_group)
+
+    ipo_group = app_commands.Group(
+        name="ipo", description="IPO subscriptions — commit cash before listing day"
+    )
+
+    @ipo_group.command(
+        name="list", description="Open and recently settled IPO offerings"
+    )
+    async def ipo_list(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            tick = await current_tick_index(conn)
+            rows = await ipo_svc.list_offerings(conn, interaction.user.id)
+        if not rows:
+            await interaction.response.send_message(
+                "No IPO offerings right now.", ephemeral=True
+            )
+            return
+        lines = []
+        for r in rows:
+            head = (
+                f"{r['ticker']:<6} {format_price(r['offer_price_minor'] / 100):>10}"
+                f" × {r['shares_offered']:,} sh"
+            )
+            if r["status"] == "OPEN":
+                remaining = max(0, int(r["close_tick"]) - (tick or 0))
+                mine = (
+                    f" · yours {format_money(r['my_committed_minor'])}"
+                    if r["my_committed_minor"]
+                    else ""
+                )
+                lines.append(
+                    f"{head} · committed {format_money(r['committed_minor'])}"
+                    f"{mine} · closes in ~{remaining} tick(s)"
+                )
+            else:
+                alloc = (
+                    f" · you got {r['my_allocated_qty']:,} sh"
+                    f" ({format_money(r['my_refund_minor'])} back)"
+                    if r["my_allocated_qty"] is not None
+                    else ""
+                )
+                lines.append(
+                    f"{head} · {r['status'].lower()}"
+                    + (
+                        f" — {r['allocated_qty']:,} sh allocated"
+                        if r["status"] == "SETTLED"
+                        else ""
+                    )
+                    + alloc
+                )
+        embed = discord.Embed(title="IPO offerings")
+        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        embed.set_footer(text="/ipo subscribe <ticker> <dollars> — pro-rata at the offer price")
+        await interaction.response.send_message(
+            content=_welcome_suffix(bootstrap) or None, embed=embed
+        )
+
+    @ipo_group.command(
+        name="subscribe", description="Commit dollars to an open IPO window"
+    )
+    @app_commands.describe(
+        ticker="IPO ticker",
+        dollars="Cash to commit — buys shares at the offer price, excess refunds",
+    )
+    async def ipo_subscribe(interaction: discord.Interaction, ticker: str, dollars: float) -> None:
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            try:
+                result = await ipo_svc.subscribe(
+                    conn,
+                    user_id=interaction.user.id,
+                    ticker=ticker,
+                    amount_minor=int(Decimal(str(dollars)) * 100),
+                    interaction_id=str(interaction.id),
+                )
+            except InsufficientFundsError:
+                await interaction.response.send_message(
+                    "Insufficient funds for that subscription.", ephemeral=True
+                )
+                return
+            except (TradingError, ValueError, MarginError) as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Committed **{format_money(result.committed_minor)}** to the "
+            f"**{result.ticker}** IPO — book total "
+            f"{format_money(result.total_committed_minor)}. Allocation "
+            "settles at the window close (pro-rata, excess refunded)."
+            + _welcome_suffix(bootstrap)
+        )
+
+    tree.add_command(ipo_group)
 
     league_group = app_commands.Group(
         name="league",
@@ -2417,6 +2627,52 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"MM absorbed {format_money(report.mm_absorbed_minor)}"
             )
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @admin_group.command(
+        name="ipo-create",
+        description="Create an IPO: lists dormant at the offer price, settles at close",
+    )
+    @app_commands.describe(
+        ticker="Instrument ticker",
+        name="Display name",
+        sector="Sector key, e.g. TECH",
+        offer_price="Offer price in dollars",
+        shares="Shares offered (the float subscribers allocate pro-rata)",
+        days="Subscription window length in days",
+    )
+    @app_commands.autocomplete(sector=sector_autocomplete)
+    async def admin_ipo_create(
+        interaction: discord.Interaction,
+        ticker: str,
+        name: str,
+        sector: str,
+        offer_price: app_commands.Range[float, 0.0001, 1_000_000_000.0],
+        shares: app_commands.Range[int, 1, 1_000_000_000],
+        days: app_commands.Range[float, 0.02, 30.0] = 1.0,
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        async with db.connection() as conn:
+            try:
+                offering_id = await ipo_svc.create_offering(
+                    conn,
+                    ticker=ticker,
+                    name=name,
+                    sector_key=sector,
+                    offer_price=offer_price,
+                    shares_offered=shares,
+                    duration_ticks=int(days * TICKS_PER_DAY),
+                )
+            except (ValueError, TradingError) as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"IPO **{ticker.upper()}** created — {shares:,} shares at "
+            f"{format_price(Decimal(str(offer_price)))}, offering #{offering_id}. "
+            f"Window is open for ~{days} day(s); `/ipo subscribe`.",
+            ephemeral=True,
+        )
 
     tree.add_command(admin_group)
 

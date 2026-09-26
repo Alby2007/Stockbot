@@ -7,6 +7,8 @@ Insert sites (all inside the event's own transaction):
     shorts/service.py     sweep_knockouts  -> KNOCKOUT
     orders/service.py     fill sites       -> ORDER_FILLED
     seasons/service.py    close_season     -> SEASON_RESULT
+    status/service.py     evaluate_badges  -> BADGE_EARNED
+    ipo/service.py        settle_due       -> IPO_SETTLED
 """
 
 from __future__ import annotations
@@ -122,12 +124,33 @@ def _fmt_account_suspended(items: list[dict[str, Any]]) -> str:
     )
 
 
+def _fmt_badge_earned(items: list[dict[str, Any]]) -> str:
+    names = ", ".join(f"**{p['name']}**" for p in items)
+    noun = "Badge" if len(items) == 1 else "Badges"
+    return f"{noun} earned: {names} — see `/profile`."
+
+
+def _fmt_ipo_settled(items: list[dict[str, Any]]) -> str:
+    parts = []
+    for p in items:
+        part = (
+            f"**{p['ticker']}** — {p['allocated']:,} shares allocated "
+            f"@ {format_price(p['price'])}"
+        )
+        if p.get("refund"):
+            part += f", {format_money(p['refund'])} refunded"
+        parts.append(part)
+    return "IPO settled: " + "; ".join(parts) + ". It's live on the market."
+
+
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "LIQUIDATION": _fmt_liquidation,
     "KNOCKOUT": _fmt_knockout,
     "ORDER_FILLED": _fmt_order_filled,
     "SEASON_RESULT": _fmt_season_result,
     "ACCOUNT_SUSPENDED": _fmt_account_suspended,
+    "BADGE_EARNED": _fmt_badge_earned,
+    "IPO_SETTLED": _fmt_ipo_settled,
 }
 
 

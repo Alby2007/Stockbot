@@ -370,6 +370,12 @@ async def test_iceberg_shows_display_qty_but_fills_full_size(
         amount=10_000_000,
         reason="TEST_TOPUP",
     )
+    # Iceberg display is a paid unlock (0041).
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO entitlements (user_id, item_key) "
+            "VALUES (3021, 'order_iceberg')"
+        )
     ticker = await _first_ticker(conn)
     mark = await _quoted(conn, ticker)
 
@@ -409,6 +415,11 @@ async def test_iceberg_shows_display_qty_but_fills_full_size(
 
 async def test_place_order_rejects_bad_display_qty(conn: AsyncConnection) -> None:
     await bootstrap_user(conn, 3022)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO entitlements (user_id, item_key) "
+            "VALUES (3022, 'order_iceberg')"
+        )
     ticker = await _first_ticker(conn)
     mark = await _quoted(conn, ticker)
     with pytest.raises(ValueError):

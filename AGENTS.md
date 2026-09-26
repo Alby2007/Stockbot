@@ -977,3 +977,35 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   adds a dumb global throttle (10 cmds / 10s / user, in-memory deque) --
   catches scripted bursts across all commands, not just the expensive
   one.
+- **Currency sinks** (0040-0042): `shop_items.kind` now spans
+  SLOT/ANALYST_TOOL/COSMETIC/TROPHY/MARGIN_TIER/BADGE/ORDER_TYPE.
+  Grant-only kinds (TROPHY, BADGE, price_minor NULL) are filtered from
+  `/shop list` and the buy autocomplete; `buy_item` rejects NULL-price
+  rows. Milestone badges grant in `evaluate_badges` (status/service.py) --
+  a day-boundary batch pass alongside `snapshot_net_worth_if_due` in BOTH
+  apply_tick branches; thresholds live in `shop_items.metadata`
+  ({"metric","threshold_minor"|"threshold"}) and grants ride
+  `entitlements`' PK as the idempotency key, DMing via BADGE_EARNED.
+  ORDER_TYPE unlocks gate at `place_order` (iceberg=display_qty is now
+  paid, `order_trailing` for trail_amount, `order_oco` via place_oco);
+  a resting order survives its entitlement lapsing.
+  `orders.trail_amount` drives `_ratchet_trailing_stops` once per tick at
+  the top of `match_orders` (before `_trigger_due_stops`, NOT in the
+  cascade loop -- same-tick fills must not re-anchor it); SELL trails
+  ratchet up to mark-trail only, BUY mirrors, grid-snapped and biased one
+  tick AWAY from the mark so a sub-tick trail can't park the stop on the
+  mark and self-trigger; trail+limit is rejected (no trailing stop-limit).
+  `orders.oco_group` links a `/order bracket` pair; `_cancel_oco_siblings`
+  fires on every single-leg terminal transition (cross fill, MM fill,
+  manual cancel, expiry sweep, fill_failures strike-out) -- scoped sweeps
+  (season close, delist, user disable) already take both legs in one
+  UPDATE. IPOs (ipo/service.py): `create_offering` wraps `add_instrument`
+  then flips is_active=FALSE -- dormant instruments are invisible to the
+  engine/candles/events until settlement; `subscribe` escrows cash into
+  the IPO_ESCROW system account (SYSTEM_ACCOUNTS allowlist in
+  ledger/service.py must include it); `settle_due` in apply_tick's
+  lifecycle block allocates pro-rata-by-commitment capped at affordability
+  (largest-remainder dust pass), burns proceeds escrow->SINK, refunds the
+  excess, upserts positions at offer avg_cost, and activates the listing.
+  Zero subscriptions -> CANCELLED, instrument stays dormant. `/ipo list`
+  + `/ipo subscribe` user-side; `/admin ipo-create`.

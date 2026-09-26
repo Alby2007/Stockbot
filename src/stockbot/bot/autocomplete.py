@@ -189,7 +189,10 @@ async def shop_item_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:
     async with db.connection() as conn, conn.cursor() as cursor:
-        await cursor.execute("SELECT key FROM shop_items ORDER BY key")
+        await cursor.execute(
+            "SELECT key FROM shop_items WHERE price_minor IS NOT NULL "
+            "OR key IN ('slot', 'margin_tier') ORDER BY key"
+        )
         keys = [str(r[0]) for r in await cursor.fetchall()]
     cur = current.strip().lower()
     return [

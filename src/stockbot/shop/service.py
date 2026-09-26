@@ -202,6 +202,9 @@ async def buy_item(
             item = await cur.fetchone()
         if item is None:
             raise UnknownItemError(item_key)
+        if item["price_minor"] is None:
+            # Grant-only catalog rows (badges, trophies) aren't purchasable.
+            raise UnknownItemError(item_key)
 
         account_id = await get_user_account_id(conn, user_id)
 

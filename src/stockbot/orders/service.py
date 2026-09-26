@@ -88,6 +88,50 @@ class OrderResult:
     order_type: OrderType = "LIMIT"
     stop_price: Decimal | None = None
     display_qty: int | None = None
+    trail_amount: Decimal | None = None
+
+
+async def _require_entitlement(
+    conn: AsyncConnection, user_id: int, item_key: str
+) -> None:
+    """Gate for paid order-type unlocks (shop_items kind='ORDER_TYPE').
+    Raw SQL rather than a shop import: the entitlement check is one row."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT 1 FROM entitlements
+            WHERE user_id = %s AND item_key = %s
+              AND (expires_at IS NULL OR expires_at > now())
+            """,
+            (user_id, item_key),
+        )
+        if await cur.fetchone() is None:
+            raise TradingError(
+                f"`{item_key}` is a paid unlock — buy it in `/shop list` first."
+            )
+
+
+async def _cancel_oco_siblings(conn: AsyncConnection, order_ids: list[int]) -> int:
+    """One-cancels-other: when any leg of an oco_group goes terminal
+    (filled, cancelled, expired, struck out on fill_failures), its
+    still-open siblings die with it -- that IS the contract. Sweeps that
+    cancel whole scopes at once (season close, delist, user suspension)
+    already take both legs in one UPDATE; the per-order paths route here.
+    """
+    if not order_ids:
+        return 0
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE orders SET status = 'CANCELLED'
+            WHERE status = 'OPEN' AND oco_group IN (
+                SELECT oco_group FROM orders
+                WHERE id = ANY(%s) AND oco_group IS NOT NULL
+            )
+            """,
+            (list(order_ids),),
+        )
+        return cur.rowcount
 
 
 async def _current_tick(conn: AsyncConnection) -> int | None:
@@ -111,6 +155,7 @@ async def place_order(
     stop_price: Decimal | None = None,
     display_qty: int | None = None,
     allow_short: bool = False,
+    trail_amount: Decimal | None = None,
 ) -> OrderResult:
     """Validate and rest an order. Marketability/margin are re-checked at
     fill time; placement only rejects structurally bad orders.
@@ -120,6 +165,10 @@ async def place_order(
     `display_qty` caps the size shown in the /stock depth ladder (an
     iceberg): the matcher still works the real remaining quantity, and
     the visible slice refills until the order drains.
+
+    `trail_amount` (paid unlock) makes a pure STOP trailing: with no
+    explicit stop_price the initial stop anchors one trail-width off the
+    mark, then `_ratchet_trailing_stops` chases the mark each tick.
 
     `allow_short` is the N4 oversell opt-in: a SELL without it is
     clamped to the seller's position at fill time (the unbacked part
@@ -133,8 +182,15 @@ async def place_order(
         raise ValueError("stop price must be positive")
     if display_qty is not None and not 0 < display_qty <= quantity:
         raise ValueError("display quantity must be between 1 and the order quantity")
+    if trail_amount is not None:
+        if trail_amount <= 0:
+            raise ValueError("trail amount must be positive")
+        if limit_price is not None:
+            raise ValueError(
+                "trailing is only supported on pure stop orders (no limit)"
+            )
     order_type: OrderType
-    if stop_price is None:
+    if stop_price is None and trail_amount is None:
         if limit_price is None:
             raise ValueError("need a limit price, a stop price, or both")
         order_type = "LIMIT"
@@ -147,6 +203,12 @@ async def place_order(
             await record_idempotency_key(conn, interaction_id)
         await assert_feature_enabled(conn, "orders.enabled", "order placement")
         await assert_market_open(conn)
+        # Paid order-type unlocks (0041): gated at placement; a resting
+        # order keeps working even if the entitlement later lapses.
+        if display_qty is not None:
+            await _require_entitlement(conn, user_id, "order_iceberg")
+        if trail_amount is not None:
+            await _require_entitlement(conn, user_id, "order_trailing")
         await cur.execute(
             "SELECT id, is_active, quoted_price, next_halting_event_tick "
             "FROM instruments WHERE ticker = %s",
@@ -162,6 +224,19 @@ async def place_order(
         # fills print on, so a displayed quote is always attainable.
         tick_cfg = await spread_config(conn)
         tick_grid = Decimal(str(engine.tick_size(float(row[2]), tick_cfg)))
+        if trail_amount is not None and stop_price is None:
+            # Trail-only stop: anchor the initial stop one trail-width off
+            # the mark; the per-tick ratchet takes it from there.
+            mark = Decimal(row[2])
+            raw_stop = (
+                mark - trail_amount if side == "SELL" else mark + trail_amount
+            )
+            if raw_stop <= 0:
+                raise ValueError(
+                    "trail amount is wider than the mark — the stop would "
+                    "anchor at zero"
+                )
+            stop_price = raw_stop
         if limit_price is not None:
             limit_price = (
                 Decimal(str(limit_price)) / tick_grid
@@ -201,8 +276,8 @@ async def place_order(
             INSERT INTO orders
                 (user_id, instrument_id, season_id, side, quantity,
                  limit_price, opened_tick, expires_tick, order_type, stop_price,
-                 display_qty, allow_short)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 display_qty, allow_short, trail_amount)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
@@ -218,6 +293,7 @@ async def place_order(
                 stop_price,
                 display_qty,
                 allow_short,
+                trail_amount,
             ),
         )
         order_row = await cur.fetchone()
@@ -234,11 +310,80 @@ async def place_order(
         order_type=order_type,
         stop_price=stop_price,
         display_qty=display_qty,
+        trail_amount=trail_amount,
     )
 
 
+async def place_oco(
+    conn: AsyncConnection,
+    *,
+    user_id: int,
+    ticker: str,
+    side: Side,
+    quantity: int,
+    take_profit: Decimal,
+    stop_price: Decimal,
+    season_id: int | None = None,
+    expires_in_ticks: int | None = None,
+    interaction_id: str | None = None,
+    allow_short: bool = False,
+) -> tuple[OrderResult, OrderResult]:
+    """Rest a one-cancels-other bracket: a take-profit LIMIT leg plus a
+    stop-loss STOP leg sharing an `oco_group` (the take-profit leg's id).
+    Whichever leg resolves first -- fill, cancel, expiry, strike-out --
+    cancels the other via `_cancel_oco_siblings`.
+
+    SELL exits a long (take_profit above, stop below); BUY exits a short
+    (mirrored). Placement validates only that the pair isn't self-crossed;
+    position fit is checked at fill time like every other order.
+    """
+    if take_profit <= 0 or stop_price <= 0:
+        raise ValueError("bracket prices must be positive")
+    if side == "SELL" and take_profit <= stop_price:
+        raise ValueError("a SELL bracket needs take_profit above stop_loss")
+    if side == "BUY" and take_profit >= stop_price:
+        raise ValueError("a BUY bracket needs take_profit below stop_loss")
+    async with conn.transaction():
+        # One key for the pair: a redelivered interaction must not rest a
+        # second bracket. The inner place_order calls get None -- the outer
+        # claim is what makes the whole pair atomic.
+        if interaction_id is not None:
+            await record_idempotency_key(conn, interaction_id)
+        await _require_entitlement(conn, user_id, "order_oco")
+        tp_leg = await place_order(
+            conn,
+            user_id=user_id,
+            ticker=ticker,
+            side=side,
+            quantity=quantity,
+            limit_price=take_profit,
+            season_id=season_id,
+            expires_in_ticks=expires_in_ticks,
+            allow_short=allow_short,
+        )
+        sl_leg = await place_order(
+            conn,
+            user_id=user_id,
+            ticker=ticker,
+            side=side,
+            quantity=quantity,
+            limit_price=None,
+            stop_price=stop_price,
+            season_id=season_id,
+            expires_in_ticks=expires_in_ticks,
+            allow_short=allow_short,
+        )
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE orders SET oco_group = %s WHERE id IN (%s, %s)",
+                (tp_leg.order_id, tp_leg.order_id, sl_leg.order_id),
+            )
+    return tp_leg, sl_leg
+
+
 async def cancel_order(conn: AsyncConnection, *, user_id: int, order_id: int) -> bool:
-    """Cancel an open order owned by `user_id`. Returns False if not found."""
+    """Cancel an open order owned by `user_id`. Returns False if not found.
+    Cancelling one OCO leg cancels its sibling -- one decision, one pair."""
     async with conn.transaction(), conn.cursor() as cur:
         await cur.execute(
             """
@@ -247,7 +392,10 @@ async def cancel_order(conn: AsyncConnection, *, user_id: int, order_id: int) ->
             """,
             (order_id, user_id),
         )
-        return cur.rowcount > 0
+        cancelled = cur.rowcount > 0
+        if cancelled:
+            await _cancel_oco_siblings(conn, [order_id])
+        return cancelled
 
 
 async def list_open_orders(
@@ -258,7 +406,8 @@ async def list_open_orders(
             """
             SELECT o.id, i.ticker, o.side, o.quantity, o.filled_quantity,
                    o.limit_price, o.order_type, o.stop_price, o.triggered_tick,
-                   o.display_qty, i.quoted_price, o.expires_tick, o.created_at
+                   o.display_qty, o.trail_amount, o.oco_group,
+                   i.quoted_price, o.expires_tick, o.created_at
             FROM orders o
             JOIN instruments i ON i.id = o.instrument_id
             WHERE o.user_id = %s AND o.status = 'OPEN'
@@ -463,6 +612,8 @@ async def _settle_cross(
                 # 'CANCELLED'. Roll back the whole cross via the savepoint.
                 raise ValueError(f"order {order['id']} is no longer open")
             if updated[0] == "FILLED":
+                # OCO: the filled leg going terminal kills its sibling.
+                await _cancel_oco_siblings(conn, [int(order["id"])])
                 await cur.execute(
                     """
                     INSERT INTO notifications (user_id, kind, payload)
@@ -547,6 +698,65 @@ async def _trigger_due_stops(conn: AsyncConnection, tick_index: int) -> int:
         return cur.rowcount
 
 
+async def _ratchet_trailing_stops(conn: AsyncConnection) -> int:
+    """Trailing-stop ratchet, once per tick BEFORE the trigger sweep: a
+    SELL trail lifts its stop toward mark - trail_amount (only ever up),
+    a BUY trail lowers its toward mark + trail_amount (only ever down).
+
+    The new stop snaps to the tick grid like a placed price, biased one
+    grid step AWAY from the mark -- a sub-tick trail can never park the
+    stop on the mark and self-trigger. Untriggered orders only (a
+    triggered stop already converted). Rows are few (paid unlock), so a
+    per-order loop beats SQLizing the 1-2-5 grid."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT o.id, o.side, o.stop_price, o.trail_amount, i.quoted_price
+            FROM orders o
+            JOIN instruments i ON i.id = o.instrument_id
+            WHERE o.status = 'OPEN' AND o.triggered_tick IS NULL
+              AND o.order_type = 'STOP' AND o.trail_amount IS NOT NULL
+              AND i.is_active
+            """
+        )
+        rows = await cur.fetchall()
+    if not rows:
+        return 0
+    spread_cfg = await spread_config(conn)
+    moved = 0
+    async with conn.cursor() as cur:
+        for order in rows:
+            mark = float(order["quoted_price"])
+            grid = engine.tick_size(mark, spread_cfg)
+            raw = (
+                mark - float(order["trail_amount"])
+                if order["side"] == "SELL"
+                else mark + float(order["trail_amount"])
+            )
+            snapped = engine.round_to_tick(raw, grid)
+            if order["side"] == "SELL" and snapped >= mark:
+                snapped -= grid
+            elif order["side"] == "BUY" and snapped <= mark:
+                snapped += grid
+            if snapped <= 0:
+                continue
+            new_stop = Decimal(str(round(snapped, 6)))
+            old_stop = Decimal(order["stop_price"])
+            improves = (
+                (order["side"] == "SELL" and new_stop > old_stop)
+                or (order["side"] == "BUY" and new_stop < old_stop)
+            )
+            if not improves:
+                continue
+            await cur.execute(
+                "UPDATE orders SET stop_price = %s "
+                "WHERE id = %s AND status = 'OPEN'",
+                (new_stop, int(order["id"])),
+            )
+            moved += cur.rowcount
+    return moved
+
+
 async def match_orders(
     conn: AsyncConnection,
     tick_index: int,
@@ -586,9 +796,13 @@ async def match_orders(
             UPDATE orders SET status = 'EXPIRED'
             WHERE status = 'OPEN' AND expires_tick IS NOT NULL
               AND expires_tick <= %s
+            RETURNING id
             """,
             (tick_index,),
         )
+        expired_ids = [int(r[0]) for r in await cur.fetchall()]
+    # OCO legs share an expiry, but a stale one-sided group still cleans up.
+    await _cancel_oco_siblings(conn, expired_ids)
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             "SELECT key, value FROM config WHERE key IN "
@@ -615,6 +829,10 @@ async def match_orders(
     # re-anchored the next collar check to the print it just made).
     open_marks: dict[int, float] = {}
     fills = 0
+    # Trailing stops re-anchor off this tick's mark before triggers
+    # evaluate -- the ratchet runs once per tick, not per cascade pass, so
+    # same-tick fills can't chase a stop upward and re-trigger it.
+    await _ratchet_trailing_stops(conn)
     triggered = await _trigger_due_stops(conn, tick_index)
     if stats is not None:
         stats["stops_triggered"] += triggered
@@ -1176,6 +1394,9 @@ async def _match_once(
                             f"order {order['id']} is no longer open"
                         )
                     if updated[0] == "FILLED":
+                        # OCO: the filled leg going terminal kills its
+                        # sibling.
+                        await _cancel_oco_siblings(conn, [int(order["id"])])
                         # MM fallback: the order's counterparty is always
                         # the market maker -- this side is always taker.
                         await cur.execute(
@@ -1227,9 +1448,15 @@ async def _match_once(
                             WHEN fill_failures + 1 >= %s THEN 'CANCELLED'
                             ELSE status END
                     WHERE id = %s
+                    RETURNING status
                     """,
                     (max_fill_failures, order["id"]),
                 )
+                struck = await cur.fetchone()
+                if struck is not None and struck[0] == "CANCELLED":
+                    # Strike-out is terminal too: an OCO leg that can
+                    # never fill can't leave its sibling trading alone.
+                    await _cancel_oco_siblings(conn, [int(order["id"])])
             continue
 
     return fills
