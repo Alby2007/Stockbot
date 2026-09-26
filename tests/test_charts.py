@@ -369,29 +369,78 @@ def test_axis_formatter_ticks_mode() -> None:
 
 
 def test_session_boundaries_detects_compressed_gap() -> None:
-    """An open-open tick jump (compressed overnight/halt) draws a
-    separator at the gap's left edge."""
-    assert charts._session_boundaries([100, 101, 102, 580, 581], 1) == [2.5]
+    """An open-open tick jump (compressed overnight/halt) returns the
+    index of the first candle after the gap (drawn at i - 0.5)."""
+    assert charts._session_boundaries(
+        [100, 101, 102, 580, 581], [None] * 5, 1
+    ) == [3]
 
 
 def test_session_boundaries_none_when_contiguous() -> None:
-    assert charts._session_boundaries([10, 11, 12, 13], 1) == []
-    assert charts._session_boundaries([], 1) == []
-    assert charts._session_boundaries([7], 1) == []
+    assert charts._session_boundaries([10, 11, 12, 13], [None] * 4, 1) == []
+    assert charts._session_boundaries([], [], 1) == []
+    assert charts._session_boundaries([7], [None], 1) == []
 
 
 def test_session_boundaries_respect_bucket() -> None:
     """Bucketed rows differ by `bucket` normally -- only bigger gaps are
     real boundaries."""
-    assert charts._session_boundaries([100, 104, 108], 4) == []
-    assert charts._session_boundaries([100, 104, 120], 4) == [1.5]
+    assert charts._session_boundaries([100, 104, 108], [None] * 3, 4) == []
+    assert charts._session_boundaries([100, 104, 120], [None] * 3, 4) == [2]
 
 
 def test_session_boundaries_closed_tail_is_not_a_boundary() -> None:
     """The open->closed-tail transition is tick-adjacent (gap=1), so no
     separator -- the shading already marks it."""
     ticks = [956, 957, 958, 959, 960, 961, 962]
-    assert charts._session_boundaries(ticks, 1) == []
+    assert charts._session_boundaries(ticks, [None] * 7, 1) == []
+
+
+def test_session_boundaries_wall_clock_downtime() -> None:
+    """Contiguous tick_indexes can still hide a real gap: a restart /
+    deploy pause shows as a ts jump, not a tick jump. Flag deltas beyond
+    6x the median candle spacing (with a 10m floor)."""
+    from datetime import UTC, datetime, timedelta
+
+    t0 = datetime(2025, 1, 6, 14, 0, tzinfo=UTC)
+    times = [t0 + timedelta(minutes=i) for i in range(10)]
+    times[6] = t0 + timedelta(hours=9)  # ~8h downtime between i=5 and i=6
+    times[7:] = [t0 + timedelta(hours=9, minutes=i) for i in range(7, 10)]
+    # Contiguous ticks -> the tick-gap rule alone sees nothing.
+    assert charts._session_boundaries(list(range(10)), times, 1) == [6]
+    # All-None times -> tick-gap rule only, no crash.
+    assert charts._session_boundaries(list(range(10)), [None] * 10, 1) == []
+    # A gap when times are missing falls back to the tick test.
+    assert charts._session_boundaries(
+        list(range(5)) + [100], [None] * 6, 1
+    ) == [5]
+
+
+def test_gap_tag_formats_wall_duration() -> None:
+    """The boundary tag is the compressed span's wall-clock duration --
+    the cue that makes a same-day 07:17 -> 15:44 teleport read as an
+    8.5h session close instead of a rendering bug."""
+    from datetime import UTC, datetime, timedelta
+
+    t0 = datetime(2025, 1, 6, 15, 0, tzinfo=UTC)
+    assert charts._gap_tag(t0, t0 + timedelta(minutes=45), 10, 11) == "45m"
+    assert (
+        charts._gap_tag(t0, t0 + timedelta(hours=8, minutes=30), 10, 500)
+        == "8.5h"
+    )
+    assert charts._gap_tag(t0, t0 + timedelta(hours=8), 10, 500) == "8h"
+    assert charts._gap_tag(t0, t0 + timedelta(days=2), 10, 500) == "2d"
+
+
+def test_gap_tag_falls_back_to_ticks() -> None:
+    """No timestamps (synthetic candles) -> label by the tick span."""
+    from datetime import UTC, datetime
+
+    t0 = datetime(2025, 1, 6, 15, 0, tzinfo=UTC)
+    assert charts._gap_tag(None, None, 100, 580) == "480t"
+    assert charts._gap_tag(t0, None, 100, 580) == "480t"
+    # Non-positive wall gaps (clock skew) also fall back.
+    assert charts._gap_tag(t0, t0, 100, 580) == "480t"
 
 
 def test_span_label() -> None:

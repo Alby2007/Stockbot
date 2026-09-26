@@ -43,16 +43,58 @@ def _span_label(span: int) -> str:
     )
 
 
-def _session_boundaries(ticks: list[int], bucket: int) -> list[float]:
-    """Positions where consecutive candles' tick gap exceeds the bucket --
-    an open-phase discontinuity the ordinal axis compresses (overnight,
-    halt, missing data). Drawn as hairline separators so the compressed
-    jump is spatially legible. The closed tail has shading instead."""
-    return [
-        i - 0.5
+def _session_boundaries(
+    ticks: list[int], times: list[Any], bucket: int
+) -> list[int]:
+    """Candle indexes where an open-phase discontinuity was compressed by
+    the ordinal axis. Two kinds: the tick gap exceeds the bucket
+    (overnight, halt, missing rows), or the wall-clock gap exceeds 6x
+    the window's median candle spacing (service downtime between ticks
+    -- contiguous tick_indexes can still span days). Rendered at
+    `i - 0.5` with a `_gap_tag` duration label: a same-UTC-day close
+    teleports the axis (07:17 -> 15:44) and the `Mon DD` day labels only
+    fire across UTC dates, so without a legible boundary + duration the
+    compressed gap reads as a glitch. The closed tail has shading."""
+    bounds = {
+        i
         for i in range(1, len(ticks))
         if ticks[i] - ticks[i - 1] > bucket
+    }
+    # 10-minute floor: brief tick-cadence jitter isn't a "break"; real
+    # downtime and session closes are hours.
+    deltas = [
+        (times[i] - times[i - 1]).total_seconds()
+        for i in range(1, len(times))
+        if times[i] is not None and times[i - 1] is not None
     ]
+    spacing = sorted(d for d in deltas if d > 0)
+    if spacing:
+        threshold = max(spacing[len(spacing) // 2] * 6, 600.0)
+        bounds |= {
+            i
+            for i in range(1, len(times))
+            if times[i] is not None
+            and times[i - 1] is not None
+            and (times[i] - times[i - 1]).total_seconds() > threshold
+        }
+    return sorted(bounds)
+
+
+def _gap_tag(t_prev: Any, t_next: Any, tick_prev: int, tick_next: int) -> str:
+    """Label for a compressed boundary: the wall-clock gap when both
+    edges carry a market_ticks.ts ("45m"/"8.5h"/"2d"), else the tick
+    span. ts is NULL on candles with no market_ticks row."""
+    if t_prev is not None and t_next is not None:
+        secs = (t_next - t_prev).total_seconds()
+        if secs > 0:
+            if secs < 5400:
+                return f"{secs / 60:,.0f}m"
+            if secs < 129_600:
+                h = secs / 3600
+                return f"{h:.1f}h" if h % 1 else f"{int(h)}h"
+            d = secs / 86_400
+            return f"{d:.1f}d" if d % 1 else f"{int(d)}d"
+    return f"{tick_next - tick_prev}t"
 
 
 async def _select_window_rows(
@@ -304,9 +346,23 @@ def _render_png(
     bar_w, wick_lw = (0.8, 0.8) if n_bars <= 120 else (0.6, 0.6)
 
     # Session-boundary separators: open-open tick discontinuities the
-    # ordinal axis hides (overnights, halts) get a hairline marker.
-    for boundary in _session_boundaries(ticks, bucket):
-        ax.axvline(boundary, color=_SPINE, linestyle="--", linewidth=0.6)
+    # ordinal axis hides (overnights, halts, missing rows) get a visible
+    # dashed separator plus the compressed gap's duration. Without both,
+    # a same-day close teleports the axis (07:17 -> 15:44) with no cue
+    # and the reopen candle reads as a bad tick.
+    for i in _session_boundaries(ticks, times, bucket):
+        ax.axvline(i - 0.5, color=_MUTED, linestyle="--", linewidth=0.9)
+        ax.text(
+            i - 0.5,
+            price_hi + ypad,
+            _gap_tag(times[i - 1], times[i], ticks[i - 1], ticks[i]),
+            color=_TEXT,
+            fontsize=6,
+            ha="center",
+            va="top",
+            alpha=0.85,
+            bbox=dict(facecolor=_BG, edgecolor="none", alpha=0.8, pad=0.4),
+        )
 
     # Candlesticks: wick low->high, body over [min(o,c), |o-c|].
     vol_colors = []
