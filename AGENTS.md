@@ -242,6 +242,13 @@ is wrapped once at the end of `register_commands`
 `/admin order-cancel` (any OPEN order), `/admin recalc-balances`
 (rebuild the balance cache from SUM(ledger_entries) -- a rebuild that
 would go negative fails on the CHECK, which IS the signal).
+`ledger_entries` is trigger-guarded append-only
+(`ledger_entries_no_delete`/`_no_update`) — manual cleanup requires
+`ALTER TABLE ledger_entries DISABLE TRIGGER ledger_entries_no_delete`
+inside the transaction, deleting BOTH legs of every affected transfer_id
+(preserves sum-zero), then rebuilding `accounts.balance` from the ledger
+and re-enabling. Reverse-FK order for user deletion:
+insurance_fund_flows → wash_trade_flags → trades → … → accounts → users.
 `python -m stockbot.tools.doctor` checks migrations, advisory lock,
 tick staleness, ledger invariants, config bounds, index presence, and
 heartbeat freshness; `python -m stockbot.tools.replay --from N --to M`
