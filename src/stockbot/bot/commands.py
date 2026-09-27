@@ -58,6 +58,8 @@ from stockbot.bot.autocomplete import (
     tunable_param_autocomplete,
 )
 from stockbot.bot.chart_view import (
+    MAX_SPAN,
+    MAX_SPAN_PRO,
     TIMEFRAME_SPANS,
     build_chart_view,
     load_chart_prefs,
@@ -524,6 +526,16 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
             mcfg = await margin_config(conn)
             tick_now = await current_tick_index(conn)
+            # Pro Terminal: deeper stats gated on the entitlement (the
+            # analyst_tools ownership pattern from /calendar).
+            pro = await owns_item(conn, interaction.user.id, "pro_terminal")
+            pro_stats = (
+                await status_svc.pro_terminal_stats(
+                    conn, snapshot.id, tick_now or 0
+                )
+                if snapshot is not None and pro
+                else None
+            )
         if snapshot is None:
             await interaction.response.send_message(
                 f"No instrument found for `{ticker.upper()}`.", ephemeral=True
@@ -617,6 +629,41 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         embed.add_field(
             name="Short interest", value=si_line1 + "\n" + si_line2
         )
+        if pro_stats is not None:
+            if (
+                pro_stats.week_high is not None
+                and pro_stats.week_low is not None
+            ):
+                embed.add_field(
+                    name="7d range Ⓟ",
+                    value=(
+                        f"{format_price(pro_stats.week_low)} – "
+                        f"{format_price(pro_stats.week_high)}"
+                    ),
+                )
+            if pro_stats.realized_vol is not None:
+                embed.add_field(
+                    name="Realized vol Ⓟ",
+                    value=f"{pro_stats.realized_vol * 100:.2f}%/day",
+                )
+            embed.add_field(
+                name="24h flow Ⓟ",
+                value=(
+                    f"buy {format_money(pro_stats.buy_notional_24h)} · "
+                    f"sell {format_money(pro_stats.sell_notional_24h)}"
+                ),
+            )
+            embed.add_field(
+                name="ADV Ⓟ", value=f"{pro_stats.adv_shares:,.0f} shares/day"
+            )
+            if pro_stats.next_event_in is not None:
+                embed.add_field(
+                    name="Next event Ⓟ",
+                    value=(
+                        f"in ~{pro_stats.next_event_in} ticks "
+                        f"(~{pro_stats.next_event_in}min)"
+                    ),
+                )
         if snapshot.is_halted:
             embed.add_field(name="Status", value="Halted (circuit breaker)")
         elif snapshot.event_halted:
@@ -637,6 +684,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             app_commands.Choice(name="4 hours", value="4h"),
             app_commands.Choice(name="1 day", value="1d"),
             app_commands.Choice(name="1 week", value="1w"),
+            app_commands.Choice(name="2 weeks (Pro)", value="2w"),
+            app_commands.Choice(name="1 month (Pro)", value="1M"),
         ],
         axis=[
             app_commands.Choice(name="Time (UTC)", value="time"),
@@ -664,12 +713,24 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 )
                 return
             # Explicit args win and become the new saved view; absent
-            # args fall back to saved prefs, then system defaults.
-            prefs = await load_chart_prefs(conn, interaction.user.id)
+            # args fall back to saved prefs, then system defaults. Pro
+            # Terminal lifts the saved/requested span bound to 1M.
+            pro = await owns_item(conn, interaction.user.id, "pro_terminal")
+            prefs = await load_chart_prefs(
+                conn, interaction.user.id,
+                max_span=MAX_SPAN_PRO if pro else MAX_SPAN,
+            )
             if timeframe is None:
                 span = prefs[0] if prefs else 240
             else:
                 span = TIMEFRAME_SPANS.get(timeframe, 240)
+            if span > MAX_SPAN and not pro:
+                await interaction.followup.send(
+                    "The 2w and 1M spans need **Pro Terminal** — "
+                    "`/shop buy pro_terminal`.",
+                    ephemeral=True,
+                )
+                return
             if axis is None:
                 resolved_axis = prefs[1] if prefs else "time"
             else:

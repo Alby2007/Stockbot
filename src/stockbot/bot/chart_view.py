@@ -29,6 +29,7 @@ from psycopg import AsyncConnection
 
 from stockbot import db
 from stockbot.bot.charts import bucket_for_span, render_candle_chart
+from stockbot.shop.service import owns_item
 
 log = logging.getLogger("stockbot.bot.chart_view")
 
@@ -36,7 +37,12 @@ CHART_CID_PREFIX = "cbt:"
 
 MIN_SPAN = 30
 MAX_SPAN = 6720  # ~1 week of open ticks at session.open_ticks=960
-TIMEFRAME_SPANS = {"1h": 60, "4h": 240, "1d": 960, "1w": 4800}
+MAX_SPAN_PRO = 19200  # Pro Terminal bound: the 2w/1M spans
+TIMEFRAME_SPANS = {
+    "1h": 60, "4h": 240, "1d": 960, "1w": 4800,
+    "2w": 9600, "1M": 19200,
+}
+PRO_SPANS = {"2w", "1M"}  # TIMEFRAME_SPANS keys gated on pro_terminal
 
 _BUTTONS = [
     ("\u25c0 Older", "panl", 0),
@@ -48,6 +54,9 @@ _BUTTONS = [
     ("4H", "s240", 1),
     ("1D", "s960", 1),
     ("1W", "s4800", 1),
+    # Pro spans render for everyone -- a gated click advertises the tier.
+    ("2W", "s9600", 2),
+    ("1M", "s19200", 2),
 ]
 
 
@@ -314,7 +323,26 @@ async def _handle(interaction: discord.Interaction) -> None:
             new_end, new_span = end, span
             axis = "ticks" if axis == "time" else "time"
         else:
-            new_end, new_span = await next_window(conn, action, iid, end, span)
+            # Pro Terminal unlocks the 2w/1M presets and lifts the zoom
+            # bound -- resolved per CLICKER, not from the message (a
+            # shared chart can't repaint per-viewer, but span gating can).
+            pro = await owns_item(conn, interaction.user.id, "pro_terminal")
+            if (
+                not pro
+                and action.startswith("s")
+                and action[1:].isdigit()
+                and int(action[1:]) > MAX_SPAN
+            ):
+                await interaction.followup.send(
+                    "The 2w and 1M spans need **Pro Terminal** — "
+                    "`/shop buy pro_terminal`.",
+                    ephemeral=True,
+                )
+                return
+            new_end, new_span = await next_window(
+                conn, action, iid, end, span,
+                max_span=MAX_SPAN_PRO if pro else MAX_SPAN,
+            )
         # The click teaches the clicker's default view -- the next bare
         # /chart opens at this span+axis. Pan position isn't saved:
         # charts always open anchored at the latest tick.

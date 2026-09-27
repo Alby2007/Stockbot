@@ -80,7 +80,10 @@ def _span_label(span: int) -> str:
     """Human span for the title (trading-day-aware: 960 open ticks = one
     market day, 4800 = a week) -- replaces "N open ticks" insider speak.
     Odd zoom levels from the buttons fall back to tick counts."""
-    return {60: "1h", 240: "4h", 960: "1d", 4800: "1w"}.get(
+    return {
+        60: "1h", 240: "4h", 960: "1d", 4800: "1w",
+        9600: "2w", 19200: "1M",
+    }.get(
         span, f"~{span // 960}d" if span >= 960 else f"{span}t"
     )
 

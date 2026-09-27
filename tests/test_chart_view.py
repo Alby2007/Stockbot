@@ -120,7 +120,7 @@ async def test_next_window_unknown_action_is_noop(conn: AsyncConnection) -> None
 def test_build_chart_view_encodes_window() -> None:
     view = build_chart_view(21, 1528, 240)
     buttons = [c for c in view.children if isinstance(c, discord.ui.Button)]
-    assert len(buttons) == 10
+    assert len(buttons) == 12
     parsed = [parse_cid(str(b.custom_id)) for b in buttons]
     assert all(
         p is not None and p[1:] == (21, 1528, 240, "time", None)
@@ -136,6 +136,8 @@ def test_build_chart_view_encodes_window() -> None:
         "s240",
         "s960",
         "s4800",
+        "s9600",
+        "s19200",
         "ax",
     }
 

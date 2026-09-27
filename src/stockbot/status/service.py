@@ -369,6 +369,81 @@ async def profile_stats(conn: AsyncConnection, user_id: int) -> ProfileStats | N
     )
 
 
+@dataclass(frozen=True)
+class ProTerminalStats:
+    """Pro Terminal gated /stock fields. All values may be None on thin
+    history -- the command renders what exists."""
+    week_high: float | None
+    week_low: float | None
+    realized_vol: float | None   # σ of daily close-to-close returns, 7d
+    buy_notional_24h: int        # minor units
+    sell_notional_24h: int
+    adv_shares: float            # average daily volume, raw shares
+    next_event_in: int | None    # ticks until the next scheduled event
+
+
+async def pro_terminal_stats(
+    conn: AsyncConnection, instrument_id: int, tick_now: int
+) -> ProTerminalStats:
+    """Two grouped queries over the trailing 7d/24h windows. Candles are
+    per-tick rows; the daily-close vol buckets by day_index (tick/1440)."""
+    day_ticks = 1440
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            WITH daily AS (
+                SELECT DISTINCT ON (tick_index / 1440)
+                       tick_index / 1440 AS d, close
+                FROM candles
+                WHERE instrument_id = %s AND tick_index > %s
+                ORDER BY tick_index / 1440, tick_index DESC
+            ), rets AS (
+                SELECT close / NULLIF(lag(close) OVER (ORDER BY d), 0) - 1
+                       AS r
+                FROM daily
+            )
+            SELECT STDDEV_SAMP(r) FROM rets WHERE r IS NOT NULL
+            """,
+            (instrument_id, tick_now - 7 * day_ticks),
+        )
+        vol_row = await cur.fetchone()
+        await cur.execute(
+            """
+            SELECT MAX(high), MIN(low) FROM candles
+            WHERE instrument_id = %s AND tick_index > %s
+            """,
+            (instrument_id, tick_now - 7 * day_ticks),
+        )
+        range_row = await cur.fetchone()
+        await cur.execute(
+            """
+            SELECT COALESCE(SUM(notional_minor) FILTER (WHERE side = 'BUY'), 0),
+                   COALESCE(SUM(notional_minor) FILTER (WHERE side = 'SELL'), 0)
+            FROM trades
+            WHERE instrument_id = %s AND tick_index > %s
+            """,
+            (instrument_id, tick_now - day_ticks),
+        )
+        flow_row = await cur.fetchone()
+        await cur.execute(
+            "SELECT adv, next_event_tick FROM instruments WHERE id = %s",
+            (instrument_id,),
+        )
+        inst_row = await cur.fetchone()
+    next_in = None
+    if inst_row and inst_row[1] is not None:
+        next_in = max(0, int(inst_row[1]) - tick_now)
+    return ProTerminalStats(
+        week_high=float(range_row[0]) if range_row and range_row[0] else None,
+        week_low=float(range_row[1]) if range_row and range_row[1] else None,
+        realized_vol=float(vol_row[0]) if vol_row and vol_row[0] else None,
+        buy_notional_24h=int(flow_row[0]) if flow_row else 0,
+        sell_notional_24h=int(flow_row[1]) if flow_row else 0,
+        adv_shares=float(inst_row[0]) if inst_row else 0.0,
+        next_event_in=next_in,
+    )
+
+
 async def equipped_flair_map(
     conn: AsyncConnection, user_ids: list[int]
 ) -> dict[int, str]:
