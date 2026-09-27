@@ -19,7 +19,12 @@ from stockbot.ledger.service import (
     record_idempotency_key,
 )
 from stockbot.margin import service as margin
-from stockbot.shop.errors import AlreadyOwnedError, UnknownItemError
+from stockbot.shop.errors import (
+    AlreadyOwnedError,
+    NotEquippableError,
+    NotOwnedError,
+    UnknownItemError,
+)
 
 BASE_SLOTS = 5
 SLOT_BASE_PRICE_MINOR = 500
@@ -310,9 +315,68 @@ async def buy_item(
                     (user_id, item_key),
                 )
 
-        # Themes "just work": buying one equips it immediately. /equip
-        # switches back to another owned theme or the default.
-        if is_theme_item(str(item["kind"]), item["metadata"]):
+        # Equippables "just work": buying one equips it immediately.
+        # /equip switches slots; /unequip clears them.
+        if item["kind"] == "TITLE":
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE users SET equipped_title = %s WHERE id = %s",
+                    (item_key, user_id),
+                )
+        elif is_theme_item(str(item["kind"]), item["metadata"]):
             await equip_theme(conn, user_id, item_key)
 
     return price
+
+
+async def equip_item(
+    conn: AsyncConnection, user_id: int, item_key: str
+) -> str:
+    """Equip an owned item into its slot; returns the slot name
+    ('title' | 'theme'). kind->slot routing: TITLE -> users.equipped_title,
+    COSMETIC-with-palette -> chart_prefs.theme."""
+    async with conn.transaction():
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT kind, metadata FROM shop_items WHERE key = %s",
+                (item_key,),
+            )
+            item = await cur.fetchone()
+        if item is None:
+            raise UnknownItemError(item_key)
+        if not await owns_item(conn, user_id, item_key):
+            raise NotOwnedError(item_key)
+
+        if item["kind"] == "TITLE":
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE users SET equipped_title = %s WHERE id = %s",
+                    (item_key, user_id),
+                )
+            return "title"
+        if is_theme_item(str(item["kind"]), item["metadata"]):
+            await equip_theme(conn, user_id, item_key)
+            return "theme"
+        raise NotEquippableError(item_key)
+
+
+async def unequip(conn: AsyncConnection, user_id: int, slot: str) -> bool:
+    """Clear an equip slot ('title' | 'theme'); returns whether anything
+    was equipped."""
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            if slot == "title":
+                await cur.execute(
+                    "UPDATE users SET equipped_title = NULL "
+                    "WHERE id = %s AND equipped_title IS NOT NULL",
+                    (user_id,),
+                )
+            elif slot == "theme":
+                await cur.execute(
+                    "UPDATE chart_prefs SET theme = NULL, updated_at = now() "
+                    "WHERE user_id = %s AND theme IS NOT NULL",
+                    (user_id,),
+                )
+            else:
+                raise NotEquippableError(slot)
+            return cur.rowcount > 0

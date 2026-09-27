@@ -292,20 +292,29 @@ class ProfileStats:
     lifetime_volume_minor: int
     quests_completed: int
     trophies: list[str]
+    title: str | None
     active_season_equity_minor: int | None
 
 
 async def profile_stats(conn: AsyncConnection, user_id: int) -> ProfileStats | None:
     async with conn.cursor() as cur:
         await cur.execute(
-            "SELECT created_at, total_traded_minor, quests_completed "
-            "FROM users WHERE id = %s",
+            """
+            SELECT u.created_at, u.total_traded_minor, u.quests_completed,
+                   s.name, s.metadata->>'emoji'
+            FROM users u
+            LEFT JOIN shop_items s ON s.key = u.equipped_title
+            WHERE u.id = %s
+            """,
             (user_id,),
         )
         row = await cur.fetchone()
     if row is None:
         return None
-    created_at, total_traded, quests_completed = row
+    created_at, total_traded, quests_completed, title_name, title_emoji = row
+    title = (
+        f"{title_emoji} {title_name}" if title_emoji else title_name
+    ) if title_name else None
 
     equity = await net_worth_minor(conn, user_id)
     rank_row = await user_rank(conn, user_id)
@@ -313,14 +322,17 @@ async def profile_stats(conn: AsyncConnection, user_id: int) -> ProfileStats | N
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            SELECT s.name FROM entitlements e
+            SELECT s.name, s.metadata->>'emoji' FROM entitlements e
             JOIN shop_items s ON s.key = e.item_key
             WHERE e.user_id = %s AND s.kind IN ('TROPHY', 'BADGE')
             ORDER BY e.item_key
             """,
             (user_id,),
         )
-        trophies = [r[0] for r in await cur.fetchall()]
+        trophies = [
+            f"{r[1]} {r[0]}" if r[1] else str(r[0])
+            for r in await cur.fetchall()
+        ]
 
     async with conn.cursor() as cur:
         await cur.execute(
@@ -352,8 +364,34 @@ async def profile_stats(conn: AsyncConnection, user_id: int) -> ProfileStats | N
         lifetime_volume_minor=int(total_traded),
         quests_completed=int(quests_completed),
         trophies=trophies,
+        title=title,
         active_season_equity_minor=active_equity,
     )
+
+
+async def equipped_flair_map(
+    conn: AsyncConnection, user_ids: list[int]
+) -> dict[int, str]:
+    """{user_id: "emoji + title"} for users with an equipped title --
+    one IN() query joining users.equipped_title to the shop row for
+    name+emoji. Feeds the leaderboard board, /leaderboard, /whois."""
+    if not user_ids:
+        return {}
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT u.id, s.name, s.metadata->>'emoji'
+            FROM users u
+            JOIN shop_items s ON s.key = u.equipped_title
+            WHERE u.id = ANY(%s)
+            """,
+            (user_ids,),
+        )
+        rows = await cur.fetchall()
+    return {
+        int(r[0]): f"{r[2]} {r[1]}" if r[2] else str(r[1])
+        for r in rows
+    }
 
 
 @dataclass(frozen=True)

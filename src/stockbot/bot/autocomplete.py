@@ -12,6 +12,7 @@ import time
 
 import discord
 from discord import app_commands
+from psycopg.rows import dict_row
 
 from stockbot import db
 from stockbot.admin.service import TUNABLE_PARAMS
@@ -227,6 +228,35 @@ async def shop_item_autocomplete(
         app_commands.Choice(name=k, value=k)
         for k in keys
         if not cur or k.startswith(cur)
+    ][:MAX_CHOICES]
+
+
+async def equipped_item_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Owned equippables: TITLEs plus COSMETICs carrying a theme palette."""
+    from stockbot.shop.service import is_theme_item
+
+    async with db.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT s.key, s.name, s.kind, s.metadata
+            FROM entitlements e
+            JOIN shop_items s ON s.key = e.item_key
+            WHERE e.user_id = %s
+              AND (e.expires_at IS NULL OR e.expires_at > now())
+              AND (s.kind = 'TITLE' OR s.kind = 'COSMETIC')
+            ORDER BY s.kind, s.key
+            """,
+            (interaction.user.id,),
+        )
+        rows = await cur.fetchall()
+    cur_s = current.strip().lower()
+    return [
+        app_commands.Choice(name=f"{r['key']} — {r['name']}", value=str(r["key"]))
+        for r in rows
+        if r["kind"] == "TITLE" or is_theme_item(str(r["kind"]), r["metadata"])
+        if not cur_s or str(r["key"]).startswith(cur_s)
     ][:MAX_CHOICES]
 
 

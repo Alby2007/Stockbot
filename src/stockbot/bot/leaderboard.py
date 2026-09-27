@@ -45,15 +45,19 @@ def leaderboard_embed(
     *,
     limit: int = BOARD_LIMIT,
     caller: LeaderboardRow | None = None,
+    flair: dict[int, str] | None = None,
 ) -> discord.Embed:
     """Shared renderer for `/leaderboard` and the persistent boards --
-    `rank. <@uid>  $equity` lines plus an `Updated HH:MM UTC` footer so
-    the board's freshness is legible. `caller` appends a "You: rank N"
-    note for the command surface (boards pass None)."""
+    `rank. <@uid> · title  $equity` lines plus an `Updated HH:MM UTC`
+    footer so the board's freshness is legible. `caller` appends a
+    "You: rank N" note for the command surface (boards pass None);
+    `flair` is {user_id: equipped-title string}."""
     embed = discord.Embed(title="Leaderboard — net worth")
     if rows:
         embed.description = "\n".join(
-            f"{r.rank:>3}. <@{r.user_id}>  {format_money(r.equity_minor):>14}"
+            f"{r.rank:>3}. <@{r.user_id}>"
+            + (f" · {flair[r.user_id]}" if flair and r.user_id in flair else "")
+            + f"  {format_money(r.equity_minor):>14}"
             for r in rows[:limit]
         )
     else:
@@ -119,7 +123,10 @@ async def post_leaderboard_board(
     pin it (pinning is best-effort). Used by /leaderboard-setup so the
     board lands the moment the channel is bound."""
     rows = await status_svc.leaderboard(conn)
-    message = await channel.send(embed=leaderboard_embed(rows))
+    flair = await status_svc.equipped_flair_map(
+        conn, [r.user_id for r in rows[:BOARD_LIMIT]]
+    )
+    message = await channel.send(embed=leaderboard_embed(rows, flair=flair))
     await _store_message_id(conn, guild_id, message.id)
     try:
         await message.pin()
@@ -146,13 +153,19 @@ async def sync_leaderboard_boards(client: Any) -> None:
         if not bindings:
             return
         rows = await status_svc.leaderboard(conn)
-    embed = leaderboard_embed(rows)
-    # Hash the ranking, not the embed -- the `Updated HH:MM` footer would
-    # change every minute and make the skip worthless. Flat overnight
-    # boards should genuinely cost zero REST calls.
+        flair = await status_svc.equipped_flair_map(
+            conn, [r.user_id for r in rows[:BOARD_LIMIT]]
+        )
+    embed = leaderboard_embed(rows, flair=flair)
+    # Hash the ranking + flair, not the embed -- the `Updated HH:MM`
+    # footer would change every minute and make the skip worthless. Flair
+    # belongs in the digest: equipping a title must repaint the board.
     digest = hashlib.sha256(
         json.dumps(
-            [(r.user_id, r.equity_minor) for r in rows[:BOARD_LIMIT]]
+            [
+                (r.user_id, r.equity_minor, flair.get(r.user_id))
+                for r in rows[:BOARD_LIMIT]
+            ]
         ).encode()
     ).hexdigest()
 

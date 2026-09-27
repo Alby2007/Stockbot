@@ -48,6 +48,7 @@ from stockbot.alerts.service import cancel_alert, create_alert, list_alerts
 from stockbot.bot.autocomplete import (
     admin_order_autocomplete,
     alert_autocomplete,
+    equipped_item_autocomplete,
     order_autocomplete,
     sector_autocomplete,
     shop_item_autocomplete,
@@ -122,11 +123,15 @@ from stockbot.shop.service import (
     BASE_SLOTS,
     MARGIN_TIER_PRICES_MINOR,
     buy_item,
+    equip_item,
     get_slot_count,
     get_user_entitlements,
     list_items,
     owns_item,
     slot_price,
+)
+from stockbot.shop.service import (
+    unequip as unequip_item,
 )
 from stockbot.shorts.service import (
     cover_bounded_short,
@@ -938,11 +943,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         async with db.connection() as conn:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
             rows = await status_svc.leaderboard(conn)
+            flair = await status_svc.equipped_flair_map(
+                conn, [r.user_id for r in rows[:15]]
+            )
         if not rows:
             await interaction.response.send_message("No accounts yet.", ephemeral=True)
             return
         caller = next((r for r in rows if r.user_id == interaction.user.id), None)
-        embed = leaderboard_embed(rows, caller=caller)
+        embed = leaderboard_embed(rows, caller=caller, flair=flair)
         await interaction.response.send_message(
             content=_welcome_suffix(bootstrap) or None, embed=embed
         )
@@ -1088,6 +1096,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             stats = await status_svc.profile_stats(conn, interaction.user.id)
         assert stats is not None
         embed = discord.Embed(title=f"{interaction.user.display_name}'s profile")
+        if stats.title:
+            embed.description = stats.title
         embed.add_field(
             name="Account age", value=f"{stats.account_age_days:.1f} day(s)"
         )
@@ -1133,6 +1143,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
             return
         embed = discord.Embed(title=user.display_name)
+        if stats.title:
+            # Equipped title sits under the name -- the flex reads first.
+            embed.description = stats.title
         embed.set_thumbnail(url=user.display_avatar.url)
         embed.add_field(
             name="Net worth", value=format_money(stats.net_worth_minor)
@@ -1167,6 +1180,50 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         # Public by design -- the flex is the point.
         await interaction.response.send_message(
             content=_welcome_suffix(bootstrap) or None, embed=embed
+        )
+
+    @tree.command(
+        name="equip",
+        description="Equip an owned title or chart theme",
+    )
+    @app_commands.describe(item="Owned item key, e.g. title_oracle, theme_vapor")
+    @app_commands.autocomplete(item=equipped_item_autocomplete)
+    async def equip(interaction: discord.Interaction, item: str) -> None:
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            try:
+                slot = await equip_item(conn, interaction.user.id, item.lower())
+            except ShopError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        label = "title" if slot == "title" else "chart theme"
+        await interaction.response.send_message(
+            f"Equipped **{item.lower()}** as your {label}."
+            + _welcome_suffix(bootstrap),
+            ephemeral=True,
+        )
+
+    @tree.command(
+        name="unequip", description="Clear an equip slot"
+    )
+    @app_commands.describe(slot="Which slot to clear")
+    @app_commands.choices(
+        slot=[
+            app_commands.Choice(name="title", value="title"),
+            app_commands.Choice(name="theme", value="theme"),
+        ]
+    )
+    async def unequip(interaction: discord.Interaction, slot: str) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            try:
+                cleared = await unequip_item(conn, interaction.user.id, slot)
+            except ShopError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Cleared your {slot}." if cleared else f"No {slot} equipped.",
+            ephemeral=True,
         )
 
     @tree.command(name="buy", description="Buy shares of an instrument")
