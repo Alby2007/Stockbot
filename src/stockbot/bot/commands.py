@@ -1092,6 +1092,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         embed.add_field(
             name="Lifetime volume", value=format_money(stats.lifetime_volume_minor)
         )
+        embed.add_field(name="Quests", value=str(stats.quests_completed))
         if stats.trophies:
             embed.add_field(
                 name="Trophies & badges",
@@ -1103,6 +1104,58 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 name="Active season equity",
                 value=format_money(stats.active_season_equity_minor),
             )
+        await interaction.response.send_message(
+            content=_welcome_suffix(bootstrap) or None, embed=embed
+        )
+
+    @tree.command(
+        name="whois",
+        description="Flex card: any player's net worth, rank, badges and trophies",
+    )
+    @app_commands.describe(user="Discord user to look up")
+    async def whois(interaction: discord.Interaction, user: discord.User) -> None:
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            stats = await status_svc.profile_stats(conn, user.id)
+        if stats is None:
+            await interaction.response.send_message(
+                f"**{user.display_name}** hasn't joined StockBot — "
+                "`/start` creates an account."
+            )
+            return
+        embed = discord.Embed(title=user.display_name)
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.add_field(
+            name="Net worth", value=format_money(stats.net_worth_minor)
+        )
+        embed.add_field(
+            name="Rank",
+            value=(
+                f"#{stats.rank} of {stats.total_users}"
+                if stats.rank
+                else "unranked"
+            ),
+        )
+        embed.add_field(
+            name="Lifetime volume",
+            value=format_money(stats.lifetime_volume_minor),
+        )
+        embed.add_field(name="Quests", value=str(stats.quests_completed))
+        embed.add_field(
+            name="StockBot age", value=f"{stats.account_age_days:.1f}d"
+        )
+        if stats.active_season_equity_minor is not None:
+            embed.add_field(
+                name="Active season",
+                value=format_money(stats.active_season_equity_minor),
+            )
+        if stats.trophies:
+            embed.add_field(
+                name="Badges & trophies",
+                value="\n".join(stats.trophies),
+                inline=False,
+            )
+        # Public by design -- the flex is the point.
         await interaction.response.send_message(
             content=_welcome_suffix(bootstrap) or None, embed=embed
         )

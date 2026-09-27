@@ -213,6 +213,14 @@ async def test_profile_stats_reports_rank_and_trophies(conn: AsyncConnection) ->
     stats = await profile_stats(conn, 8060)
     assert stats is not None
     assert stats.trophies == ["Test Trophy"]
+    assert stats.quests_completed == 0
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE users SET quests_completed = 7 WHERE id = 8060"
+        )
+    stats = await profile_stats(conn, 8060)
+    assert stats is not None and stats.quests_completed == 7
 
 
 async def test_profile_stats_none_for_unknown_user(conn: AsyncConnection) -> None:

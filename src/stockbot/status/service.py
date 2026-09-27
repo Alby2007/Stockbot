@@ -290,6 +290,7 @@ class ProfileStats:
     rank: int | None
     total_users: int
     lifetime_volume_minor: int
+    quests_completed: int
     trophies: list[str]
     active_season_equity_minor: int | None
 
@@ -297,13 +298,14 @@ class ProfileStats:
 async def profile_stats(conn: AsyncConnection, user_id: int) -> ProfileStats | None:
     async with conn.cursor() as cur:
         await cur.execute(
-            "SELECT created_at, total_traded_minor FROM users WHERE id = %s",
+            "SELECT created_at, total_traded_minor, quests_completed "
+            "FROM users WHERE id = %s",
             (user_id,),
         )
         row = await cur.fetchone()
     if row is None:
         return None
-    created_at, total_traded = row
+    created_at, total_traded, quests_completed = row
 
     equity = await net_worth_minor(conn, user_id)
     rank_row = await user_rank(conn, user_id)
@@ -348,6 +350,7 @@ async def profile_stats(conn: AsyncConnection, user_id: int) -> ProfileStats | N
         rank=rank_row.rank if rank_row else None,
         total_users=rank_row.total if rank_row else 0,
         lifetime_volume_minor=int(total_traded),
+        quests_completed=int(quests_completed),
         trophies=trophies,
         active_season_equity_minor=active_equity,
     )
