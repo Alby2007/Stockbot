@@ -117,7 +117,7 @@ async def test_first_claim_delay_carries_unlock(conn: AsyncConnection) -> None:
             "WHERE id = %s",
             (user_id,),
         )
-    amount, streak = await claim_daily(conn, user_id)
+    amount, streak, _shield = await claim_daily(conn, user_id)
     assert amount > 0 and streak == 1
 
 

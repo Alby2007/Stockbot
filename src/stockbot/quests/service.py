@@ -9,6 +9,13 @@ QUEST_COMPLETED outbox rows -- all inside the calling transaction.
 
 League and main activity both count (quests reward playing), but rewards
 always pay the main account. `quests.enabled` is the kill switch.
+
+Personal instances (`quest_instances.user_id` set) come from paid
+rerolls: `reroll_quest` consumes a quest_reroll token, records the
+original->replacement pair in `quest_swaps`, and inserts a personal
+instance in the same window. Both the sweep and `list_quests` scope to
+`(user_id IS NULL OR user_id = viewer)` and exclude swapped rows, so a
+rerolled-away quest genuinely stops tracking.
 """
 
 from __future__ import annotations
@@ -21,6 +28,11 @@ from psycopg.rows import dict_row
 
 from stockbot.ledger.service import get_system_account_id, get_user_account_id, post_transfer
 from stockbot.market.engine import TICKS_PER_DAY
+
+
+class RerollError(Exception):
+    """Reroll rejected: quest not on the board, already done, already
+    swapped, or no replacement def available."""
 
 # kind -> (source table, window column, measure expression, extra JOIN
 # condition). All measure queries share one shape: join the source rows
@@ -180,6 +192,14 @@ async def sweep_completions(conn: AsyncConnection, tick_index: int) -> int:
                       ON t.{col} BETWEEN qi.window_start AND qi.window_end
                      {extra}
                     WHERE qi.status = 'OPEN' AND qi.kind = %s
+                      -- Personal instances measure only their owner;
+                      -- global ones measure everyone. A swapped-away
+                      -- quest stops tracking entirely.
+                      AND (qi.user_id IS NULL OR qi.user_id = t.user_id)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM quest_swaps s
+                          WHERE s.user_id = t.user_id
+                            AND s.quest_instance_id = qi.id)
                     GROUP BY qi.id, t.user_id
                     HAVING {measure} >= qi.target
                     ON CONFLICT DO NOTHING
@@ -247,9 +267,13 @@ async def list_quests(
             LEFT JOIN quest_completions qc
               ON qc.quest_instance_id = qi.id AND qc.user_id = %s
             WHERE qi.status = 'OPEN'
+              AND (qi.user_id IS NULL OR qi.user_id = %s)
+              AND NOT EXISTS (
+                  SELECT 1 FROM quest_swaps s
+                  WHERE s.user_id = %s AND s.quest_instance_id = qi.id)
             ORDER BY qi.period DESC, qi.id
             """,
-            (user_id,),
+            (user_id, user_id, user_id),
         )
         rows = await cur.fetchall()
         progress: dict[int, int] = {}
@@ -264,9 +288,13 @@ async def list_quests(
                  AND t.user_id = %s
                  {extra}
                 WHERE qi.status = 'OPEN' AND qi.kind = %s
+                  AND (qi.user_id IS NULL OR qi.user_id = %s)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM quest_swaps s
+                      WHERE s.user_id = %s AND s.quest_instance_id = qi.id)
                 GROUP BY qi.id
                 """,
-                (user_id, kind),
+                (user_id, kind, user_id, user_id),
             )
             progress.update(
                 {int(r["id"]): int(r["progress"]) for r in await cur.fetchall()}
@@ -275,3 +303,122 @@ async def list_quests(
         row["progress"] = progress.get(int(row["id"]), 0)
         row["ticks_remaining"] = max(0, int(row["window_end"]) - tick_index)
     return rows
+
+
+async def reroll_quest(
+    conn: AsyncConnection, user_id: int, instance_id: int
+) -> dict[str, Any]:
+    """Swap one of the user's visible OPEN quests for a different def in
+    the same window. Consumes a quest_reroll token, records the swap in
+    quest_swaps (the swapped quest stops tracking for real), and inserts
+    a personal user_id-scoped replacement instance sharing the original
+    window -- progress on it measures from the window start like any
+    instance, not from the reroll moment."""
+    from stockbot.shop.service import use_consumable
+
+    async with conn.transaction():
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT qi.id, qi.period, qi.period_index, qi.window_start,
+                       qi.window_end, qi.user_id
+                FROM quest_instances qi
+                WHERE qi.id = %s AND qi.status = 'OPEN'
+                  AND (qi.user_id IS NULL OR qi.user_id = %s)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM quest_swaps s
+                      WHERE s.user_id = %s AND s.quest_instance_id = qi.id)
+                """,
+                (instance_id, user_id, user_id),
+            )
+            inst = await cur.fetchone()
+        if inst is None:
+            raise RerollError("that quest isn't on your board")
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM quest_completions "
+                "WHERE quest_instance_id = %s AND user_id = %s",
+                (instance_id, user_id),
+            )
+            if await cur.fetchone() is not None:
+                raise RerollError("that quest is already complete")
+
+        # Replacement pool: active same-period defs absent from the
+        # user's visible board AND not previously swapped away this
+        # window (a swapped-away def can't come back).
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT d.key, d.kind, d.name, d.target, d.reward_minor
+                FROM quest_defs d
+                WHERE d.active AND d.period = %s
+                  AND (d.kind <> 'IPO_SUBSCRIBE' OR EXISTS
+                       (SELECT 1 FROM ipo_offerings WHERE status = 'OPEN'))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM quest_instances x
+                      WHERE x.def_key = d.key AND x.period = d.period
+                        AND x.period_index = %s
+                        AND (x.user_id IS NULL OR x.user_id = %s)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM quest_swaps s
+                            WHERE s.user_id = %s
+                              AND s.quest_instance_id = x.id))
+                  AND NOT EXISTS (
+                      SELECT 1 FROM quest_instances x2
+                      JOIN quest_swaps s2
+                        ON s2.quest_instance_id = x2.id
+                       AND s2.user_id = %s
+                      WHERE x2.def_key = d.key AND x2.period = d.period
+                        AND x2.period_index = %s)
+                ORDER BY random() LIMIT 1
+                """,
+                (
+                    inst["period"],
+                    inst["period_index"],
+                    user_id,
+                    user_id,
+                    user_id,
+                    inst["period_index"],
+                ),
+            )
+            replacement = await cur.fetchone()
+        if replacement is None:
+            raise RerollError("no other quest to swap in")
+
+        await use_consumable(conn, user_id, "quest_reroll")
+
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO quest_instances
+                    (def_key, kind, period, period_index, window_start,
+                     window_end, target, reward_minor, user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    replacement["key"],
+                    replacement["kind"],
+                    inst["period"],
+                    inst["period_index"],
+                    inst["window_start"],
+                    inst["window_end"],
+                    replacement["target"],
+                    replacement["reward_minor"],
+                    user_id,
+                ),
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            new_id = int(row[0])
+            await cur.execute(
+                "INSERT INTO quest_swaps (user_id, quest_instance_id, "
+                "replacement_instance_id) VALUES (%s, %s, %s)",
+                (user_id, instance_id, new_id),
+            )
+    return {
+        "id": new_id,
+        "name": str(replacement["name"]),
+        "target": int(replacement["target"]),
+        "reward_minor": int(replacement["reward_minor"]),
+    }

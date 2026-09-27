@@ -260,6 +260,25 @@ async def equipped_item_autocomplete(
     ][:MAX_CHOICES]
 
 
+async def quest_reroll_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """The clicker's incomplete visible quests -- reroll targets."""
+    from stockbot.quests.service import list_quests
+
+    async with db.connection() as conn:
+        rows = await list_quests(conn, interaction.user.id, 0)
+    cur = current.strip().lower()
+    return [
+        app_commands.Choice(
+            name=f"{r['name']} ({r['period'].lower()})", value=str(r["id"])
+        )
+        for r in rows
+        if not r["completed"]
+        if not cur or cur in str(r["name"]).lower()
+    ][:MAX_CHOICES]
+
+
 async def tunable_param_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:

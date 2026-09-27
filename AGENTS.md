@@ -225,6 +225,27 @@ deliberately doesn't touch it) and rides the cid as a 7th field — a shared
 chart message can't repaint per-clicker; `-` = default. `/chart` gates the
 theme on `owns_item`; `buy_item` auto-equips themes on purchase.
 `/equip` (0047) owns the column going forward.
+Titles/flair (0047): `TITLE` shop kind + `users.equipped_title` (explicit
+slot column). `/equip` routes kind→slot via `shop.equip_item`
+(TITLE→users.equipped_title, COSMETIC-with-palette→chart_prefs.theme),
+`/unequip slot` clears; buying either auto-equips inside `buy_item`.
+`status.equipped_flair_map(conn, ids)` renders "emoji name" for boards —
+`leaderboard_embed(flair=)` prints `rank. <@uid> · title  $X`, and flair
+joins the board content digest (equipping must repaint the board).
+`profile_stats.title` feeds `/profile` + `/whois`; badge/trophy names
+render `metadata.emoji` inline.
+Consumables/perks (0048): `CONSUMABLE`+`PERK` kinds stack on buy
+(quantity+1, not AlreadyOwnedError); `use_consumable` decrements and
+deletes at 0 (CHECK forbids the 0 row) — caller owns the tx. Reroll:
+`quest_instances.user_id` (NULL=global) + `quest_swaps` make a rerolled
+quest genuinely stop tracking — `list_quests` and `sweep_completions`
+both filter `(user_id IS NULL OR user_id = viewer) AND NOT swapped`;
+the dedupe unique became `(def_key, period, period_index, user_id)
+NULLS NOT DISTINCT`. `/quests` became a group: `list` + `reroll`.
+Streak shield: `claim_daily` returns a THIRD element `shield_used` —
+gap==2 days + owned shield → consume + streak continues; gap≥3 doesn't
+consume. `alert_pack` adds `10×quantity` to `alerts.max_per_user` in
+`create_alert`.
 `market_ticks` row itself (duration_ms, fills, crosses, stops_triggered,
 knockouts, liquidations, events_resolved) plus one structured log line
 (`tick=N phase=… crosses=… ms=…`) — tick 4532 is fully re-describable

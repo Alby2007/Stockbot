@@ -22,6 +22,7 @@ from stockbot.claims.errors import (
     FirstClaimLockedError,
 )
 from stockbot.ledger.service import get_system_account_id, post_transfer
+from stockbot.shop.service import owns_item, use_consumable
 
 BASE_CLAIM_MINOR = 200  # $2.00
 STREAK_BONUS_PER_DAY_MINOR = 20  # $0.20 per consecutive day
@@ -42,8 +43,9 @@ async def claim_daily(
     *,
     as_of_date: date | None = None,
     enforce_first_claim_delay: bool = True,
-) -> tuple[int, int]:
-    """Claim today's faucet grant. Returns (amount_minor, streak).
+) -> tuple[int, int, bool]:
+    """Claim today's faucet grant. Returns (amount_minor, streak,
+    shield_used).
 
     Raises `AlreadyClaimedTodayError` if this user already claimed today
     (server date, UTC). A streak continues if the previous claim was
@@ -102,11 +104,22 @@ async def claim_daily(
             else:
                 today = as_of_date
 
+        shield_used = False
         if existing is not None:
             last_claim_date, previous_streak = existing
             if last_claim_date == today:
                 raise AlreadyClaimedTodayError(user_id)
-            streak = previous_streak + 1 if (today - last_claim_date).days == 1 else 1
+            gap = (today - last_claim_date).days
+            if gap == 2 and await owns_item(conn, user_id, "streak_shield"):
+                # Exactly one missed day: the shield is consumed and the
+                # streak reads as continuous (+1), i.e. the missed day
+                # was claimed. Longer gaps don't consume -- a shield
+                # shouldn't resurrect a month-old streak.
+                await use_consumable(conn, user_id, "streak_shield")
+                shield_used = True
+                streak = previous_streak + 1
+            else:
+                streak = previous_streak + 1 if gap == 1 else 1
         else:
             streak = 1
 
@@ -128,4 +141,4 @@ async def claim_daily(
             conn, from_account_id=faucet_id, to_account_id=account_id, amount=amount, reason="CLAIM"
         )
 
-    return amount, streak
+    return amount, streak, shield_used

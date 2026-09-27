@@ -281,7 +281,10 @@ async def buy_item(
             )
             already_owned = await cur.fetchone() is not None
 
-        if item["duration_days"] is None and already_owned:
+        # CONSUMABLE/PERK stack: a repeat buy is quantity + 1, not a
+        # duplicate-ownership rejection.
+        stackable = item["kind"] in ("CONSUMABLE", "PERK")
+        if item["duration_days"] is None and already_owned and not stackable:
             raise AlreadyOwnedError(item_key)
 
         sink_id = await get_system_account_id(conn, "SINK")
@@ -308,6 +311,17 @@ async def buy_item(
                     """,
                     (user_id, item_key, item["duration_days"], item["duration_days"]),
                 )
+        elif stackable:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO entitlements (user_id, item_key)
+                    VALUES (%s, %s)
+                    ON CONFLICT (user_id, item_key) DO UPDATE
+                    SET quantity = entitlements.quantity + 1
+                    """,
+                    (user_id, item_key),
+                )
         else:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -327,6 +341,39 @@ async def buy_item(
             await equip_theme(conn, user_id, item_key)
 
     return price
+
+
+async def use_consumable(
+    conn: AsyncConnection, user_id: int, item_key: str
+) -> int:
+    """Spend one unit of a consumable; returns the remaining quantity.
+    entitlements CHECK forbids a 0 row, so the last unit's spend deletes
+    it. Caller owns the transaction."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE entitlements SET quantity = quantity - 1
+            WHERE user_id = %s AND item_key = %s AND quantity > 1
+              AND (expires_at IS NULL OR expires_at > now())
+            RETURNING quantity
+            """,
+            (user_id, item_key),
+        )
+        row = await cur.fetchone()
+        if row is not None:
+            return int(row[0])
+        await cur.execute(
+            """
+            DELETE FROM entitlements
+            WHERE user_id = %s AND item_key = %s AND quantity = 1
+              AND (expires_at IS NULL OR expires_at > now())
+            RETURNING item_key
+            """,
+            (user_id, item_key),
+        )
+        if await cur.fetchone() is None:
+            raise NotOwnedError(item_key)
+        return 0
 
 
 async def equip_item(

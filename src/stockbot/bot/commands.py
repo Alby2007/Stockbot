@@ -50,6 +50,7 @@ from stockbot.bot.autocomplete import (
     alert_autocomplete,
     equipped_item_autocomplete,
     order_autocomplete,
+    quest_reroll_autocomplete,
     sector_autocomplete,
     shop_item_autocomplete,
     short_autocomplete,
@@ -105,7 +106,7 @@ from stockbot.orders.service import (
     place_oco,
     place_order,
 )
-from stockbot.quests.service import list_quests
+from stockbot.quests.service import RerollError, list_quests, reroll_quest
 from stockbot.seasons.errors import SeasonError
 from stockbot.seasons.service import (
     close_season,
@@ -118,7 +119,7 @@ from stockbot.seasons.service import (
     league_equity_minor,
     standings,
 )
-from stockbot.shop.errors import ShopError
+from stockbot.shop.errors import NotOwnedError, ShopError
 from stockbot.shop.service import (
     BASE_SLOTS,
     MARGIN_TIER_PRICES_MINOR,
@@ -373,7 +374,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             name="Compete",
             value=(
                 "`/league` seasons are opt-in equal-stake competitions · "
-                "`/leaderboard` ranks everyone by net worth · `/quests` "
+                "`/leaderboard` ranks everyone by net worth · `/quests list` "
                 "pays faucet rewards for daily/weekly tasks."
             ),
             inline=False,
@@ -436,7 +437,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         async with db.connection() as conn:
             bootstrap = await bootstrap_user(conn, user.id)
             try:
-                amount, streak = await claim_daily(conn, user.id)
+                amount, streak, shield_used = await claim_daily(conn, user.id)
             except AccountTooYoungError:
                 await interaction.response.send_message(
                     f"Your Discord account needs to be at least "
@@ -464,6 +465,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
         await interaction.response.send_message(
             f"Claimed **{format_money(amount)}**! Current streak: **{streak}** day(s)."
+            + (" 🛡 Streak shield consumed — streak saved." if shield_used else "")
             + _welcome_suffix(bootstrap)
         )
 
@@ -1007,10 +1009,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             content=_welcome_suffix(bootstrap) or None, embed=embed
         )
 
-    @tree.command(
-        name="quests", description="Today's and this week's quests and your progress"
+    quest_group = app_commands.Group(
+        name="quests", description="Daily and weekly quests"
     )
-    async def quests_cmd(interaction: discord.Interaction) -> None:
+
+    @quest_group.command(
+        name="list", description="Today's and this week's quests and your progress"
+    )
+    async def quests_list(interaction: discord.Interaction) -> None:
         async with db.connection() as conn:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
             tick_index = await current_tick_index(conn)
@@ -1049,6 +1055,39 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.response.send_message(
             content=_welcome_suffix(bootstrap) or None, embed=embed
         )
+
+    @quest_group.command(
+        name="reroll",
+        description="Swap one active quest for a different one (uses a reroll token)",
+    )
+    @app_commands.describe(quest="The quest to swap out")
+    @app_commands.autocomplete(quest=quest_reroll_autocomplete)
+    async def quests_reroll(interaction: discord.Interaction, quest: str) -> None:
+        try:
+            instance_id = int(quest)
+        except ValueError:
+            instance_id = -1
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            try:
+                new = await reroll_quest(conn, interaction.user.id, instance_id)
+            except NotOwnedError:
+                await interaction.response.send_message(
+                    "You don't own a quest reroll — `/shop buy quest_reroll`.",
+                    ephemeral=True,
+                )
+                return
+            except RerollError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Rerolled into **{new['name']}** — target {new['target']}, "
+            f"+{format_money(new['reward_minor'])}."
+            + _welcome_suffix(bootstrap),
+            ephemeral=True,
+        )
+
+    tree.add_command(quest_group)
 
     @tree.command(name="compare", description="Head-to-head comparison with another user")
     @app_commands.describe(user="Discord user to compare against")
@@ -2213,7 +2252,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             if item.price_minor is None:
                 # Grant-only catalog rows (trophies, badges) aren't for sale.
                 continue
-            marker = " (owned)" if item.key in owned_keys and item.duration_days is None else ""
+            if item.key in owned_keys and item.duration_days is None:
+                qty = owned_keys[item.key]
+                marker = (
+                    f" (owned ×{qty})" if item.kind in ("CONSUMABLE", "PERK")
+                    else " (owned)"
+                )
+            else:
+                marker = ""
             recurring = f" every {item.duration_days}d" if item.duration_days else ""
             lines.append(
                 f"{item.key:<15} {format_money(item.price_minor):>10}{recurring}{marker}"

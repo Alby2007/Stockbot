@@ -65,6 +65,15 @@ async def create_alert(
     max_alerts = int(await _config_float(conn, "alerts.max_per_user", 25))
     async with conn.cursor() as cur:
         await cur.execute(
+            "SELECT quantity FROM entitlements "
+            "WHERE user_id = %s AND item_key = 'alert_pack' "
+            "AND (expires_at IS NULL OR expires_at > now())",
+            (user_id,),
+        )
+        pack_row = await cur.fetchone()
+    max_alerts += 10 * (int(pack_row[0]) if pack_row else 0)
+    async with conn.cursor() as cur:
+        await cur.execute(
             "SELECT COUNT(*) FROM price_alerts "
             "WHERE user_id = %s AND status = 'OPEN'",
             (user_id,),
