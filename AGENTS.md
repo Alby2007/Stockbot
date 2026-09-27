@@ -242,10 +242,23 @@ quest genuinely stop tracking — `list_quests` and `sweep_completions`
 both filter `(user_id IS NULL OR user_id = viewer) AND NOT swapped`;
 the dedupe unique became `(def_key, period, period_index, user_id)
 NULLS NOT DISTINCT`. `/quests` became a group: `list` + `reroll`.
-Streak shield: `claim_daily` returns a THIRD element `shield_used` —
-gap==2 days + owned shield → consume + streak continues; gap≥3 doesn't
-consume. `alert_pack` adds `10×quantity` to `alerts.max_per_user` in
-`create_alert`.
+Streak shield: `claim_daily` returns a `ClaimResult` (`amount_minor`,
+`streak`, `shield_used`, `roll`) — gap==2 days + owned shield → consume +
+streak continues; gap≥3 doesn't consume. `alert_pack` adds
+`10×quantity` to `alerts.max_per_user` in `create_alert`.
+Claim wheel (0051): the daily grant is a seeded draw, not the flat
+`claim_amount`. `wheel_roll(user_id, day, seed, jackpot_pct)` =
+HMAC(seed, `claim|{uid}|{iso-date}`) → u∈[0,1) over `WHEEL_SEGMENTS`
+(50/30/12/6/2 → 0.75×/1.25×/2×/4×/10× base) — same (user, day, seed)
+always rolls the same segment, so retries can't re-roll and sims
+reproduce; the draw happens inside the claim txn. `claim.jackpot_pct`
+replaces the jackpot weight (0 = disabled); `claim.wheel_enabled=0`
+falls back to the flat formula (`roll=None`). Streak multiplies the
+roll via `claim_amount(streak)/BASE` (1.0×→1.9× cap, same curve as the
+old flat streak bonus); EV ≈ 1.43× base. `claims.last_segment`/
+`last_amount_minor` audit the last roll. `/claim` sends "spinning" then
+edits the result in (~0.8s) — cosmetic only. Harness passes
+`wheel_seed=f"{master_seed}|claims"`.
 Pro Terminal (0049): `pro_terminal` is a 30-day ANALYST_TOOL (renewals
 reuse entitlement expiry). `/stock` gates `status.pro_terminal_stats`
 (7d range, daily realized vol from close returns, 24h buy/sell flow

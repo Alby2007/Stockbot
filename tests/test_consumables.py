@@ -213,15 +213,15 @@ async def test_streak_shield_bridges_one_missed_day(
     await buy_item(conn, uid, "streak_shield")
 
     d = date(2026, 9, 20)
-    _, s1, sh1 = await claim_daily(
+    r1 = await claim_daily(
         conn, uid, as_of_date=d, enforce_first_claim_delay=False
     )
-    assert (s1, sh1) == (1, False)
+    assert (r1.streak, r1.shield_used) == (1, False)
     # Day 2 missed; day 3 claim consumes the shield and keeps the streak.
-    _, s3, sh3 = await claim_daily(
+    r3 = await claim_daily(
         conn, uid, as_of_date=d.replace(day=22), enforce_first_claim_delay=False
     )
-    assert (s3, sh3) == (2, True)
+    assert (r3.streak, r3.shield_used) == (2, True)
     assert await _quantity(conn, uid, "streak_shield") == 0
 
 
@@ -236,10 +236,10 @@ async def test_streak_shield_not_consumed_on_longer_gap(
     d = date(2026, 9, 20)
     await claim_daily(conn, uid, as_of_date=d, enforce_first_claim_delay=False)
     # Two missed days -> shield stays, streak resets.
-    _, s5, sh5 = await claim_daily(
+    r5 = await claim_daily(
         conn, uid, as_of_date=d.replace(day=23), enforce_first_claim_delay=False
     )
-    assert (s5, sh5) == (1, False)
+    assert (r5.streak, r5.shield_used) == (1, False)
     assert await _quantity(conn, uid, "streak_shield") == 1
 
 

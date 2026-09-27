@@ -145,6 +145,8 @@ CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "accounts.min_discord_age_days": (0, 3650),
     "alerts.max_per_user": (1, 1e4),
     "audit.every_n_ticks": (1, 1e6),
+    "claim.jackpot_pct": (0.0, 25.0),
+    "claim.wheel_enabled": (0, 1),
     "cross.collar_pct": (0.0001, 1.0),
     "cross.trade_through_epsilon": (0.0, 1.0),
     "dividend.interval_ticks": (1, 1e9),

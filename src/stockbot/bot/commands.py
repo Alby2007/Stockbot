@@ -171,6 +171,15 @@ def guild_welcome_message() -> str:
     )
 
 
+_WHEEL_LABELS = {
+    "cold": "❄️ Cold",
+    "even": "⚪ Even",
+    "warm": "🔥 Warm",
+    "hot": "☄️ Hot",
+    "jackpot": "💎 JACKPOT",
+}
+
+
 def _welcome_suffix(result: BootstrapResult | None) -> str:
     # League paths never bootstrap (season-scoped accounts) -> None.
     if result is None:
@@ -443,7 +452,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         async with db.connection() as conn:
             bootstrap = await bootstrap_user(conn, user.id)
             try:
-                amount, streak, shield_used = await claim_daily(conn, user.id)
+                result = await claim_daily(conn, user.id)
             except AccountTooYoungError:
                 await interaction.response.send_message(
                     f"Your Discord account needs to be at least "
@@ -469,11 +478,38 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 )
                 return
 
-        await interaction.response.send_message(
-            f"Claimed **{format_money(amount)}**! Current streak: **{streak}** day(s)."
-            + (" 🛡 Streak shield consumed — streak saved." if shield_used else "")
+        shield_note = (
+            " 🛡 Streak shield consumed — streak saved." if result.shield_used else ""
+        )
+        if result.roll is None:
+            # claim.wheel_enabled=0 -- flat formula, same message as always.
+            await interaction.response.send_message(
+                f"Claimed **{format_money(result.amount_minor)}**! "
+                f"Current streak: **{result.streak}** day(s)."
+                + shield_note
+                + _welcome_suffix(bootstrap)
+            )
+            return
+
+        # The draw is already committed -- this edit is presentation, not
+        # the roll itself, so a client retry can't re-roll the payout.
+        await interaction.response.send_message("🎡 Spinning the daily wheel…")
+        await asyncio.sleep(0.8)
+        reveal = (
+            f"🎡 The wheel lands on **{_WHEEL_LABELS[result.roll.segment]}** — "
+            f"**{format_money(result.roll.roll_minor)}**"
+        )
+        if result.streak > 1:
+            reveal += (
+                f" × **{result.amount_minor / result.roll.roll_minor:.2f}** streak"
+            )
+        reveal += (
+            f"\nClaimed **{format_money(result.amount_minor)}**! "
+            f"Current streak: **{result.streak}** day(s)."
+            + shield_note
             + _welcome_suffix(bootstrap)
         )
+        await interaction.edit_original_response(content=reveal)
 
     @tree.command(name="market", description="List all tradeable instruments")
     async def market(interaction: discord.Interaction) -> None:

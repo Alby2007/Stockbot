@@ -211,13 +211,20 @@ async def _random_active_ticker(conn: AsyncConnection, rng: random.Random) -> st
     return rng.choice(tickers) if tickers else None
 
 
-async def _safe_claim(conn: AsyncConnection, user_id: int, sim_today: date) -> None:
+async def _safe_claim(
+    conn: AsyncConnection, user_id: int, sim_today: date, wheel_seed: str
+) -> None:
     try:
         # enforce_first_claim_delay=False: sim users' users.created_at is
         # wall-clock now, not sim time -- the 24h gate is real-Discord
-        # anti-farm, meaningless for agents.
+        # anti-farm, meaningless for agents. wheel_seed is derived from the
+        # run's master_seed so claim draws reproduce on re-run.
         await claim_daily(
-            conn, user_id, as_of_date=sim_today, enforce_first_claim_delay=False
+            conn,
+            user_id,
+            as_of_date=sim_today,
+            enforce_first_claim_delay=False,
+            wheel_seed=wheel_seed,
         )
     except AlreadyClaimedTodayError:
         pass
@@ -228,15 +235,19 @@ async def _quantity_for_spend(spend_minor: int, ticker_price_minor: int) -> int:
 
 
 async def _run_agent_day(
-    conn: AsyncConnection, agent: Agent, rng: random.Random, sim_today: date
+    conn: AsyncConnection,
+    agent: Agent,
+    rng: random.Random,
+    sim_today: date,
+    wheel_seed: str,
 ) -> None:
     try:
         if agent.archetype == "farmer":
-            await _safe_claim(conn, agent.user_id, sim_today)
+            await _safe_claim(conn, agent.user_id, sim_today, wheel_seed)
             return
 
         if agent.archetype in ("whale", "grinder", "yolo"):
-            await _safe_claim(conn, agent.user_id, sim_today)
+            await _safe_claim(conn, agent.user_id, sim_today, wheel_seed)
             chance, spend_range = {
                 "whale": (0.4, (0.05, 0.2)),
                 "grinder": (0.3, (0.05, 0.15)),
@@ -268,8 +279,8 @@ async def _run_agent_day(
             # Only the lower-id half of each pair drives the pair's schedule.
             if agent.user_id > agent.wash_partner_id:
                 return
-            await _safe_claim(conn, agent.user_id, sim_today)
-            await _safe_claim(conn, agent.wash_partner_id, sim_today)
+            await _safe_claim(conn, agent.user_id, sim_today, wheel_seed)
+            await _safe_claim(conn, agent.wash_partner_id, sim_today, wheel_seed)
 
             if agent.wash_ticker is None:
                 agent.wash_ticker = await _random_active_ticker(conn, rng)
@@ -303,7 +314,7 @@ async def _run_agent_day(
             await execute_trade(conn, user_id=partner_id, ticker=ticker, side="SELL", quantity=5)
 
         if agent.archetype == "liquidity_provider" and agent.quote_ticker:
-            await _safe_claim(conn, agent.user_id, sim_today)
+            await _safe_claim(conn, agent.user_id, sim_today, wheel_seed)
             ticker = agent.quote_ticker
             # Prune anything beyond ~2 days of accumulated quotes, then add
             # today's two-sided quote. Stale quotes deliberately rest on:
@@ -363,7 +374,7 @@ async def _run_agent_day(
             # Holds one name with a protective SELL stop trailing ~4-9%
             # under the mark; re-enters a day or two after being stopped
             # out. Exercises the stop trigger/cascade path every run.
-            await _safe_claim(conn, agent.user_id, sim_today)
+            await _safe_claim(conn, agent.user_id, sim_today, wheel_seed)
             if agent.stop_ticker is None:
                 agent.stop_ticker = await _random_active_ticker(conn, rng)
             ticker = agent.stop_ticker
@@ -425,7 +436,7 @@ async def _run_agent_day(
             return
 
         if agent.archetype == "shorter":
-            await _safe_claim(conn, agent.user_id, sim_today)
+            await _safe_claim(conn, agent.user_id, sim_today, wheel_seed)
             if rng.random() >= 0.4:
                 return
             async with conn.cursor() as cur:
@@ -590,7 +601,9 @@ async def run_simulation(
         last_tick = await apply_tick(conn, master_seed)
         sim_today = SIM_CLAIM_EPOCH + timedelta(days=day)
         for agent in agents:
-            await _run_agent_day(conn, agent, rng, sim_today)
+            await _run_agent_day(
+                conn, agent, rng, sim_today, f"{master_seed}|claims"
+            )
         for _ in range(ticks_per_day - 1):
             last_tick = await apply_tick(conn, master_seed)
 
