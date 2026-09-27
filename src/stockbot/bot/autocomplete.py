@@ -185,6 +185,34 @@ async def short_autocomplete(
     return choices
 
 
+async def alert_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[int]]:
+    """The caller's open price alerts."""
+    cur = current.strip()
+    id_like = f"%{cur.lstrip('#')}%" if cur else "%"
+    tick_like = f"%{cur.upper()}%" if cur else "%"
+    async with db.connection() as conn, conn.cursor() as cursor:
+        await cursor.execute(
+            """
+            SELECT a.id, i.ticker, a.direction, a.target_price
+            FROM price_alerts a JOIN instruments i ON i.id = a.instrument_id
+            WHERE a.user_id = %s AND a.status = 'OPEN'
+              AND (CAST(a.id AS TEXT) LIKE %s OR i.ticker LIKE %s)
+            ORDER BY a.id DESC LIMIT 100
+            """,
+            (interaction.user.id, id_like, tick_like),
+        )
+        rows = await cursor.fetchall()
+    choices = []
+    for aid, ticker, direction, target in rows:
+        label = f"#{aid} {ticker} {direction.lower()} {format_price(target)}"
+        choices.append(app_commands.Choice(name=label[:100], value=int(aid)))
+        if len(choices) >= MAX_CHOICES:
+            break
+    return choices
+
+
 async def shop_item_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:

@@ -11,6 +11,7 @@ Insert sites (all inside the event's own transaction):
     seasons/service.py    close_season     -> SEASON_RESULT
     status/service.py     evaluate_badges  -> BADGE_EARNED
     ipo/service.py        settle_due       -> IPO_SETTLED
+    alerts/service.py     sweep_alerts     -> ALERT_TRIGGERED
 """
 
 from __future__ import annotations
@@ -166,6 +167,15 @@ def _fmt_ipo_settled(items: list[dict[str, Any]]) -> str:
     return "IPO settled: " + "; ".join(parts) + ". It's live on the market."
 
 
+def _fmt_alert_triggered(items: list[dict[str, Any]]) -> str:
+    parts = [
+        f"**{p['ticker']}** crossed {p['direction'].lower()} "
+        f"{format_price(p['target'])} (now {format_price(p['mark'])})"
+        for p in items
+    ]
+    return "Price alert" + ("s" if len(items) > 1 else "") + ": " + "; ".join(parts)
+
+
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "LIQUIDATION": _fmt_liquidation,
     "MARGIN_CALL": _fmt_margin_call,
@@ -176,6 +186,7 @@ _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "ACCOUNT_SUSPENDED": _fmt_account_suspended,
     "BADGE_EARNED": _fmt_badge_earned,
     "IPO_SETTLED": _fmt_ipo_settled,
+    "ALERT_TRIGGERED": _fmt_alert_triggered,
 }
 
 

@@ -23,6 +23,7 @@ import psycopg
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
+from stockbot.alerts.service import cancel_for_instrument, cancel_for_user
 from stockbot.ledger.service import (
     get_system_account_id,
     get_user_account_id,
@@ -142,6 +143,7 @@ async def ledger_audit(conn: AsyncConnection) -> LedgerAuditReport:
 # always finite and nonzero where a zero would divide.
 CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "accounts.min_discord_age_days": (0, 3650),
+    "alerts.max_per_user": (1, 1e4),
     "audit.every_n_ticks": (1, 1e6),
     "cross.collar_pct": (0.0001, 1.0),
     "cross.trade_through_epsilon": (0.0, 1.0),
@@ -327,6 +329,9 @@ async def disable_user(
             (user_id,),
         )
         cancelled = cur.rowcount
+        # Same gap as resting orders: a suspended user's open alerts would
+        # keep firing DMs forever -- the sweep never consults bootstrap.
+        await cancel_for_user(conn, user_id)
         await cur.execute(
             """
             INSERT INTO notifications (user_id, kind, payload)
@@ -645,6 +650,7 @@ class DelistReport:
     shorts_covered: int
     bounded_shorts_settled: int
     orders_cancelled: int
+    alerts_cancelled: int
     events_resolved: int
     fund_paid_minor: int
     mm_absorbed_minor: int
@@ -729,6 +735,8 @@ async def delist_instrument(conn: AsyncConnection, ticker: str) -> DelistReport:
                 (iid,),
             )
             orders_cancelled = cur.rowcount
+            # A delisted instrument can never cross anything again.
+            alerts_cancelled = await cancel_for_instrument(conn, iid)
             # resolve_due_events doesn't check is_active -- left pending, a
             # DIVIDEND would keep rescheduling onto a dead instrument.
             await cur.execute(
@@ -968,6 +976,7 @@ async def delist_instrument(conn: AsyncConnection, ticker: str) -> DelistReport:
         shorts_covered=covered,
         bounded_shorts_settled=len(bshorts),
         orders_cancelled=orders_cancelled,
+        alerts_cancelled=alerts_cancelled,
         events_resolved=events_resolved,
         fund_paid_minor=fund_paid,
         mm_absorbed_minor=mm_absorbed,

@@ -11,6 +11,7 @@ import time
 from psycopg import AsyncConnection, sql
 from psycopg.rows import dict_row
 
+from stockbot.alerts import service as alerts
 from stockbot.ipo import service as ipo
 from stockbot.maintenance import run_maintenance_if_due
 from stockbot.margin import service as margin
@@ -636,6 +637,11 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         recalls = await margin.sweep_recalls(conn, tick_index)
         liqs = await margin.sweep_undermargined(conn, tick_index)
 
+        # Price alerts fire on the tick-close mark -- after every
+        # mark-mutating step above (steps, crosses, MM fills) so an alert
+        # never waits a tick for a price it already crossed.
+        alert_fires = await alerts.sweep_alerts(conn, tick_index)
+
         # H4: trailing ADV refresh -- a sliding-window SMA of per-tick
         # notional volume (candles.volume * close). Once per tick, never
         # per-trade (finding 7): add this tick's notional, subtract the
@@ -695,7 +701,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
 
     log.info(
         "tick=%d phase=OPEN steps=%d events=%d crosses=%d mm_fills=%d "
-        "stops=%d kos=%d recalls=%d liqs=%d auction=%d ms=%.1f",
+        "stops=%d kos=%d recalls=%d liqs=%d alerts=%d auction=%d ms=%.1f",
         tick_index,
         len(results),
         stats.get("events_resolved", 0),
@@ -705,6 +711,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         kos,
         recalls,
         liqs,
+        alert_fires,
         stats.get("auction_fills", 0),
         duration_ms,
     )

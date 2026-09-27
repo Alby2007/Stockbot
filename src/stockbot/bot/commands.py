@@ -44,8 +44,10 @@ from stockbot.admin.service import (
     tune_instrument,
     user_info,
 )
+from stockbot.alerts.service import cancel_alert, create_alert, list_alerts
 from stockbot.bot.autocomplete import (
     admin_order_autocomplete,
+    alert_autocomplete,
     order_autocomplete,
     sector_autocomplete,
     shop_item_autocomplete,
@@ -1910,6 +1912,110 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
     tree.add_command(order_group)
 
+    alert_group = app_commands.Group(
+        name="alert", description="One-shot price alerts (DM on cross)"
+    )
+
+    @alert_group.command(
+        name="add", description="DM me when a ticker crosses a price"
+    )
+    @app_commands.describe(
+        ticker="Instrument ticker",
+        direction="above or below",
+        price="Target price in dollars",
+    )
+    @app_commands.choices(
+        direction=[
+            app_commands.Choice(name="above", value="ABOVE"),
+            app_commands.Choice(name="below", value="BELOW"),
+        ]
+    )
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
+    async def alert_add(
+        interaction: discord.Interaction,
+        ticker: str,
+        direction: str,
+        price: app_commands.Range[float, 0.0001, 999_999_999_999.0],
+    ) -> None:
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            try:
+                alert_id = await create_alert(
+                    conn,
+                    user_id=interaction.user.id,
+                    ticker=ticker,
+                    direction=direction,
+                    target=Decimal(str(price)),
+                )
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT quoted_price FROM instruments WHERE ticker = %s",
+                        (ticker.strip().upper(),),
+                    )
+                    mark_row = await cur.fetchone()
+            except TradingError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        assert mark_row is not None
+        await interaction.response.send_message(
+            f"Alert **#{alert_id}** set — **{ticker.strip().upper()}** "
+            f"{direction.lower()} {format_price(price)} "
+            f"(now {format_price(mark_row[0])}). I'll DM you when it crosses."
+            + _welcome_suffix(bootstrap)
+        )
+
+    @alert_group.command(name="list", description="Your open and recent alerts")
+    async def alert_list(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            rows = await list_alerts(conn, interaction.user.id)
+        if not rows["open"] and not rows["closed"]:
+            await interaction.response.send_message(
+                "No alerts — `/alert add` one and I'll DM you at the cross.",
+                ephemeral=True,
+            )
+            return
+        lines = [
+            f"**#{a['id']}** {a['ticker']} {a['direction'].lower()} "
+            f"{format_price(a['target_price'])} "
+            f"(now {format_price(a['quoted_price'])})"
+            for a in rows["open"]
+        ]
+        if rows["closed"]:
+            lines += ["— recent —"] + [
+                f"~~#{a['id']} {a['ticker']} {a['direction'].lower()} "
+                f"{format_price(a['target_price'])}~~ {a['status'].lower()}"
+                + (
+                    f" at {format_price(a['triggered_price'])}"
+                    if a["triggered_price"] is not None
+                    else ""
+                )
+                for a in rows["closed"]
+            ]
+        await interaction.response.send_message(
+            "\n".join(lines) + _welcome_suffix(bootstrap), ephemeral=True
+        )
+
+    @alert_group.command(name="cancel", description="Cancel an open alert")
+    @app_commands.describe(alert_id="Alert id from /alert list")
+    @app_commands.autocomplete(alert_id=alert_autocomplete)
+    async def alert_cancel(interaction: discord.Interaction, alert_id: int) -> None:
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            cancelled = await cancel_alert(
+                conn, user_id=interaction.user.id, alert_id=alert_id
+            )
+        if cancelled:
+            await interaction.response.send_message(
+                f"Cancelled alert **#{alert_id}**." + _welcome_suffix(bootstrap)
+            )
+        else:
+            await interaction.response.send_message(
+                f"No open alert **#{alert_id}** on your account.", ephemeral=True
+            )
+
+    tree.add_command(alert_group)
+
     shop_group = app_commands.Group(
         name="shop", description="Portfolio slots, analyst tools, and cosmetics"
     )
@@ -2660,6 +2766,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"Shorts covered: {report.shorts_covered}",
             f"Bounded shorts settled: {report.bounded_shorts_settled}",
             f"Open orders cancelled: {report.orders_cancelled}",
+            f"Price alerts cancelled: {report.alerts_cancelled}",
             f"Pending events resolved: {report.events_resolved}",
         ]
         if report.fund_paid_minor or report.mm_absorbed_minor:
