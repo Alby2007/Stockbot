@@ -29,3 +29,9 @@ class AlreadyEnteredError(SeasonError):
         self.season_id = season_id
         self.user_id = user_id
         super().__init__(f"already entered season {season_id}")
+
+
+class SandboxAlreadyOpenError(SeasonError):
+    def __init__(self, season_id: int):
+        self.season_id = season_id
+        super().__init__(f"sandbox season {season_id} is already running")

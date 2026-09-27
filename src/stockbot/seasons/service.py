@@ -42,6 +42,7 @@ from stockbot.market.engine import TICKS_PER_DAY
 from stockbot.seasons.errors import (
     AlreadyEnteredError,
     NoOpenSeasonError,
+    SandboxAlreadyOpenError,
     SeasonNotFoundError,
     SeasonNotOpenError,
 )
@@ -68,6 +69,7 @@ class Season:
     entry_fee_minor: int
     stake_minor: int
     prize_pool_minor: int
+    sandbox_user_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,9 @@ def _season_from_row(row: dict[str, Any]) -> Season:
         entry_fee_minor=int(row["entry_fee_minor"]),
         stake_minor=int(row["stake_minor"]),
         prize_pool_minor=int(row["prize_pool_minor"]),
+        sandbox_user_id=(
+            int(row["sandbox_user_id"]) if row["sandbox_user_id"] is not None else None
+        ),
     )
 
 
@@ -140,6 +145,7 @@ async def get_open_season(conn: AsyncConnection) -> Season | None:
             """
             SELECT * FROM seasons
             WHERE status IN ('ACTIVE', 'SCHEDULED')
+              AND sandbox_user_id IS NULL
             ORDER BY CASE status WHEN 'ACTIVE' THEN 0 ELSE 1 END, start_tick
             LIMIT 1
             """
@@ -154,6 +160,7 @@ async def get_latest_season(conn: AsyncConnection) -> Season | None:
         await cur.execute(
             """
             SELECT * FROM seasons
+            WHERE sandbox_user_id IS NULL
             ORDER BY CASE status WHEN 'ACTIVE' THEN 0 WHEN 'SCHEDULED' THEN 1 ELSE 2 END,
                      start_tick DESC
             LIMIT 1
@@ -285,6 +292,7 @@ async def get_active_entry(
                 FROM season_entries e
                 JOIN seasons s ON s.id = e.season_id
                 WHERE e.user_id = %s AND s.status = 'ACTIVE'
+                  AND s.sandbox_user_id IS NULL
                 ORDER BY s.start_tick DESC
                 LIMIT 1
                 """,
@@ -297,11 +305,87 @@ async def get_active_entry(
                 FROM season_entries e
                 JOIN seasons s ON s.id = e.season_id
                 WHERE e.user_id = %s AND e.season_id = %s AND s.status = 'ACTIVE'
+                  AND s.sandbox_user_id IS NULL
                 """,
                 (user_id, season_id),
             )
         row = await cur.fetchone()
     return (int(row[0]), int(row[1])) if row else None
+
+
+# Sandbox: a personal, resettable practice season. sandbox_user_id marks the
+# season as private -- get_open_season/get_active_entry filter those rows out
+# so a sandbox never becomes "the season" for league joins, standings, or the
+# league flag's entry resolution; the sandbox flag resolves it explicitly via
+# get_sandbox_entry. Close takes the sandbox branch of _close_season_claimed:
+# no scoring, trophies, or result DMs, just the SINK sweep.
+SANDBOX_END_TICK_OFFSET = 2_000_000_000  # effectively never auto-closes
+
+
+async def _sandbox_stake_minor(conn: AsyncConnection) -> int:
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT value FROM config WHERE key = 'sandbox.stake_minor'")
+        row = await cur.fetchone()
+    return int(row[0]) if row else 10_000
+
+
+async def get_sandbox_entry(conn: AsyncConnection, user_id: int) -> tuple[int, int] | None:
+    """The user's (season_id, league_account_id) in their ACTIVE sandbox."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT e.season_id, e.account_id
+            FROM seasons s
+            JOIN season_entries e ON e.season_id = s.id AND e.user_id = %s
+            WHERE s.sandbox_user_id = %s AND s.status = 'ACTIVE'
+            LIMIT 1
+            """,
+            (user_id, user_id),
+        )
+        row = await cur.fetchone()
+    return (int(row[0]), int(row[1])) if row else None
+
+
+async def open_sandbox(conn: AsyncConnection, user_id: int) -> int:
+    """Create the user's sandbox season and join it. Returns the season id."""
+    existing = await get_sandbox_entry(conn, user_id)
+    if existing is not None:
+        raise SandboxAlreadyOpenError(existing[0])
+    tick = await current_tick(conn)
+    stake_minor = await _sandbox_stake_minor(conn)
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO seasons
+                    (name, status, start_tick, end_tick, entry_fee_minor,
+                     stake_minor, sandbox_user_id)
+                VALUES (%s, 'ACTIVE', %s, %s, 0, %s, %s)
+                RETURNING id
+                """,
+                (
+                    f"Sandbox {user_id}",
+                    max(tick, 0),
+                    max(tick, 0) + SANDBOX_END_TICK_OFFSET,
+                    stake_minor,
+                    user_id,
+                ),
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            season_id = int(row[0])
+    # Fee 0 skips the spend check inside join_season; the stake mints
+    # FAUCET -> league account, which stays quarantined there.
+    await join_season(conn, user_id, season_id)
+    return season_id
+
+
+async def reset_sandbox(conn: AsyncConnection, user_id: int) -> int:
+    """Close the running sandbox and open a fresh one. Returns the new id."""
+    existing = await get_sandbox_entry(conn, user_id)
+    if existing is not None:
+        await close_season(conn, existing[0])
+    return await open_sandbox(conn, user_id)
 
 
 # Reusable subquery: mark-to-market value of open bounded shorts, floored at
@@ -408,6 +492,7 @@ async def on_tick(
                 LEFT JOIN ({_SHORT_VALUE_SUBQUERY}) sh
                        ON sh.season_id = e.season_id AND sh.user_id = e.user_id
                 WHERE s.status = 'ACTIVE'
+                  AND s.sandbox_user_id IS NULL
                   AND s.start_tick <= %s AND %s <= s.end_tick
                 ON CONFLICT DO NOTHING
                 """,
@@ -518,6 +603,29 @@ async def _close_season_claimed(conn: AsyncConnection, season_id: int) -> None:
             (season_id,),
         )
         entries = await dcur.fetchall()
+
+    if season.sandbox_user_id is not None:
+        # Sandbox reset: no scoring, trophies, standings, or result DMs --
+        # just sweep the stake back to SINK and cancel resting orders.
+        sink_id = await get_system_account_id(conn, "SINK")
+        for entry in entries:
+            balance = await get_balance(conn, int(entry["account_id"]))
+            if balance > 0:
+                await post_transfer(
+                    conn,
+                    from_account_id=int(entry["account_id"]),
+                    to_account_id=sink_id,
+                    amount=balance,
+                    reason="LEAGUE_RETURN",
+                    memo=season.name,
+                )
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE orders SET status = 'CANCELLED' "
+                "WHERE season_id = %s AND status = 'OPEN'",
+                (season_id,),
+            )
+        return
 
     # Final equity snapshot at close so the last partial day counts.
     for entry in entries:

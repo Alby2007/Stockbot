@@ -246,6 +246,28 @@ Streak shield: `claim_daily` returns a THIRD element `shield_used` —
 gap==2 days + owned shield → consume + streak continues; gap≥3 doesn't
 consume. `alert_pack` adds `10×quantity` to `alerts.max_per_user` in
 `create_alert`.
+Pro Terminal (0049): `pro_terminal` is a 30-day ANALYST_TOOL (renewals
+reuse entitlement expiry). `/stock` gates `status.pro_terminal_stats`
+(7d range, daily realized vol from close returns, 24h buy/sell flow
+split, raw ADV, next-event countdown) on `owns_item`. Charts add 2w/1M
+spans (`chart_view.MAX_SPAN_PRO`=19200): `/chart` choices and every
+button click resolve the clicker's entitlement; `load_chart_prefs`/
+`next_window` take `max_span` so an expired user clamps back to 6720.
+Sandbox (0050): `sandbox_access` PERK → `seasons.sandbox_user_id`
+marks a season as one user's private practice sandbox. It reuses the
+LEAGUE-account quarantine verbatim (`open_sandbox` inserts an ACTIVE
+season with `end_tick` ≈ +2e9 and `join_season`s — fee 0 skips the
+spend check, `sandbox.stake_minor`=$100 mints FAUCET→league acct).
+Every league lookup (`get_open_season`, `get_latest_season`,
+`get_active_entry`, the `on_tick` snapshot insert) filters
+`sandbox_user_id IS NULL` so a sandbox can never surface as "the
+season"; `get_sandbox_entry` resolves it explicitly for the `sandbox`
+flag on `/buy` `/sell` `/portfolio` (precedence: sandbox > league >
+main). Closing a sandbox takes the early-return branch of
+`_close_season_claimed` — no scoring, trophies, or SEASON_RESULT DMs,
+just the SINK sweep + open-order cancel. `/sandbox open|status|reset`;
+`reset_sandbox` = close + reopen. Sandbox trades are ordinary
+season-scoped `trades` rows, so quests and volume badges count them.
 `market_ticks` row itself (duration_ms, fills, crosses, stops_triggered,
 knockouts, liquidations, events_resolved) plus one structured log line
 (`tick=N phase=… crosses=… ms=…`) — tick 4532 is fully re-describable

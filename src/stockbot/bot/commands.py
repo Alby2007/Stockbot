@@ -109,7 +109,7 @@ from stockbot.orders.service import (
     place_order,
 )
 from stockbot.quests.service import RerollError, list_quests, reroll_quest
-from stockbot.seasons.errors import SeasonError
+from stockbot.seasons.errors import SandboxAlreadyOpenError, SeasonError
 from stockbot.seasons.service import (
     close_season,
     create_season,
@@ -117,8 +117,12 @@ from stockbot.seasons.service import (
     get_active_entry,
     get_latest_season,
     get_open_season,
+    get_sandbox_entry,
+    get_season,
     join_season,
     league_equity_minor,
+    open_sandbox,
+    reset_sandbox,
     standings,
 )
 from stockbot.shop.errors import NotOwnedError, ShopError
@@ -928,16 +932,28 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.response.send_message(embed=embed)
 
     @tree.command(name="portfolio", description="Show your positions and net worth")
-    @app_commands.describe(league="Show your league portfolio instead of your main one")
-    async def portfolio(interaction: discord.Interaction, league: bool = False) -> None:
+    @app_commands.describe(
+        league="Show your league portfolio instead of your main one",
+        sandbox="Show your sandbox portfolio instead of your main one",
+    )
+    async def portfolio(
+        interaction: discord.Interaction, league: bool = False, sandbox: bool = False
+    ) -> None:
         async with db.connection() as conn:
             season_id: int | None = None
             bootstrap: BootstrapResult | None = None
-            if league:
-                entry = await get_active_entry(conn, interaction.user.id)
+            scope = "sandbox" if sandbox else "league" if league else ""
+            if sandbox or league:
+                entry = await (
+                    get_sandbox_entry(conn, interaction.user.id)
+                    if sandbox
+                    else get_active_entry(conn, interaction.user.id)
+                )
                 if entry is None:
                     await interaction.response.send_message(
-                        "You're not entered in an active season. `/league join` first.",
+                        "You don't have a sandbox running. `/sandbox open` first."
+                        if sandbox
+                        else "You're not entered in an active season. `/league join` first.",
                         ephemeral=True,
                     )
                     return
@@ -984,13 +1000,15 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         lines.append(f"\nNet worth: {format_money(net_worth_minor)}")
 
         embed = discord.Embed(
-            title=f"{interaction.user.display_name}'s {'league' if league else ''} portfolio"
+            title=f"{interaction.user.display_name}'s {scope + ' ' if scope else ''}portfolio"
         )
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         if not positions:
             embed.set_footer(
                 text=(
-                    "No league positions — /league standings shows the board."
+                    "No sandbox positions — /sandbox status shows the account."
+                    if sandbox
+                    else "No league positions — /league standings shows the board."
                     if league
                     else "No positions yet — /market shows what's tradeable."
                 )
@@ -1333,6 +1351,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         dollars="Spend ~this many dollars instead of giving a share count",
         all_in="Spend your entire cash balance on this instrument",
         league="Trade from your season league stake instead of your main portfolio",
+        sandbox="Trade from your sandbox stake instead of your main portfolio",
         slippage="Max slippage vs the mark, in percent (e.g. 2.5)",
     )
     @app_commands.autocomplete(ticker=ticker_autocomplete)
@@ -1345,10 +1364,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         dollars: app_commands.Range[float, 0.01, 1_000_000_000.0] | None = None,
         all_in: bool = False,
         league: bool = False,
+        sandbox: bool = False,
         slippage: app_commands.Range[float, 0.01, 100.0] | None = None,
     ) -> None:
         await _do_trade(
-            interaction, ticker, "BUY", quantity, dollars, all_in, league, slippage
+            interaction, ticker, "BUY", quantity, dollars, all_in, league, sandbox, slippage
         )
 
     @tree.command(name="sell", description="Sell shares of an instrument")
@@ -1358,6 +1378,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         dollars="Sell ~this many dollars' worth instead of giving a share count",
         all_in="Sell your entire position",
         league="Trade from your season league stake instead of your main portfolio",
+        sandbox="Trade from your sandbox stake instead of your main portfolio",
         slippage="Max slippage vs the mark, in percent (e.g. 2.5)",
         short="Opt in to selling past your position (opens a margin short)",
     )
@@ -1369,12 +1390,13 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         dollars: app_commands.Range[float, 0.01, 1_000_000_000.0] | None = None,
         all_in: bool = False,
         league: bool = False,
+        sandbox: bool = False,
         slippage: app_commands.Range[float, 0.01, 100.0] | None = None,
         short: bool = False,
     ) -> None:
         await _do_trade(
             interaction, ticker, "SELL", quantity, dollars, all_in, league,
-            slippage, short,
+            sandbox, slippage, short,
         )
 
     async def _do_trade(
@@ -1385,6 +1407,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         dollars: float | None,
         all_in: bool,
         league: bool,
+        sandbox: bool,
         slippage: float | None,
         short: bool = False,
     ) -> None:
@@ -1392,11 +1415,17 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
             account_id = bootstrap.account_id
             season_id: int | None = None
-            if league:
-                entry = await get_active_entry(conn, interaction.user.id)
+            if sandbox or league:
+                entry = await (
+                    get_sandbox_entry(conn, interaction.user.id)
+                    if sandbox
+                    else get_active_entry(conn, interaction.user.id)
+                )
                 if entry is None:
                     await interaction.response.send_message(
-                        "You're not entered in an active season. `/league join` first.",
+                        "You don't have a sandbox running. `/sandbox open` first."
+                        if sandbox
+                        else "You're not entered in an active season. `/league join` first.",
                         ephemeral=True,
                     )
                     return
@@ -2569,6 +2598,118 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.response.send_message(embed=embed)
 
     tree.add_command(league_group)
+
+    sandbox_group = app_commands.Group(
+        name="sandbox",
+        description="Private practice portfolio — resets free, never touches net worth",
+    )
+
+    @sandbox_group.command(
+        name="open", description="Open your sandbox account (needs Sandbox access)"
+    )
+    async def sandbox_open(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            if not await owns_item(conn, interaction.user.id, "sandbox_access"):
+                await interaction.response.send_message(
+                    "Sandbox requires **Sandbox access** — `/shop buy item:sandbox_access`.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                season_id = await open_sandbox(conn, interaction.user.id)
+            except SandboxAlreadyOpenError:
+                await interaction.response.send_message(
+                    "Your sandbox is already running — `/sandbox status` or "
+                    "`/sandbox reset` to start over.",
+                    ephemeral=True,
+                )
+                return
+            season = await get_season(conn, season_id)
+        stake = season.stake_minor if season else 0
+        await interaction.response.send_message(
+            f"Sandbox open — **{format_money(stake)}** practice stake, "
+            "quarantined from your real portfolio. Trade with "
+            "`/buy` `/sell` `sandbox:True` and watch it with "
+            "`/portfolio sandbox:True`."
+            + _welcome_suffix(bootstrap)
+        )
+
+    @sandbox_group.command(name="status", description="Show your sandbox account")
+    async def sandbox_status(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            entry = await get_sandbox_entry(conn, interaction.user.id)
+            if entry is None:
+                await interaction.response.send_message(
+                    "No sandbox running — `/sandbox open` starts one "
+                    "(needs Sandbox access from `/shop`).",
+                    ephemeral=True,
+                )
+                return
+            season_id, _account_id = entry
+            season = await get_season(conn, season_id)
+            equity = await league_equity_minor(conn, season_id, interaction.user.id)
+            cash = await get_balance(conn, entry[1])
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT COUNT(*), COUNT(*) FILTER (WHERE p.quantity < 0)
+                    FROM positions p
+                    WHERE p.user_id = %s AND p.season_id = %s AND p.quantity <> 0
+                    """,
+                    (interaction.user.id, season_id),
+                )
+                row = await cur.fetchone()
+                assert row is not None
+                pos_count, short_count = int(row[0]), int(row[1])
+            assert season is not None
+            tick_age = max((await current_tick(conn)) - season.start_tick, 0)
+        embed = discord.Embed(title="Sandbox")
+        embed.add_field(name="Equity", value=format_money(equity))
+        embed.add_field(name="Cash", value=format_money(cash))
+        embed.add_field(
+            name="Positions",
+            value=(
+                f"{pos_count} open"
+                + (f" ({short_count} short)" if short_count else "")
+            ),
+        )
+        embed.set_footer(
+            text=(
+                f"Opened {tick_age} ticks ago · /sandbox reset starts over · "
+                "sandbox trades count toward quests and volume but never net worth"
+            )
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @sandbox_group.command(
+        name="reset", description="Wipe your sandbox and start a fresh stake"
+    )
+    async def sandbox_reset(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            if not await owns_item(conn, interaction.user.id, "sandbox_access"):
+                await interaction.response.send_message(
+                    "Sandbox requires **Sandbox access** — `/shop buy item:sandbox_access`.",
+                    ephemeral=True,
+                )
+                return
+            had = await get_sandbox_entry(conn, interaction.user.id)
+            season_id = await reset_sandbox(conn, interaction.user.id)
+            season = await get_season(conn, season_id)
+        stake = season.stake_minor if season else 0
+        await interaction.response.send_message(
+            (
+                "Sandbox reset — old positions and cash wiped, "
+                if had
+                else "Sandbox opened — "
+            )
+            + f"fresh **{format_money(stake)}** stake."
+            + _welcome_suffix(bootstrap)
+        )
+
+    tree.add_command(sandbox_group)
 
     # default_permissions hides the whole group from the slash picker
     # for non-admins (N4.5); _is_admin stays as the runtime gate --
