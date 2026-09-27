@@ -161,6 +161,21 @@ async def evaluate_badges(
             """
         )
         granted += [(int(r[0]), str(r[1])) for r in await cur.fetchall()]
+        # Lifetime quest completions (users.quests_completed, bumped by
+        # the quest sweep on every reward).
+        await cur.execute(
+            """
+            INSERT INTO entitlements (user_id, item_key)
+            SELECT u.id, s.key
+            FROM users u
+            JOIN shop_items s
+              ON s.kind = 'BADGE' AND s.metadata->>'metric' = 'quests'
+            WHERE u.quests_completed >= (s.metadata->>'threshold')::int
+            ON CONFLICT DO NOTHING
+            RETURNING user_id, item_key
+            """
+        )
+        granted += [(int(r[0]), str(r[1])) for r in await cur.fetchall()]
         for user_id, item_key in granted:
             await cur.execute(
                 """

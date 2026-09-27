@@ -22,6 +22,7 @@ from stockbot.observability import (
     write_heartbeat,
 )
 from stockbot.orders import service as orders
+from stockbot.quests import service as quests
 from stockbot.seasons import service as seasons
 from stockbot.shorts import service as shorts
 from stockbot.status.service import evaluate_badges, snapshot_net_worth_if_due
@@ -100,6 +101,10 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             await snapshot_net_worth_if_due(conn, tick_index)
             await evaluate_badges(conn, tick_index)
             await ipo.settle_due(conn, tick_index)
+            # Quest rotation can land on a closed tick, and alert/IPO
+            # actions aren't session-gated -- sweep here too.
+            await quests.on_tick(conn, tick_index)
+            quest_fires = await quests.sweep_completions(conn, tick_index)
             duration_ms = (time.perf_counter() - started) * 1000
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -111,8 +116,9 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             )
             log.info(
                 "tick=%d phase=CLOSED steps=0 events=0 crosses=0 mm_fills=0 "
-                "stops=0 kos=0 liqs=0 ms=%.1f",
+                "stops=0 kos=0 liqs=0 quests=%d ms=%.1f",
                 tick_index,
+                quest_fires,
                 duration_ms,
             )
             await _post_tick(conn, tick_index)
@@ -672,6 +678,10 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         await snapshot_net_worth_if_due(conn, tick_index)
         await evaluate_badges(conn, tick_index)
         await ipo.settle_due(conn, tick_index)
+        # Quest rotation at day boundaries, then the completion sweep
+        # LAST so all of this tick's fills/KOs/covers count.
+        await quests.on_tick(conn, tick_index)
+        quest_fires = await quests.sweep_completions(conn, tick_index)
 
         duration_ms = (time.perf_counter() - started) * 1000
         async with conn.cursor() as cur:
@@ -701,7 +711,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
 
     log.info(
         "tick=%d phase=OPEN steps=%d events=%d crosses=%d mm_fills=%d "
-        "stops=%d kos=%d recalls=%d liqs=%d alerts=%d auction=%d ms=%.1f",
+        "stops=%d kos=%d recalls=%d liqs=%d alerts=%d quests=%d auction=%d ms=%.1f",
         tick_index,
         len(results),
         stats.get("events_resolved", 0),
@@ -712,6 +722,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         recalls,
         liqs,
         alert_fires,
+        quest_fires,
         stats.get("auction_fills", 0),
         duration_ms,
     )

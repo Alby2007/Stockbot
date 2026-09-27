@@ -12,6 +12,7 @@ Insert sites (all inside the event's own transaction):
     status/service.py     evaluate_badges  -> BADGE_EARNED
     ipo/service.py        settle_due       -> IPO_SETTLED
     alerts/service.py     sweep_alerts     -> ALERT_TRIGGERED
+    quests/service.py     sweep_completions -> QUEST_COMPLETED
 """
 
 from __future__ import annotations
@@ -176,6 +177,13 @@ def _fmt_alert_triggered(items: list[dict[str, Any]]) -> str:
     return "Price alert" + ("s" if len(items) > 1 else "") + ": " + "; ".join(parts)
 
 
+def _fmt_quest_completed(items: list[dict[str, Any]]) -> str:
+    parts = [
+        f"{p['name']} (+{format_money(p['reward_minor'])})" for p in items
+    ]
+    return "Quest complete: " + "; ".join(parts)
+
+
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "LIQUIDATION": _fmt_liquidation,
     "MARGIN_CALL": _fmt_margin_call,
@@ -187,6 +195,7 @@ _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "BADGE_EARNED": _fmt_badge_earned,
     "IPO_SETTLED": _fmt_ipo_settled,
     "ALERT_TRIGGERED": _fmt_alert_triggered,
+    "QUEST_COMPLETED": _fmt_quest_completed,
 }
 
 

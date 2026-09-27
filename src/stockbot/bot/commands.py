@@ -104,6 +104,7 @@ from stockbot.orders.service import (
     place_oco,
     place_order,
 )
+from stockbot.quests.service import list_quests
 from stockbot.seasons.errors import SeasonError
 from stockbot.seasons.service import (
     close_season,
@@ -366,7 +367,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             name="Compete",
             value=(
                 "`/league` seasons are opt-in equal-stake competitions · "
-                "`/leaderboard` ranks everyone by net worth."
+                "`/leaderboard` ranks everyone by net worth · `/quests` "
+                "pays faucet rewards for daily/weekly tasks."
             ),
             inline=False,
         )
@@ -984,6 +986,49 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ]
         embed = discord.Embed(title="Recent trades")
         embed.description = "```\n" + "\n".join(lines) + "\n```"
+        await interaction.response.send_message(
+            content=_welcome_suffix(bootstrap) or None, embed=embed
+        )
+
+    @tree.command(
+        name="quests", description="Today's and this week's quests and your progress"
+    )
+    async def quests_cmd(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            tick_index = await current_tick_index(conn)
+            rows = await list_quests(conn, interaction.user.id, tick_index or 0)
+        if not rows:
+            await interaction.response.send_message(
+                "No active quests — the board rotates at the next day "
+                "boundary." + _welcome_suffix(bootstrap),
+                ephemeral=True,
+            )
+            return
+
+        def _quest_line(q: dict[str, Any]) -> str:
+            done = "✓ " if q["completed"] else ""
+            return (
+                f"{done}**{q['name']}** — {q['progress']}/{q['target']} · "
+                f"+{format_money(q['reward_minor'])}"
+            )
+
+        embed = discord.Embed(title="Quests")
+        daily = [q for q in rows if q["period"] == "DAILY"]
+        weekly = [q for q in rows if q["period"] == "WEEKLY"]
+        if daily:
+            hours = daily[0]["ticks_remaining"] / 60
+            embed.add_field(
+                name=f"Today — resets in ~{hours:.0f}h",
+                value="\n".join(_quest_line(q) for q in daily),
+                inline=False,
+            )
+        if weekly:
+            embed.add_field(
+                name="This week",
+                value="\n".join(_quest_line(q) for q in weekly),
+                inline=False,
+            )
         await interaction.response.send_message(
             content=_welcome_suffix(bootstrap) or None, embed=embed
         )

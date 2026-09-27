@@ -1077,3 +1077,19 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   next tick. `alerts.max_per_user` (default 25) caps open alerts.
   `disable_user` and `delist_instrument` bulk-cancel open alerts (the
   sweep never consults bootstrap — same gap as resting orders).
+- **Quests** (0045): daily/weekly rotating tasks measured entirely
+  read-side — `quest_defs` catalog, `quest_instances` (deterministic
+  shared pick per day via `hashtext(key||':'||day_index)`, window =
+  [boundary_tick, +TICKS_PER_DAY)), `quest_completions` (PK is the
+  pay-once key). `quests.on_tick` rotates at `tick % 1440 == 0` (both
+  phases — rotation can land on a closed tick) and expires stale
+  windows; `sweep_completions` runs EVERY tick (open and closed),
+  one grouped INSERT..ON CONFLICT DO NOTHING per kind, paying FAUCET→
+  main account via post_transfer + `QUEST_COMPLETED` outbox + bumping
+  `users.quests_completed` (feeds the `quests` badge metric).
+  `quest_instances.kind` is snapshotted with target/reward — def edits
+  never mutate live quests. `IPO_SUBSCRIBE` is skipped in rotation when
+  no offering is open. `quests.enabled` gates both rotation and sweep;
+  counts are tuned by `quests.daily_count`/`weekly_count`. Kill-switch
+  note for tests: apply_tick runs the rotation itself at tick 0, so
+  quest tests zero `quests.*_count` config before driving real actions.

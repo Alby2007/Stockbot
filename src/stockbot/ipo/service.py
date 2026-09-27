@@ -186,13 +186,14 @@ async def subscribe(
         )
         await cur.execute(
             """
-            INSERT INTO ipo_subscriptions (offering_id, user_id, amount_minor)
-            VALUES (%s, %s, %s)
+            INSERT INTO ipo_subscriptions
+                (offering_id, user_id, amount_minor, created_tick)
+            VALUES (%s, %s, %s, %s)
             ON CONFLICT (offering_id, user_id) DO UPDATE
                 SET amount_minor = ipo_subscriptions.amount_minor + EXCLUDED.amount_minor,
                     updated_at = now()
             """,
-            (offering_id, user_id, amount_minor),
+            (offering_id, user_id, amount_minor, tick),
         )
         await cur.execute(
             """
