@@ -49,17 +49,17 @@ async def _instrument_id(conn: AsyncConnection) -> int:
 
 def test_cid_roundtrip() -> None:
     cid = encode_cid("panl", 21, 1528, 240)
-    assert parse_cid(cid) == ("panl", 21, 1528, 240, "time")
+    assert parse_cid(cid) == ("panl", 21, 1528, 240, "time", None)
     assert len(cid) < 100  # Discord's custom_id cap
 
     cid2 = encode_cid("zin", 7, 300, 120, "ticks")
-    assert parse_cid(cid2) == ("zin", 7, 300, 120, "ticks")
+    assert parse_cid(cid2) == ("zin", 7, 300, 120, "ticks", None)
 
 
 def test_parse_cid_legacy_defaults_to_time() -> None:
     """Buttons on pre-axis charts carry 5-field cids; they parse as the
     default axis so old messages keep working after the upgrade."""
-    assert parse_cid("cbt:panr:5:640:240") == ("panr", 5, 640, 240, "time")
+    assert parse_cid("cbt:panr:5:640:240") == ("panr", 5, 640, 240, "time", None)
 
 
 @pytest.mark.parametrize(
@@ -70,7 +70,7 @@ def test_parse_cid_legacy_defaults_to_time() -> None:
         "cbt:panl:1:2",  # missing a field
         "cbt:panl:1:2:3:4",  # unknown axis value
         "cbt:panl:1:2:3:bogus",
-        "cbt:panl:1:2:3:time:extra",  # too many fields
+        "cbt:panl:1:2:3:time:extra:more",  # too many fields
         "cbt:panl:x:2:3",
         "cbt:panl:1:2:x",
         "",
@@ -122,7 +122,10 @@ def test_build_chart_view_encodes_window() -> None:
     buttons = [c for c in view.children if isinstance(c, discord.ui.Button)]
     assert len(buttons) == 10
     parsed = [parse_cid(str(b.custom_id)) for b in buttons]
-    assert all(p is not None and p[1:] == (21, 1528, 240, "time") for p in parsed)
+    assert all(
+        p is not None and p[1:] == (21, 1528, 240, "time", None)
+        for p in parsed
+    )
     assert {p[0] for p in parsed if p} == {
         "panl",
         "panr",
@@ -143,11 +146,11 @@ def test_build_chart_view_axis_state() -> None:
     view = build_chart_view(21, 1528, 240, axis="ticks")
     buttons = {str(b.custom_id).split(":")[1]: b for b in view.children}
     assert parse_cid(str(buttons["panl"].custom_id)) == (
-        "panl", 21, 1528, 240, "ticks"
+        "panl", 21, 1528, 240, "ticks", None
     )
     ax = buttons["ax"]
     # cid still encodes the CURRENT axis; the label advertises the target.
-    assert parse_cid(str(ax.custom_id)) == ("ax", 21, 1528, 240, "ticks")
+    assert parse_cid(str(ax.custom_id)) == ("ax", 21, 1528, 240, "ticks", None)
     assert ax.label == "Axis: time"
 
     view_time = build_chart_view(21, 1528, 240, axis="time")
@@ -235,13 +238,13 @@ async def test_handler_dedups_concurrent_dispatch() -> None:
 async def test_chart_prefs_roundtrip(conn: AsyncConnection) -> None:
     assert await load_chart_prefs(conn, 999_001) is None
     await save_chart_prefs(conn, 999_001, 60, "ticks")
-    assert await load_chart_prefs(conn, 999_001) == (60, "ticks")
+    assert await load_chart_prefs(conn, 999_001) == (60, "ticks", None)
 
 
 async def test_chart_prefs_upsert_overwrites(conn: AsyncConnection) -> None:
     await save_chart_prefs(conn, 999_002, 60, "ticks")
     await save_chart_prefs(conn, 999_002, 4800, "time")
-    assert await load_chart_prefs(conn, 999_002) == (4800, "time")
+    assert await load_chart_prefs(conn, 999_002) == (4800, "time", None)
 
 
 async def test_chart_prefs_span_clamps_on_load(conn: AsyncConnection) -> None:
@@ -253,4 +256,4 @@ async def test_chart_prefs_span_clamps_on_load(conn: AsyncConnection) -> None:
             "VALUES (%s, %s, 'time')",
             (999_003, MAX_SPAN * 4),
         )
-    assert await load_chart_prefs(conn, 999_003) == (MAX_SPAN, "time")
+    assert await load_chart_prefs(conn, 999_003) == (MAX_SPAN, "time", None)

@@ -125,6 +125,7 @@ from stockbot.shop.service import (
     get_slot_count,
     get_user_entitlements,
     list_items,
+    owns_item,
     slot_price,
 )
 from stockbot.shorts.service import (
@@ -666,13 +667,19 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 resolved_axis = prefs[1] if prefs else "time"
             else:
                 resolved_axis = axis if axis in ("time", "ticks") else "time"
+            # Equipped theme renders only while the entitlement is live.
+            theme = prefs[2] if prefs else None
+            if theme is not None and not await owns_item(
+                conn, interaction.user.id, theme
+            ):
+                theme = None
             if timeframe is not None or axis is not None:
                 await save_chart_prefs(
                     conn, interaction.user.id, span, resolved_axis
                 )
             result = await render_candle_chart(
                 conn, snapshot.id, snapshot.ticker,
-                span=span, axis=resolved_axis,
+                span=span, axis=resolved_axis, theme=theme,
             )
 
         if result is None:
@@ -694,7 +701,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.followup.send(
             embed=embed,
             file=file,
-            view=build_chart_view(snapshot.id, end, span, resolved_axis),
+            view=build_chart_view(
+                snapshot.id, end, span, resolved_axis, theme
+            ),
         )
 
     @tree.command(name="movers", description="Show today's biggest gainers and losers")

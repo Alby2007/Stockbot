@@ -17,17 +17,49 @@ from matplotlib.figure import Figure  # noqa: E402
 from matplotlib.patches import Rectangle  # noqa: E402
 from matplotlib.ticker import FuncFormatter, MaxNLocator  # noqa: E402
 from psycopg import AsyncConnection  # noqa: E402
+from psycopg.rows import dict_row  # noqa: E402
 
-# TradingView-style dark terminal palette.
-_BG = "#131722"
-_UP = "#26a69a"
-_DOWN = "#ef5350"
-_GRID = "#ffffff"
-_TEXT = "#b2b5be"
-_SPINE = "#2a2e39"
-_MUTED = "#5a5f6b"
-_HALT_FLOW = "#ff9800"
-_HALT_MODEL = "#ef5350"
+from stockbot.shop.service import palette_from_metadata  # noqa: E402
+
+# TradingView-style dark terminal palette -- the default every themed
+# palette merges over, so a theme only needs to set the keys it changes.
+_DEFAULT_PALETTE = {
+    "bg": "#131722",
+    "up": "#26a69a",
+    "down": "#ef5350",
+    "grid": "#ffffff",
+    "text": "#b2b5be",
+    "accent": "#26a69a",
+    "spine": "#2a2e39",
+    "muted": "#5a5f6b",
+    "halt_flow": "#ff9800",
+    "halt_model": "#ef5350",
+    "pill_text": "#ffffff",
+}
+
+# Theme shop rows are static (a palette, once loaded, never changes), so
+# resolution caches forever: {item_key: palette|None} -- None = not a
+# theme row, render falls back to defaults.
+_THEME_CACHE: dict[str, dict[str, str] | None] = {}
+
+
+async def _palette_for(
+    conn: AsyncConnection, theme: str | None
+) -> dict[str, str]:
+    if theme is None:
+        return _DEFAULT_PALETTE
+    if theme not in _THEME_CACHE:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT metadata FROM shop_items WHERE key = %s AND kind = 'COSMETIC'",
+                (theme,),
+            )
+            row = await cur.fetchone()
+        _THEME_CACHE[theme] = (
+            palette_from_metadata(row["metadata"]) if row else None
+        )
+    pal = _THEME_CACHE[theme]
+    return _DEFAULT_PALETTE if pal is None else {**_DEFAULT_PALETTE, **pal}
 
 # Render cache: a chart PNG is a pure function of its window's candle rows,
 # so a repeat request (button spam, two users on the same ticker) can reuse
@@ -213,6 +245,7 @@ async def render_candle_chart(
     end: int | None = None,
     span: int = 240,
     axis: str = "time",
+    theme: str | None = None,
 ) -> tuple[io.BytesIO, int, Any] | None:
     """Candlestick chart of the `span` open ticks ending at `end`.
     Returns (png, resolved_end, end_ts) -- the clamped end tick for
@@ -220,16 +253,20 @@ async def render_candle_chart(
     None if the window holds no candles."""
     if axis not in ("time", "ticks"):
         axis = "time"
+    palette = await _palette_for(conn, theme)
     rows, resolved_end = await _select_window_rows(
         conn, instrument_id, end, span
     )
     if not rows or resolved_end is None:
         return None
     bucket = bucket_for_span(span)
+    # `theme` rides the fingerprint: without it the cache would serve one
+    # user's palette to everyone on the same window.
     fp = (
         instrument_id,
         span,
         axis,
+        theme or "",
         tuple((int(r[0]), float(r[4]), int(r[5])) for r in rows),
     )
     cached = _RENDER_CACHE.get(fp)
@@ -242,7 +279,7 @@ async def render_candle_chart(
         # (not pyplot) keeps it off pyplot's shared global state, which isn't
         # thread-safe.
         buf = await asyncio.to_thread(
-            _render_png, rows, ticker, span, bucket, axis
+            _render_png, rows, ticker, span, bucket, axis, palette
         )
         _RENDER_CACHE[fp] = buf.getvalue()
         while len(_RENDER_CACHE) > _RENDER_CACHE_MAX:
@@ -296,8 +333,9 @@ def _axis_formatter(
 
 def _render_png(
     rows: list[Any], ticker: str, span: int = 240, bucket: int = 1,
-    axis: str = "time",
+    axis: str = "time", palette: dict[str, str] | None = None,
 ) -> io.BytesIO:
+    p = palette or _DEFAULT_PALETTE
     rows = list(reversed(rows))
 
     ticks = [int(r[0]) for r in rows]
@@ -321,18 +359,18 @@ def _render_png(
     view = price_span + 2 * ypad
     doji_eps = view * 0.004  # minimum body height so doji stay visible
 
-    fig = Figure(figsize=(10, 6), facecolor=_BG)
+    fig = Figure(figsize=(10, 6), facecolor=p["bg"])
     gs = fig.add_gridspec(2, 1, height_ratios=(3, 1), hspace=0.05)
     ax = fig.add_subplot(gs[0])
     axv = fig.add_subplot(gs[1], sharex=ax)
     for a in (ax, axv):
-        a.set_facecolor(_BG)
-        a.tick_params(colors=_TEXT, labelsize=8)
+        a.set_facecolor(p["bg"])
+        a.tick_params(colors=p["text"], labelsize=8)
         # Horizontal gridlines only -- the session separators below carry
         # the vertical reference, without the crosshatch noise.
-        a.grid(axis="y", color=_GRID, alpha=0.06)
+        a.grid(axis="y", color=p["grid"], alpha=0.06)
         for spine in a.spines.values():
-            spine.set_color(_SPINE)
+            spine.set_color(p["spine"])
     ax.tick_params(labelbottom=False)
 
     # Ticker watermark behind everything -- cheap terminal flavor.
@@ -342,7 +380,7 @@ def _render_png(
         ticker,
         transform=ax.transAxes,
         fontsize=64,
-        color=_TEXT,
+        color=p["text"],
         alpha=0.035,
         ha="center",
         va="center",
@@ -360,7 +398,7 @@ def _render_png(
             spans.append((run_start, i - 1))
             run_start = None
     for lo_i, hi_i in spans:
-        ax.axvspan(lo_i - 0.5, hi_i + 0.5, color=_GRID, alpha=0.03, lw=0)
+        ax.axvspan(lo_i - 0.5, hi_i + 0.5, color=p["grid"], alpha=0.03, lw=0)
 
     # X positions are ordinal (0..N-1): the window holds OPEN candles only
     # (plus a short CLOSED tail), so a skipped closed run shows as a price
@@ -377,24 +415,24 @@ def _render_png(
     # a same-day close teleports the axis (07:17 -> 15:44) with no cue
     # and the reopen candle reads as a bad tick.
     for i in _session_boundaries(ticks, times, bucket):
-        ax.axvline(i - 0.5, color=_MUTED, linestyle="--", linewidth=0.9)
+        ax.axvline(i - 0.5, color=p["accent"], linestyle="--", linewidth=0.9)
         ax.text(
             i - 0.5,
             price_hi + ypad,
             _gap_tag(times[i - 1], times[i], ticks[i - 1], ticks[i]),
-            color=_TEXT,
+            color=p["text"],
             fontsize=6,
             ha="center",
             va="top",
             alpha=0.85,
-            bbox=dict(facecolor=_BG, edgecolor="none", alpha=0.8, pad=0.4),
+            bbox=dict(facecolor=p["bg"], edgecolor="none", alpha=0.8, pad=0.4),
         )
 
     # Candlesticks: wick low->high, body over [min(o,c), |o-c|].
     vol_colors = []
     for i, x in enumerate(pos):
         closed = sessions[i] == "CLOSED"
-        color = _MUTED if closed else (_UP if up[i] else _DOWN)
+        color = p["muted"] if closed else (p["up"] if up[i] else p["down"])
         ax.vlines(x, lows[i], highs[i], color=color, linewidth=wick_lw)
         body_lo = min(opens[i], closes[i])
         body_h = max(abs(closes[i] - opens[i]), doji_eps)
@@ -412,7 +450,7 @@ def _render_png(
                 highs[i] + view * 0.02,
                 marker="v",
                 s=18,
-                color=_HALT_FLOW if halts[i] == "FLOW" else _HALT_MODEL,
+                color=p["halt_flow"] if halts[i] == "FLOW" else p["halt_model"],
                 zorder=5,
                 linewidths=0,
             )
@@ -420,7 +458,7 @@ def _render_png(
     # Window OHLC + net-change legend, top-left -- the "how much did it
     # move" answer in one glance, colored by the window's direction.
     window_delta = closes[-1] / opens[0] - 1 if opens[0] else 0.0
-    window_color = _UP if closes[-1] >= opens[0] else _DOWN
+    window_color = p["up"] if closes[-1] >= opens[0] else p["down"]
     ax.text(
         0.01,
         0.98,
@@ -435,13 +473,13 @@ def _render_png(
 
     # Last-price line, colored by the final candle's direction, with a
     # TradingView-style pill pinned in the reserved right gutter.
-    last_color = _UP if up[-1] else _DOWN
+    last_color = p["up"] if up[-1] else p["down"]
     ax.axhline(closes[-1], color=last_color, linestyle="--", linewidth=0.8, alpha=0.9)
     ax.annotate(
         f"{closes[-1]:,.2f}",
         xy=(1.005, closes[-1]),
         xycoords=("axes fraction", "data"),
-        color="#ffffff",
+        color=p["pill_text"],
         fontweight="bold",
         fontsize=8,
         va="center",
@@ -457,7 +495,7 @@ def _render_png(
             (lo_i + hi_i) / 2,
             price_hi + ypad,
             "CLOSED",
-            color=_TEXT,
+            color=p["text"],
             fontsize=6,
             ha="center",
             va="top",
@@ -469,11 +507,11 @@ def _render_png(
     ax.set_title(
         f"{ticker} · {_span_label(span)}{bucket_note}"
         + (" · MARKET CLOSED" if closed_now else ""),
-        color=_TEXT,
+        color=p["text"],
         fontsize=11,
     )
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.2f}"))
-    ax.set_ylabel("price", color=_TEXT, fontsize=8)
+    ax.set_ylabel("price", color=p["text"], fontsize=8)
     ax.margins(x=0.02)
 
     axv.bar(pos, volumes, width=bar_w, color=vol_colors, alpha=0.6)
@@ -485,9 +523,9 @@ def _render_png(
         FuncFormatter(_axis_formatter(times, ticks, axis))
     )
     axv.set_xlabel(
-        "tick" if axis == "ticks" else "time (UTC)", color=_TEXT, fontsize=8
+        "tick" if axis == "ticks" else "time (UTC)", color=p["text"], fontsize=8
     )
-    axv.set_ylabel("volume", color=_TEXT, fontsize=8)
+    axv.set_ylabel("volume", color=p["text"], fontsize=8)
     axv.yaxis.set_major_formatter(
         FuncFormatter(
             lambda v, _: f"{v / 1e3:,.0f}k" if v >= 1000 else f"{max(v, 0):,.0f}"

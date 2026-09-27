@@ -67,6 +67,67 @@ async def get_slot_count(conn: AsyncConnection, user_id: int) -> int:
     return BASE_SLOTS + (row[0] if row else 0)
 
 
+# Theme palette keys a shop item's metadata may set -- anything else is
+# ignored and unspecified keys fall back to the renderer defaults.
+_PALETTE_KEYS = {
+    "up", "down", "bg", "grid", "text", "accent",
+    "spine", "muted", "halt_flow", "halt_model", "pill_text",
+}
+
+
+def palette_from_metadata(metadata: dict[str, Any] | None) -> dict[str, str] | None:
+    """Normalize a COSMETIC item's metadata into a render palette -- None
+    when the item isn't a theme. Legacy `chart_color` (pre-0046 rows) maps
+    onto up+accent when the full keys are absent."""
+    if not isinstance(metadata, dict):
+        return None
+    pal = {
+        k: v
+        for k, v in metadata.items()
+        if k in _PALETTE_KEYS and isinstance(v, str)
+    }
+    legacy = metadata.get("chart_color")
+    if isinstance(legacy, str):
+        pal.setdefault("up", legacy)
+        pal.setdefault("accent", legacy)
+    return pal or None
+
+
+def is_theme_item(kind: str, metadata: dict[str, Any] | None) -> bool:
+    return kind == "COSMETIC" and palette_from_metadata(metadata) is not None
+
+
+async def owns_item(conn: AsyncConnection, user_id: int, item_key: str) -> bool:
+    """Live (unexpired, quantity>0 by CHECK) entitlement check -- the gate
+    for equippable/unlockable shop items."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT 1 FROM entitlements
+            WHERE user_id = %s AND item_key = %s
+              AND (expires_at IS NULL OR expires_at > now())
+            """,
+            (user_id, item_key),
+        )
+        return await cur.fetchone() is not None
+
+
+async def equip_theme(conn: AsyncConnection, user_id: int, item_key: str) -> None:
+    """Write the equipped theme onto chart_prefs, creating the row with
+    default view prefs when the user has never touched a chart. Caller
+    owns ownership checks and the transaction."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            INSERT INTO chart_prefs (user_id, span, axis, theme)
+            VALUES (%s, 240, 'time', %s)
+            ON CONFLICT (user_id) DO UPDATE
+            SET theme = EXCLUDED.theme, updated_at = now()
+            """,
+            (user_id, item_key),
+        )
+
+
 async def get_user_entitlements(conn: AsyncConnection, user_id: int) -> list[dict[str, Any]]:
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
@@ -248,5 +309,10 @@ async def buy_item(
                     "INSERT INTO entitlements (user_id, item_key) VALUES (%s, %s)",
                     (user_id, item_key),
                 )
+
+        # Themes "just work": buying one equips it immediately. /equip
+        # switches back to another owned theme or the default.
+        if is_theme_item(str(item["kind"]), item["metadata"]):
+            await equip_theme(conn, user_id, item_key)
 
     return price

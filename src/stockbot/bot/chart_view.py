@@ -1,8 +1,8 @@
 """Interactive chart controls: pan / zoom / timeframe / axis buttons.
 
 Stateless by construction -- the whole window state rides inside each
-button's custom_id (`cbt:{action}:{iid}:{end}:{span}:{axis}`), so a click
-needs no server-side session. Two entry paths reach
+button's custom_id (`cbt:{action}:{iid}:{end}:{span}:{axis}:{theme}`), so
+a click needs no server-side session. Two entry paths reach
 `handle_chart_component`: the View's item callbacks while the sending
 process lives, and `StockBotClient.on_interaction` as the post-restart
 fallback (discord.py dispatches a component interaction to both; the
@@ -12,7 +12,10 @@ Actions: panl/panr (shift the window half a span), zin/zout (halve/double
 the span), home (re-anchor to the last open tick), s<span> (timeframe
 presets: set span, re-anchor), ax (toggle the x-axis between real time
 and raw ticks). `axis` is "time" (UTC wall-clock labels) or "ticks";
-legacy 5-field cids parse as "time" -- an in-place upgrade.
+`theme` is the equipped theme item key ("-" = default palette) and rides
+the cid rather than the clicker's pref -- a shared chart message can't
+repaint per-clicker. Legacy 5/6-field cids parse as time/no-theme -- an
+in-place upgrade.
 """
 
 from __future__ import annotations
@@ -52,21 +55,26 @@ AXES = ("time", "ticks")
 
 
 def encode_cid(
-    action: str, iid: int, end: int, span: int, axis: str = "time"
+    action: str, iid: int, end: int, span: int, axis: str = "time",
+    theme: str | None = None,
 ) -> str:
-    return f"cbt:{action}:{iid}:{end}:{span}:{axis}"
+    return f"cbt:{action}:{iid}:{end}:{span}:{axis}:{theme or '-'}"
 
 
-def parse_cid(custom_id: str) -> tuple[str, int, int, int, str] | None:
+def parse_cid(
+    custom_id: str,
+) -> tuple[str, int, int, int, str, str | None] | None:
     parts = custom_id.split(":")
-    if parts[0] != "cbt" or len(parts) not in (5, 6):
+    if parts[0] != "cbt" or len(parts) not in (5, 6, 7):
         return None
-    # Legacy 5-field ids predate the axis mode -- parse as the default.
-    axis = parts[5] if len(parts) == 6 else "time"
+    # Legacy 5/6-field ids predate axis/theme -- parse the defaults.
+    axis = parts[5] if len(parts) >= 6 else "time"
     if axis not in AXES:
         return None
+    theme_raw = parts[6] if len(parts) == 7 else "-"
+    theme = theme_raw if theme_raw not in ("", "-") else None
     try:
-        return parts[1], int(parts[2]), int(parts[3]), int(parts[4]), axis
+        return parts[1], int(parts[2]), int(parts[3]), int(parts[4]), axis, theme
     except ValueError:
         return None
 
@@ -137,21 +145,24 @@ async def _distance_from_last_open(
 
 
 async def load_chart_prefs(
-    conn: AsyncConnection, user_id: int
-) -> tuple[int, str] | None:
-    """The user's saved chart view: (span, axis). span is re-clamped to
-    the current zoom bounds on read -- a bound change can't strand a
-    stored value. None when the user has never customized a chart."""
+    conn: AsyncConnection, user_id: int, *, max_span: int = MAX_SPAN
+) -> tuple[int, str, str | None] | None:
+    """The user's saved chart view: (span, axis, theme). span is
+    re-clamped to `max_span` on read -- a bound change can't strand a
+    stored value. `theme` is the equipped theme item key (or None for the
+    default palette); callers verify ownership before rendering. None when
+    the user has never customized a chart."""
     async with conn.cursor() as cur:
         await cur.execute(
-            "SELECT span, axis FROM chart_prefs WHERE user_id = %s",
+            "SELECT span, axis, theme FROM chart_prefs WHERE user_id = %s",
             (user_id,),
         )
         row = await cur.fetchone()
     if row is None:
         return None
-    span = min(MAX_SPAN, max(MIN_SPAN, int(row[0])))
-    return span, str(row[1])
+    span = min(max_span, max(MIN_SPAN, int(row[0])))
+    theme = str(row[2]) if row[2] else None
+    return span, str(row[1]), theme
 
 
 async def save_chart_prefs(
@@ -174,7 +185,8 @@ async def save_chart_prefs(
 
 
 async def next_window(
-    conn: AsyncConnection, action: str, iid: int, end: int, span: int
+    conn: AsyncConnection, action: str, iid: int, end: int, span: int,
+    max_span: int = MAX_SPAN,
 ) -> tuple[int, int]:
     """Resolve a button action to the new (end, span). All movement is in
     open-candle units so session boundaries fall out of the open-only
@@ -195,11 +207,11 @@ async def next_window(
     if action == "zin":
         return end, max(MIN_SPAN, span // 2)
     if action == "zout":
-        return end, min(MAX_SPAN, span * 2)
+        return end, min(max_span, span * 2)
     if action == "home":
         return anchor, span
     if action.startswith("s") and action[1:].isdigit():
-        return anchor, min(MAX_SPAN, max(MIN_SPAN, int(action[1:])))
+        return anchor, min(max_span, max(MIN_SPAN, int(action[1:])))
     return end, span
 
 
@@ -209,17 +221,20 @@ class _ChartButton(discord.ui.Button[discord.ui.View]):
 
 
 def build_chart_view(
-    iid: int, end: int, span: int, axis: str = "time"
+    iid: int, end: int, span: int, axis: str = "time",
+    theme: str | None = None,
 ) -> discord.ui.View:
     """Button rows encoding the current window -- every button's custom_id
-    carries (action, iid, end, span, axis) so no state lives process-side."""
+    carries (action, iid, end, span, axis, theme) so no state lives
+    process-side. The theme rides the cid rather than the clicker's pref:
+    a shared chart message can't repaint per-clicker."""
     view = discord.ui.View(timeout=None)
     for label, action, row in _BUTTONS:
         view.add_item(
             _ChartButton(
                 style=discord.ButtonStyle.secondary,
                 label=label,
-                custom_id=encode_cid(action, iid, end, span, axis),
+                custom_id=encode_cid(action, iid, end, span, axis, theme),
                 row=row,
             )
         )
@@ -229,7 +244,7 @@ def build_chart_view(
         _ChartButton(
             style=discord.ButtonStyle.secondary,
             label=f"Axis: {other}",
-            custom_id=encode_cid("ax", iid, end, span, axis),
+            custom_id=encode_cid("ax", iid, end, span, axis, theme),
             row=1,
         )
     )
@@ -269,7 +284,7 @@ async def _handle(interaction: discord.Interaction) -> None:
             "That chart is stale — run /chart for a fresh one.", ephemeral=True
         )
         return
-    action, iid, end, span, axis = parsed
+    action, iid, end, span, axis, theme = parsed
 
     # Payload-free type-6 ACK up front. New file attachments cannot ride
     # the type-7 edit_message interaction callback (Discord rejects it --
@@ -305,7 +320,8 @@ async def _handle(interaction: discord.Interaction) -> None:
         # charts always open anchored at the latest tick.
         await save_chart_prefs(conn, interaction.user.id, new_span, axis)
         result = await render_candle_chart(
-            conn, iid, ticker, end=new_end, span=new_span, axis=axis
+            conn, iid, ticker, end=new_end, span=new_span, axis=axis,
+            theme=theme,
         )
     if result is None:
         await interaction.followup.send(
@@ -328,7 +344,7 @@ async def _handle(interaction: discord.Interaction) -> None:
             f" · {bucket_for_span(new_span)}t/candle"
         )
     )
-    view = build_chart_view(iid, resolved_end, new_span, axis)
+    view = build_chart_view(iid, resolved_end, new_span, axis, theme)
     file = discord.File(buf, filename=filename)
     msg = interaction.message
     try:

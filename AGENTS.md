@@ -212,6 +212,19 @@ dir, so without it every container restart rebuilds the fontlist and
 the first render takes seconds. Candle/wick/volume widths drop to 0.6 above
 120 bars, else 0.8. `MARKET CLOSED` only suffixes the title when the
 tail is closed candles.
+Shop themes (0046): `theme_*` COSMETIC metadata IS the render palette —
+`shop.service.palette_from_metadata` normalizes it over
+`charts._DEFAULT_PALETTE` keys {up, down, bg, grid, text, accent, spine,
+muted, halt_flow, halt_model, pill_text} (legacy `chart_color` maps to
+up+accent). `render_candle_chart(theme=)` resolves via `charts._palette_for`
+(cached forever in `_THEME_CACHE` — theme rows are static) and `theme` is
+part of `_RENDER_CACHE`'s fingerprint, else one user's palette leaks to
+everyone. The equipped key lives in `chart_prefs.theme`
+(`load_chart_prefs` returns it as a third element; `save_chart_prefs`
+deliberately doesn't touch it) and rides the cid as a 7th field — a shared
+chart message can't repaint per-clicker; `-` = default. `/chart` gates the
+theme on `owns_item`; `buy_item` auto-equips themes on purchase.
+`/equip` (0047) owns the column going forward.
 `market_ticks` row itself (duration_ms, fills, crosses, stops_triggered,
 knockouts, liquidations, events_resolved) plus one structured log line
 (`tick=N phase=… crosses=… ms=…`) — tick 4532 is fully re-describable

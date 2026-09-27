@@ -96,7 +96,8 @@ async def test_closed_window_anchors_to_last_open_tick(
     captured: list[list[Any]] = []
 
     def fake_render(
-        rows: list[Any], ticker: str, span: int, bucket: int, axis: str
+        rows: list[Any], ticker: str, span: int, bucket: int, axis: str,
+        palette: dict[str, str] | None = None,
     ) -> io.BytesIO:
         captured.append(rows)
         return io.BytesIO(b"png")
