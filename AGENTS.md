@@ -200,7 +200,16 @@ reads as a bad tick. The open→closed-tail transition is tick-adjacent
 so the shading marks it, not a separator. The legend (`O/H/L/C Δ%` in the window's direction
 color), right-edge last-price pill (`rect=(0,0,0.94,1)` reserves its
 gutter), and faint ticker watermark are all derived from `rows` — no
-protocol/signature change. Candle/wick/volume widths drop to 0.6 above
+protocol/signature change. Renders are cached in-process
+(`_RENDER_CACHE`, LRU 64) keyed by a fingerprint of every row's
+tick_index+close+volume — a repeat request (button spam, second user on
+the same ticker) reuses the PNG bytes; the fingerprint busts on any
+intra-tick fill amendment so a mid-tick trade still re-renders. PNGs
+save at dpi=120 (1200px wide): upload size is the dominant
+/chart latency on slow links. In Docker, `MPLCONFIGDIR=/app/.mplconfig`
+is baked with the font cache at image build — `stockbot` has no home
+dir, so without it every container restart rebuilds the fontlist and
+the first render takes seconds. Candle/wick/volume widths drop to 0.6 above
 120 bars, else 0.8. `MARKET CLOSED` only suffixes the title when the
 tail is closed candles.
 `market_ticks` row itself (duration_ms, fills, crosses, stops_triggered,
@@ -1056,3 +1065,15 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   `/stock` reports borrow %/day, days-to-cover (si_shares/adv), and
   remaining capacity / lockout tick from new InstrumentSnapshot fields
   adv/float_shares/shortable_after_tick.
+- **Price alerts** (0044): one-shot `/alert add|list|cancel`. OPEN rows in
+  `price_alerts` flip to TRIGGERED in `apply_tick`'s `sweep_alerts` call —
+  placed AFTER the liquidation sweep (the last mark-mutating op) so alerts
+  see the true tick-close mark; the CLOSED branch never sweeps. Each fire
+  enqueues an `ALERT_TRIGGERED` outbox row in the same transaction (the
+  poller coalesces into one DM per user/tick). A partial unique index
+  `price_alerts_one_open` rejects exact duplicates (user+instrument+
+  direction+price); opposite directions at the same price are distinct.
+  An already-crossed target is allowed at create time — it fires on the
+  next tick. `alerts.max_per_user` (default 25) caps open alerts.
+  `disable_user` and `delist_instrument` bulk-cancel open alerts (the
+  sweep never consults bootstrap — same gap as resting orders).

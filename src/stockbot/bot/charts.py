@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import math
+from collections import OrderedDict
 from datetime import UTC
 from typing import Any
 
@@ -27,6 +28,15 @@ _SPINE = "#2a2e39"
 _MUTED = "#5a5f6b"
 _HALT_FLOW = "#ff9800"
 _HALT_MODEL = "#ef5350"
+
+# Render cache: a chart PNG is a pure function of its window's candle rows,
+# so a repeat request (button spam, two users on the same ticker) can reuse
+# the bytes instead of paying the matplotlib render again. The key
+# fingerprints every row's tick_index + close + volume rather than just
+# (end, span, axis) -- intra-tick fills amend the live candle, and the
+# fingerprint catches it so a mid-tick trade still re-renders.
+_RENDER_CACHE: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
+_RENDER_CACHE_MAX = 64
 
 
 def bucket_for_span(span: int) -> int:
@@ -215,12 +225,28 @@ async def render_candle_chart(
     )
     if not rows or resolved_end is None:
         return None
-    # The render is ~100ms+ of synchronous CPU -- run it off the event loop
-    # so gateway heartbeats aren't delayed. matplotlib.figure.Figure (not
-    # pyplot) keeps it off pyplot's shared global state, which isn't
-    # thread-safe.
     bucket = bucket_for_span(span)
-    buf = await asyncio.to_thread(_render_png, rows, ticker, span, bucket, axis)
+    fp = (
+        instrument_id,
+        span,
+        axis,
+        tuple((int(r[0]), float(r[4]), int(r[5])) for r in rows),
+    )
+    cached = _RENDER_CACHE.get(fp)
+    if cached is not None:
+        _RENDER_CACHE.move_to_end(fp)
+        buf = io.BytesIO(cached)
+    else:
+        # The render is ~100ms+ of synchronous CPU -- run it off the event
+        # loop so gateway heartbeats aren't delayed. matplotlib.figure.Figure
+        # (not pyplot) keeps it off pyplot's shared global state, which isn't
+        # thread-safe.
+        buf = await asyncio.to_thread(
+            _render_png, rows, ticker, span, bucket, axis
+        )
+        _RENDER_CACHE[fp] = buf.getvalue()
+        while len(_RENDER_CACHE) > _RENDER_CACHE_MAX:
+            _RENDER_CACHE.popitem(last=False)
     end_ts = rows[0][8]  # newest-first: the window's true right edge
     return buf, resolved_end, end_ts
 
@@ -472,6 +498,6 @@ def _render_png(
     # inside the rect boundary instead of clipping at the figure edge).
     gs.tight_layout(fig, rect=(0, 0, 0.94, 1))
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
+    fig.savefig(buf, format="png", dpi=120, facecolor=fig.get_facecolor())
     buf.seek(0)
     return buf

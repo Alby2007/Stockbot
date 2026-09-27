@@ -17,7 +17,16 @@ RUN pip install --no-cache-dir .
 # Drop root: the services only need to read the installed package and reach
 # Postgres over the network.
 RUN useradd --system --uid 10001 stockbot
+
+# matplotlib's font cache defaults to ~/.cache/matplotlib, but `stockbot` is
+# a system user with no home -- without MPLCONFIGDIR it lands in a tmpdir
+# rebuilt per process, so the first /chart after every restart pays a
+# multi-second font scan. Point it at a writable dir and bake the cache
+# into the image as the runtime user.
+ENV MPLCONFIGDIR=/app/.mplconfig
+RUN mkdir -p /app/.mplconfig && chown stockbot /app/.mplconfig
 USER stockbot
+RUN python -c "import matplotlib; matplotlib.use('Agg'); import matplotlib.font_manager; matplotlib.font_manager.fontManager; from matplotlib.figure import Figure; import io; f = Figure(); a = f.add_subplot(); a.set_title('warm'); f.savefig(io.BytesIO(), format='png')"
 
 ENV PYTHONUNBUFFERED=1
 # The package is pip-installed to site-packages, so migrate.py's
