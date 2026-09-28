@@ -1013,6 +1013,42 @@ states got pointers (`/portfolio`→`/market`, `/order list`→`/order`,
 `/shorts`→`/short`, `/liquidations`→`/margin`) and `/market` `/movers`
 `/order list` `/shorts` `/liquidations` gained column headers.
 
+**Public tape done** (`migrations/0055_feed.sql`, `src/stockbot/feed`,
+`src/stockbot/bot/feed.py`, `/feed-setup` `/feed-remove`): a per-guild
+market-drama channel. `feed_channels` binds one channel per guild;
+`feed_items` is a fan-out outbox — `emit_feed(conn, kind, payload,
+user_id=, tick_index=)` does `INSERT ... SELECT channel_id FROM
+feed_channels` inside the emitting event's own transaction, so a new
+binding only picks up later events and a rollback leaves no phantom tape.
+`feed.enabled` is the emit-side kill switch (checked at emit, so a
+disabled feed leaves no backlog). Emit sites mirror the notifications
+outbox: liquidation legs + borrow recalls (`LIQUIDATION`/`SQUEEZE`),
+bounded-short KOs, whale MM fills at/above `news.whale_min_notional`
+(dollars — book crosses deliberately don't post: a P2P whale print is
+the collusion vector), daily-wheel jackpots, one aggregate `IPO` row per
+offering, option payouts ≥ `news.option_payout_min`, landed NEWS/EARNINGS
+(magnitude is already applied so it leaks nothing; dividends skipped as
+too routine), and one aggregate `SEASON_RESULT` — the ONLY league event
+on the tape. Every other emit is `season_id IS NULL`-gated: league stakes
+are faucet-seeded and don't belong in main-economy drama.
+
+Delivery is `bot/feed.py` cloned from notify.py's SKIP-LOCKED outbox
+(`ChannelGone` maps `Forbidden`/`NotFound`), with two changes: pending
+rows coalesce per channel into ONE message per poll (grouped by
+(channel, kind, user_id, tick_index) → one line each, ≤1900 chars, drops
+tagged "…and N more"), and a dead channel *unbinds itself* (`DELETE FROM
+feed_channels`, ON DELETE CASCADE takes pending rows) instead of
+dead-lettering rows. `_feed_loop` runs at 30s (tape latency is fine —
+the batching is the point), posts with `AllowedMentions.none()` so `<@id>`
+markup renders names without pinging people for being liquidated.
+`/feed-setup` is manage_guild-gated and upserts (rebinds carry pending
+items via ON UPDATE CASCADE); `/feed-remove` deletes the binding —
+the feed's equivalent of `/leaderboard-setup` needs an explicit off
+switch because it keeps posting, unlike a self-serve pinned board.
+Test convention: `tests/test_feed.py` starts each case from
+`DELETE FROM feed_items; DELETE FROM feed_channels` — service tests
+elsewhere commit real feed rows whenever a channel happens to be bound.
+
 **Phase N5 done** (`bot/autocomplete.py` + `@app_commands.autocomplete`
 wiring): `ticker_autocomplete` (ticker-prefix matches first, name-prefix
 fills to 25 — the matcher returns ALL prefix hits uncapped so the

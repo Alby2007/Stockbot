@@ -27,6 +27,7 @@ from typing import Any
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
+from stockbot.feed import emit_feed
 from stockbot.ledger.service import (
     get_system_account_id,
     get_user_account_id,
@@ -478,7 +479,7 @@ async def sweep_knockouts(
               AND i.quoted_price >= bs.knockout_price
               AND (%s::int[] IS NULL OR i.market_id = ANY(%s))
             RETURNING bs.user_id, i.ticker, bs.quantity, bs.entry_price,
-                      bs.knockout_price
+                      bs.knockout_price, bs.season_id
             """,
             (
                 tick_index,
@@ -509,6 +510,19 @@ async def sweep_knockouts(
                     ),
                 ),
             )
+            if row["season_id"] is None:
+                await emit_feed(
+                    conn,
+                    "KNOCKOUT",
+                    {
+                        "ticker": row["ticker"],
+                        "qty": int(row["quantity"]),
+                        "entry": float(row["entry_price"]),
+                        "ko_price": float(row["knockout_price"]),
+                    },
+                    user_id=int(row["user_id"]),
+                    tick_index=tick_index,
+                )
         return len(knocked)
 
 

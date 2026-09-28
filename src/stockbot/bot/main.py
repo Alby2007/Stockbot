@@ -14,6 +14,8 @@ import discord
 from stockbot import db
 from stockbot.bot.chart_view import CHART_CID_PREFIX, handle_chart_component
 from stockbot.bot.commands import guild_welcome_message, register_commands
+from stockbot.bot.feed import ChannelGone
+from stockbot.bot.feed import poll_once as feed_poll_once
 from stockbot.bot.leaderboard import sync_leaderboard_boards
 from stockbot.bot.notify import DeliveryForbidden, poll_once
 from stockbot.config import get_settings
@@ -25,6 +27,7 @@ log = logging.getLogger("stockbot.bot")
 
 HEARTBEAT_INTERVAL_SECONDS = 30
 NOTIFY_POLL_INTERVAL_SECONDS = 5
+FEED_POLL_INTERVAL_SECONDS = 30
 LEADERBOARD_INTERVAL_SECONDS = 60
 
 
@@ -81,6 +84,7 @@ class StockBotClient(discord.Client):
         self.tree = StockBotTree(self)
         register_commands(self.tree)
         self._notify_stats: dict[str, int] = {}
+        self._feed_stats: dict[str, int] = {}
 
     async def setup_hook(self) -> None:
         # tree.sync() is a bulk PUT that re-publishes the entire command
@@ -130,6 +134,7 @@ class StockBotClient(discord.Client):
                             "gateway_latency_s": round(self.latency, 3),
                             "guilds": len(self.guilds),
                             "notify": self._notify_stats,
+                            "feed": self._feed_stats,
                         },
                     )
             except Exception:
@@ -160,6 +165,36 @@ class StockBotClient(discord.Client):
             except Exception:
                 log.exception("notification poll failed")
             await asyncio.sleep(NOTIFY_POLL_INTERVAL_SECONDS)
+
+    async def _deliver_feed(self, channel_id: int, message: str) -> None:
+        try:
+            channel = self.get_channel(channel_id) or await self.fetch_channel(
+                channel_id
+            )
+            if not hasattr(channel, "send"):
+                raise ChannelGone(f"channel type can't receive messages: {type(channel).__name__}")
+            await channel.send(
+                message, allowed_mentions=discord.AllowedMentions.none()
+            )
+        except discord.Forbidden as exc:
+            raise ChannelGone(str(exc)) from exc
+        except discord.NotFound as exc:
+            raise ChannelGone("channel not found") from exc
+
+    async def _feed_loop(self) -> None:
+        """Public-tape poller: 30s is plenty of latency for drama and the
+        batching is the point -- a 60s tick's liquidation cascade lands as
+        one digest post. Same at-least-once transaction semantics as
+        _notify_loop."""
+        while True:
+            try:
+                async with db.connection() as conn, conn.transaction():
+                    self._feed_stats = await feed_poll_once(
+                        conn, self._deliver_feed
+                    )
+            except Exception:
+                log.exception("feed poll failed")
+            await asyncio.sleep(FEED_POLL_INTERVAL_SECONDS)
 
     async def on_interaction(self, interaction: discord.Interaction) -> None:
         # Post-restart fallback for chart buttons: live Views get the click
@@ -223,6 +258,8 @@ class StockBotClient(discord.Client):
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         if getattr(self, "_notify_task", None) is None:
             self._notify_task = asyncio.create_task(self._notify_loop())
+        if getattr(self, "_feed_task", None) is None:
+            self._feed_task = asyncio.create_task(self._feed_loop())
         if getattr(self, "_leaderboard_task", None) is None:
             self._leaderboard_task = asyncio.create_task(self._leaderboard_loop())
 

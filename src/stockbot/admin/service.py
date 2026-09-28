@@ -161,6 +161,7 @@ CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "fee.tier1_volume": (0.0, 1e15),
     "fee.tier2_bps": (0.0, 1e4),
     "fee.tier2_volume": (0.0, 1e15),
+    "feed.enabled": (0, 1),
     "impact.participation_cap": (1e-6, 1.0),
     "ipo.short_lockout_ticks": (0, 1e6),
     "margin.borrow_fee_bps_per_tick": (0.0, 1e6),
@@ -228,6 +229,8 @@ CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "mom.max_frac": (0.0, 10.0),
     "mom.rho": (0.0, 0.999999),
     "news.fizzle_pct": (0.0, 0.9),
+    "news.option_payout_min": (0.0, 1e15),  # dollars -- tape threshold
+    "news.whale_min_notional": (0.0, 1e15),  # dollars -- tape threshold
     "trading.enabled": (0, 1),
     "vol.account_flow_cap": (0.0, 1.0),
     "vol.clip_max": (0.01, 100.0),

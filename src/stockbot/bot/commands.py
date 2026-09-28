@@ -1161,6 +1161,64 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             ephemeral=True,
         )
 
+    @tree.command(
+        name="feed-setup",
+        description="Post the market-drama tape (liquidations, whales, news) in this channel",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def feed_setup(interaction: discord.Interaction) -> None:
+        channel = interaction.channel
+        if interaction.guild_id is None or not isinstance(
+            channel, (discord.TextChannel, discord.Thread)
+        ):
+            await interaction.response.send_message(
+                "Run this in the channel that should host the tape.",
+                ephemeral=True,
+            )
+            return
+        async with db.connection() as conn, conn.transaction():
+            async with conn.cursor() as cur:
+                # One feed per channel AND one per guild: the UNIQUE
+                # channel_id plus the guild PK make a rebind an upsert --
+                # pending items follow the binding via ON UPDATE CASCADE.
+                await cur.execute(
+                    """
+                    INSERT INTO feed_channels (guild_id, channel_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (guild_id) DO UPDATE SET channel_id = EXCLUDED.channel_id
+                    """,
+                    (interaction.guild_id, channel.id),
+                )
+        await interaction.response.send_message(
+            f"📡 The market tape will post in {channel.mention} — "
+            "liquidations, whale prints, knockouts, jackpots, IPOs, season "
+            "results, and landed news, batched into one digest.",
+            ephemeral=True,
+        )
+
+    @tree.command(
+        name="feed-remove",
+        description="Stop the market-drama tape in this server",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def feed_remove(interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Run this in a server channel.", ephemeral=True
+            )
+            return
+        async with db.connection() as conn, conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM feed_channels WHERE guild_id = %s",
+                    (interaction.guild_id,),
+                )
+                removed = cur.rowcount
+        await interaction.response.send_message(
+            "Tape unbound — no more posts." if removed else "No tape was bound here.",
+            ephemeral=True,
+        )
+
     @tree.command(name="history", description="Show your recent trades")
     async def history(interaction: discord.Interaction) -> None:
         async with db.connection() as conn:

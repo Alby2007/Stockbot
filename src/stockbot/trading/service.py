@@ -23,6 +23,7 @@ from typing import Literal
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
+from stockbot.feed import emit_feed
 from stockbot.ledger.service import (
     get_system_account_id,
     get_user_account_id,
@@ -103,6 +104,13 @@ async def taker_fee_bps(conn: AsyncConnection, user_id: int) -> Decimal:
     if total >= cfg.get("fee.tier1_volume", float("inf")):
         return Decimal(str(cfg["fee.tier1_bps"]))
     return FEE_BPS
+
+
+async def _config_float(conn: AsyncConnection, key: str, default: float) -> float:
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT value FROM config WHERE key = %s", (key,))
+        row = await cur.fetchone()
+    return float(row[0]) if row else default
 
 
 async def record_volume(
@@ -894,5 +902,26 @@ async def execute_trade(
                 result.notional_minor if side == "BUY" else -result.notional_minor
             ),
         )
+        # Public tape: whale prints at/above news.whale_min_notional
+        # (config in dollars). MM fills only -- book crosses settle in
+        # _settle_cross and stay off the tape in v1 (a P2P whale print is
+        # the collusion vector, not organic flow). League fills excluded:
+        # faucet-seeded stakes aren't main-tape drama.
+        if season_id is None:
+            whale_min = await _config_float(conn, "news.whale_min_notional", 5000.0)
+            if result.notional_minor >= whale_min * 100:
+                await emit_feed(
+                    conn,
+                    "WHALE",
+                    {
+                        "ticker": ticker,
+                        "side": side,
+                        "qty": quantity,
+                        "fill": float(fill_price),
+                        "notional": result.notional_minor,
+                    },
+                    user_id=user_id,
+                    tick_index=current_tick,
+                )
 
     return result

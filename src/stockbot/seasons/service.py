@@ -31,6 +31,7 @@ from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 
 from stockbot.accounts.service import bootstrap_user
+from stockbot.feed import emit_feed
 from stockbot.ledger.service import (
     get_balance,
     get_system_account_id,
@@ -800,6 +801,23 @@ async def _close_season_claimed(conn: AsyncConnection, season_id: int) -> None:
                     ),
                 ),
             )
+
+    # Public tape: ONE aggregate row per season -- the exception to the
+    # league filter (a season ENDING is main-economy news; the trades
+    # inside it are not). No winner → everyone failed to qualify.
+    await emit_feed(
+        conn,
+        "SEASON_RESULT",
+        {
+            "season_name": season.name,
+            "winner_id": qualified[0] if qualified else None,
+            "entrants": len(entries),
+            "prize": (
+                int(prize_pool * PRIZE_SHARES[0]) if qualified else 0
+            ),
+        },
+        tick_index=tick,
+    )
 
     # Season options settle at intrinsic NOW -- the equity snapshots above
     # already counted their model marks (which include residual time value),

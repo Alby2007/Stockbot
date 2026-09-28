@@ -25,6 +25,7 @@ from stockbot.claims.errors import (
     FirstClaimLockedError,
 )
 from stockbot.config import get_settings
+from stockbot.feed import emit_feed
 from stockbot.ledger.service import get_system_account_id, post_transfer
 from stockbot.shop.service import owns_item, use_consumable
 
@@ -241,6 +242,14 @@ async def claim_daily(
         await post_transfer(
             conn, from_account_id=faucet_id, to_account_id=account_id, amount=amount, reason="CLAIM"
         )
+        if roll is not None and roll.segment == "jackpot":
+            # Public tape: the jackpot is the wheel's social proof.
+            await emit_feed(
+                conn,
+                "JACKPOT",
+                {"amount": amount, "streak": streak},
+                user_id=user_id,
+            )
 
     return ClaimResult(
         amount_minor=amount, streak=streak, shield_used=shield_used, roll=roll

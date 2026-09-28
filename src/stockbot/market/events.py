@@ -27,6 +27,7 @@ import numpy as np
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
+from stockbot.feed import emit_feed
 from stockbot.ledger.service import get_system_account_id, post_transfer
 from stockbot.market.engine import TICKS_PER_DAY
 
@@ -330,7 +331,8 @@ async def resolve_due_events(
         await cur.execute(
             """
             SELECT e.id, e.instrument_id, e.kind, e.magnitude,
-                   e.dividend_per_share, e.estimate, i.kind AS instrument_kind
+                   e.dividend_per_share, e.estimate, i.kind AS instrument_kind,
+                   i.ticker
             FROM events e
             JOIN instruments i ON i.id = e.instrument_id
             WHERE e.resolve_tick <= %s AND NOT e.resolved
@@ -395,6 +397,18 @@ async def resolve_due_events(
                 (magnitude, event["id"]),
             )
         resolved_count += 1
+
+        # Public tape: the magnitude is already applied to the fundamental,
+        # so posting it leaks nothing -- this is exactly the market drama
+        # the feed exists for. Venue scoping is inherited from open_ids:
+        # an event only lands on its instrument's open ticks. Dividends
+        # are skipped (too routine).
+        await emit_feed(
+            conn,
+            "EARNINGS" if event["kind"] == "EARNINGS" else "NEWS_LANDED",
+            {"ticker": event["ticker"], "magnitude": magnitude},
+            tick_index=current_tick,
+        )
 
         if event["kind"] == "EARNINGS":
             jitter = int(rng.integers(-EARNINGS_JITTER_TICKS, EARNINGS_JITTER_TICKS + 1))

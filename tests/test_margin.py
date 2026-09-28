@@ -192,6 +192,11 @@ async def _levered_short(
 async def test_liquidation_fires_when_price_gaps_up(conn: AsyncConnection) -> None:
     await bootstrap_user(conn, 2006)
     await _grant_tier(conn, 2006)
+    async with conn.cursor() as cur:
+        # Bound before the event so emit_feed fans out to it.
+        await cur.execute(
+            "INSERT INTO feed_channels (guild_id, channel_id) VALUES (91, 9101)"
+        )
     ticker = await _first_ticker(conn)
     await _levered_short(conn, 2006, ticker)
 
@@ -232,6 +237,17 @@ async def test_liquidation_fires_when_price_gaps_up(conn: AsyncConnection) -> No
     assert len(rows) == count
     assert all(kind == "LIQUIDATION" for kind, _ in rows)
     assert all(payload["ticker"] == ticker for _, payload in rows)
+
+    # Public tape: same rows land in feed_items for the channel bound at
+    # test start (league-scope suppression lives in test_feed). Scoped to
+    # this test's channel -- emit_feed fans out per bound channel.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT COUNT(*) FROM feed_items "
+            "WHERE user_id = 2006 AND kind = 'LIQUIDATION' AND channel_id = 9101"
+        )
+        (feed_count,) = await cur.fetchone()
+    assert feed_count == count
 
 
 async def test_never_negative_equity_and_fund_reconciles(

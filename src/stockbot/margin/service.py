@@ -35,6 +35,7 @@ from typing import Any
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
+from stockbot.feed import emit_feed
 from stockbot.ledger.service import get_system_account_id, post_transfer
 from stockbot.margin.errors import MarginSpendBlockedError
 from stockbot.market import engine
@@ -564,6 +565,17 @@ async def _liquidate_leg(
             (user_id, "LIQUIDATION" if kind == "LIQUIDATION" else "SHORT_RECALL",
              json.dumps(payload)),
         )
+        if season_id is None:
+            # Public tape: one row per leg, coalesced per (user, tick) by
+            # the poller. League stakes are faucet-seeded -- a league
+            # liquidation isn't main-tape drama.
+            await emit_feed(
+                conn,
+                "LIQUIDATION" if kind == "LIQUIDATION" else "SQUEEZE",
+                payload,
+                user_id=user_id,
+                tick_index=tick_index,
+            )
 
     if kind != "LIQUIDATION":
         return

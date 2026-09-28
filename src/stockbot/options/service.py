@@ -32,6 +32,7 @@ from typing import Any
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
+from stockbot.feed import emit_feed
 from stockbot.ledger.service import (
     get_system_account_id,
     get_user_account_id,
@@ -668,6 +669,10 @@ async def _settle_where(
         )
         settled = await cur.fetchall()
         mm_id = await get_system_account_id(conn, "MARKET_MAKER")
+        # Public-tape threshold: config in dollars, payout in minor units.
+        payout_min_minor = int(
+            (await _config_float(conn, "news.option_payout_min", 500.0)) * 100
+        )
         for row in settled:
             payout = int(row["settlement_minor"]) * int(row["quantity"])
             if payout > 0:
@@ -707,6 +712,23 @@ async def _settle_where(
                     ),
                 ),
             )
+            if (
+                payout >= payout_min_minor
+                and row["season_id"] is None
+            ):
+                await emit_feed(
+                    conn,
+                    "OPTION_PAYOUT",
+                    {
+                        "ticker": row["ticker"],
+                        "side": row["side"],
+                        "strike": float(row["strike"]),
+                        "qty": int(row["quantity"]),
+                        "payout": payout,
+                    },
+                    user_id=int(row["user_id"]),
+                    tick_index=tick_index,
+                )
     return len(settled)
 
 

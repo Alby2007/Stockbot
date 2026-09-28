@@ -25,6 +25,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from stockbot.admin.service import add_instrument
+from stockbot.feed import emit_feed
 from stockbot.ledger.service import (
     get_system_account_id,
     get_user_account_id,
@@ -411,3 +412,16 @@ async def _settle_offering(
             "UPDATE instruments SET is_active = TRUE WHERE id = %s",
             (instrument_id,),
         )
+    # Public tape: ONE aggregate row per IPO -- a per-subscriber fan-out
+    # would spam the tape with allocation detail nobody else cares about.
+    await emit_feed(
+        conn,
+        "IPO",
+        {
+            "ticker": ticker,
+            "price": float(offer_price),
+            "shares": sum(allocs.values()),
+            "holders": sum(1 for q in allocs.values() if q > 0),
+        },
+        tick_index=tick_index,
+    )
