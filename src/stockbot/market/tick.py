@@ -31,6 +31,29 @@ from stockbot.status.service import evaluate_badges, snapshot_net_worth_if_due
 log = logging.getLogger("stockbot.market.tick")
 
 
+def _scale_factor(
+    drawn: float,
+    drift: float,
+    dt_i: float,
+    vdt_i: float,
+    draw_dt: float,
+    draw_vdt: float,
+) -> float:
+    """An instrument's share of a factor drawn at the union gap scale.
+
+    The shared market/sector factors draw once per tick at the largest
+    reopening venue's (draw_dt, draw_vdt). A factor is `drift*dt +
+    sigma*sqrt(vdt)*z` for one shared z, so each instrument rescales to
+    its own venue horizon. The shortcut keeps the single-venue path --
+    where every (dt_i, vdt_i) == (draw_dt, draw_vdt) -- bit-identical.
+    """
+    if dt_i == draw_dt and vdt_i == draw_vdt:
+        return drawn
+    return drift * dt_i + (drawn - drift * draw_dt) * math.sqrt(
+        vdt_i / draw_vdt
+    )
+
+
 async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
     """Advance the market by exactly one tick. Returns the tick index applied.
 
@@ -39,19 +62,26 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
     concurrent second tick, only against concurrent trades touching the same
     instruments.
 
-    Session structure: ticks cycle through `session.open_ticks` open ticks
-    then `session.closed_ticks` closed ticks (derived from the tick index,
-    so every process agrees). Closed ticks do no factor-model work -- the
-    market row and flat zero-volume candles are still written, borrow fees
-    keep accruing (real markets charge calendar days), and season
-    snapshots still land, but no matching, knockouts, or liquidation run.
-    The first open tick after a close steps once with dt = closed_ticks
-    for clock-time terms and dt = closed_ticks*overnight_var_frac for the
-    stochastic ones (the overnight gap, bounded by the circuit breaker),
-    resets a fraction of accumulated impact, then runs the full open-tick
-    pipeline
-    -- events due during the close resolve into that gap, and the
-    knockout/margin sweeps fire immediately after it.
+    Session structure (R2): every instrument's `market_id` names a
+    `markets` venue row holding that venue's session shape
+    (open_ticks/closed_ticks/offset_ticks) and absolute gap horizon
+    (`overnight_var_ticks`). One tick = one pipeline: instruments on
+    OPEN venues run the factor-model step; instruments on CLOSED venues
+    write flat volume-0 candles (`session_state='CLOSED'`) with marks
+    frozen. `market_ticks.session_state` is the "any venue open" summary
+    -- the shared market/sector factors are drawn once per tick at the
+    largest reopening venue's gap horizon and each instrument rescales
+    them to sqrt(own var_dt / draw var_dt), so a lone US venue replays
+    byte-for-byte the pre-R2 behaviour.
+
+    The first open tick on a venue after its close (`cycle_pos == 0` and
+    tick_index > 0) steps once with dt = closed_ticks for clock-time
+    terms and dt = overnight_var_ticks for the stochastic ones (the
+    overnight gap, bounded by the circuit breaker), resets a fraction of
+    accumulated impact, then runs the full open-tick pipeline -- events
+    due during the close resolve into that gap, and the knockout/margin
+    sweeps fire immediately after it. Bookkeeping (borrow fees, seasons,
+    snapshots, badges, IPO, quests, options expiry) runs every tick.
     """
     started = time.perf_counter()
     async with conn.transaction():
@@ -61,20 +91,59 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             assert next_tick_row is not None
             tick_index: int = next_tick_row[0]
 
-        # R1 tenancy: the tick phase is still global -- it reads the
-        # single seeded market's session shape via market_cfg (identical
-        # to the old session_config values). R2 partitions instruments
-        # by their own venue's phase and this branch disappears.
-        market = await data.default_market(conn)
-        session_cfg = (
-            data.market_cfg(market, await data.session_config(conn))
-            if market
-            else await data.session_config(conn)
-        )
-        open_ticks, closed_ticks, offset = data.session_parts(session_cfg)
-        phase = engine.session_phase(tick_index, open_ticks, closed_ticks, offset)
+        markets = await data.markets_map(conn)
+        global_cfg = await data.session_config(conn)
+        # Per-venue step params for OPEN venues: (clock dt, variance dt,
+        # impact reset). Reopen = cycle_pos 0 with a real close behind
+        # it; tick 0 is the exception -- the market never closed, so the
+        # first-ever tick must not "reopen" with a closed_ticks gap.
+        # gap_var_dt narrows the stochastic horizon to the venue's
+        # absolute overnight-var ticks (0033): overnight variance
+        # empirically accrues over ~an hour of trading, not the whole
+        # closed stretch. Clock-time terms (base drift, mean reversion,
+        # impact decay) still see the full gap dt.
+        venue_step: dict[int, tuple[float, float, float]] = {}
+        for mid, m in markets.items():
+            open_t = int(m["open_ticks"])
+            closed_t = int(m["closed_ticks"])
+            off = int(m["offset_ticks"])
+            if (
+                engine.session_phase(tick_index, open_t, closed_t, off)
+                != "OPEN"
+            ):
+                continue
+            cycle_pos = (tick_index - off) % (open_t + closed_t)
+            if cycle_pos == 0 and closed_t > 0 and tick_index > 0:
+                var_ticks = m.get("overnight_var_ticks")
+                gap_var = (
+                    max(1.0, float(var_ticks))
+                    if var_ticks is not None
+                    else max(
+                        1.0,
+                        closed_t
+                        * float(
+                            global_cfg.get("session.overnight_var_frac", 1.0)
+                        ),
+                    )
+                )
+                venue_step[mid] = (
+                    float(closed_t),
+                    gap_var,
+                    float(global_cfg.get("session.open_impact_reset", 1.0)),
+                )
+            else:
+                venue_step[mid] = (1.0, 1.0, 1.0)
+        any_open = bool(venue_step)
+        # The shared market/sector factors are drawn once per tick at the
+        # largest gap among venues reopening now; each instrument
+        # rescales to its own horizon via _scale_factor (identity under
+        # one venue).
+        draw_dt, draw_vdt = 1.0, 1.0
+        for _dt_v, vdt_v, _r in venue_step.values():
+            if vdt_v > draw_vdt:
+                draw_dt, draw_vdt = _dt_v, vdt_v
 
-        if phase == "CLOSED":
+        if not any_open:
             # Flat candles keep the chart's x-axis continuous; volume 0 marks
             # them as non-trading ticks. No instrument writes at all, so no
             # FOR UPDATE is needed (trades are gated on assert_market_open).
@@ -144,32 +213,9 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             await _post_tick(conn, tick_index)
             return tick_index
 
-        # OPEN tick. Position in the cycle 0 means this is the first tick
-        # after the close: step with dt = closed_ticks so the overnight
-        # drift/vol lands as one gap (breaker-bounded like any move).
-        # tick_index 0 is the exception: the market never closed, so the
-        # first-ever tick must not "reopen" with a closed_ticks gap.
-        # gap_var_dt narrows the stochastic horizon: overnight variance
-        # empirically accrues over ~an hour of trading, not the full closed
-        # stretch -- without it gap sigma is sqrt(480)~22x per-tick vol and
-        # nearly every reopen pins the breaker cap (0033). Clock-time terms
-        # (base drift, mean reversion, impact decay) still see full gap_dt.
-        cycle_pos = (tick_index - offset) % (open_ticks + closed_ticks)
-        gap_dt = (
-            float(closed_ticks)
-            if cycle_pos == 0 and closed_ticks > 0 and tick_index > 0
-            else 1.0
-        )
-        gap_var_dt = (
-            max(1.0, gap_dt * float(session_cfg.get("session.overnight_var_frac", 1.0)))
-            if gap_dt > 1.0
-            else 1.0
-        )
-        impact_reset = (
-            float(session_cfg.get("session.open_impact_reset", 1.0))
-            if gap_dt > 1.0
-            else 1.0
-        )
+        # At least one venue is open. Instruments on CLOSED venues skip
+        # the step loop entirely and get flat 'CLOSED' candles; their
+        # pending_flow rows carry to their reopen.
 
         async with conn.cursor(row_factory=dict_row) as cur:
             # Lock ordering rule: instruments before accounts, sorted by id.
@@ -214,10 +260,21 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                 vol_row = await cur.fetchone()
                 if vol_row and vol_row[0] is not None:
                     v_mkt_prev = float(vol_row[0])
+        open_iids = [
+            int(r["id"])
+            for r in instrument_rows
+            if int(r["market_id"]) in venue_step
+        ]
+        all_iids = [int(r["id"]) for r in instrument_rows]
         async with conn.cursor() as cur:
+            # Closed-venue flow carries to that venue's reopen; stale rows
+            # for instruments no longer active are always drained.
             await cur.execute(
                 "DELETE FROM pending_flow "
-                "RETURNING instrument_id, user_id, delta_impact"
+                "WHERE instrument_id = ANY(%s) "
+                "   OR NOT instrument_id = ANY(%s) "
+                "RETURNING instrument_id, user_id, delta_impact",
+                (open_iids, all_iids),
             )
             flow_rows = await cur.fetchall()
         flow_delta: dict[int, dict[int, float]] = {}
@@ -236,11 +293,14 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # same-sector peers, scaled by the PEER's gamma loading. One hop
         # by construction: the inflow lands on impact directly and is
         # never re-recorded into pending_flow.
+        open_rows = [
+            r for r in instrument_rows if int(r["market_id"]) in venue_step
+        ]
         flow_cap = float(vol_cfg.get("vol.flow_ret_cap", 0.05))
         acct_cap = float(vol_cfg.get("vol.account_flow_cap", 0.02))
         bounded_own: dict[int, float] = {}
         sector_flow: dict[str, float] = {}
-        sector_of = {int(r["id"]): str(r["sector_key"]) for r in instrument_rows}
+        sector_of = {int(r["id"]): str(r["sector_key"]) for r in open_rows}
         for iid, deltas in flow_delta.items():
             bf, _raw = data.bound_flow(deltas, acct_cap, flow_cap)
             bounded_own[iid] = bf
@@ -253,16 +313,16 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             * float(r["gamma"])
             * (sector_flow.get(str(r["sector_key"]), 0.0)
                - bounded_own.get(int(r["id"]), 0.0))
-            for r in instrument_rows
+            for r in open_rows
         }
 
         sector_keys = sorted({row["sector_key"] for row in instrument_rows})
         rng = engine.rng_for_tick(master_seed, tick_index)
         market_factor = engine.draw_market_factor(
-            rng, dt=gap_dt, var_dt=gap_var_dt
+            rng, dt=draw_dt, var_dt=draw_vdt
         )
         sector_factors = engine.draw_sector_factors(
-            rng, sector_keys, dt=gap_dt, var_dt=gap_var_dt
+            rng, sector_keys, dt=draw_dt, var_dt=draw_vdt
         )
 
         # Shared market vol state: EWMA of the normalized market factor.
@@ -274,7 +334,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             abs(market_factor)
             / (
                 engine.MARKET_SIGMA
-                * math.sqrt(gap_var_dt)
+                * math.sqrt(draw_vdt)
                 * engine.SQRT_2_OVER_PI
             ),
             rho,
@@ -288,7 +348,12 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         stats: dict[str, int] = {}
         fundamentals = {row["id"]: float(row["fundamental_value"]) for row in instrument_rows}
         fundamentals, dividend_drops = await events.resolve_due_events(
-            conn, events_rng, tick_index, fundamentals, stats=stats
+            conn,
+            events_rng,
+            tick_index,
+            fundamentals,
+            stats=stats,
+            open_ids=set(open_iids),
         )
         await events.maybe_create_news(conn, events_rng, tick_index, instrument_rows)
         await events.refresh_next_event_ticks(conn)
@@ -297,10 +362,22 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         halts: dict[int, int | None] = {}
         opens: dict[int, float] = {}
 
-        index_rows = [row for row in instrument_rows if row["kind"] == "INDEX"]
-        for row in instrument_rows:
+        index_rows = [row for row in open_rows if row["kind"] == "INDEX"]
+        for row in open_rows:
             if row["kind"] == "INDEX":
                 continue  # priced from components below
+            gap_dt, gap_var_dt, impact_reset = venue_step[int(row["market_id"])]
+            # Rescale the shared factor draws to this instrument's venue
+            # horizon (identity when the venue gap equals the draw gap --
+            # always under one venue).
+            mf_i = _scale_factor(
+                market_factor, engine.MARKET_DRIFT,
+                gap_dt, gap_var_dt, draw_dt, draw_vdt,
+            )
+            sf_i = _scale_factor(
+                sector_factors[row["sector_key"]], engine.SECTOR_DRIFT,
+                gap_dt, gap_var_dt, draw_dt, draw_vdt,
+            )
             # Ex-date drop: the dividend subtracts from the base (immediate,
             # permanent) rather than the decaying impact term. This drop is
             # the *entire* funding mechanism -- dividend_drift_offset is
@@ -346,8 +423,8 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                 result = engine.step_instrument(
                     rng,
                     state,
-                    market_factor,
-                    sector_factors[state.sector_key],
+                    mf_i,
+                    sf_i,
                     dt=gap_dt,
                     var_dt=gap_var_dt,
                     mom_rho=float(mom_cfg.get("mom.rho", 1.0)),
@@ -377,16 +454,21 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # carry their own trade impact, which decays like everyone else's.
         quoted_by_id = {res.id: res.quoted_price for res in results}
         for row in index_rows:
+            gap_dt, gap_var_dt, impact_reset = venue_step[int(row["market_id"])]
             opens[row["id"]] = float(row["base_price"]) * math.exp(float(row["impact"]))
             divisor = float(row["index_divisor"])
+            mid = int(row["market_id"])
             level = (
                 sum(
                     float(r["float_shares"]) * quoted_by_id[r["id"]]
-                    for r in instrument_rows
+                    for r in open_rows
                     # index_member is the fixed v1 basket (0031): listings
                     # never join it, and a delisted member is divisor-
-                    # adjusted out by admin.delist_instrument.
+                    # adjusted out by admin.delist_instrument. R4: the
+                    # basket is venue-scoped -- a cross-market index would
+                    # need its own membership table.
                     if r["kind"] != "INDEX" and r["index_member"]
+                    and int(r["market_id"]) == mid
                 )
                 / divisor
             )
@@ -424,8 +506,12 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         perm_cap = float(flow_cfg.get("flow.max_fundamental_move", 0.005))
         skew_decay = float(flow_cfg.get("flow.skew_decay", 0.9))
         # r_model's stochastic terms scale with sqrt(var_dt) at a reopen --
-        # normalizing by sqrt(gap_var_dt) keeps the EWMA input a z-score.
-        sqrt_dt = math.sqrt(gap_var_dt)
+        # normalizing by sqrt(the instrument's own gap_var_dt) keeps the
+        # EWMA input a z-score.
+        sqrt_vdt_of = {
+            int(r["id"]): math.sqrt(venue_step[int(r["market_id"])][1])
+            for r in open_rows
+        }
         rows_by_id = {int(r["id"]): r for r in instrument_rows}
         vol_new: dict[int, float] = {}
         sigma_eff_new: dict[int, float] = {}
@@ -464,7 +550,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             v_i = v_prev
             if prev_close is not None and prev_close > 0 and open_mark > 0:
                 if sigma_i > 0:
-                    numerator = (abs(r_model) / sqrt_dt + abs(bounded_flow)) / (
+                    numerator = (abs(r_model) / sqrt_vdt_of[result.id] + abs(bounded_flow)) / (
                         sigma_i * engine.SQRT_2_OVER_PI
                     )
                     v_i = engine.ewma_vol_update(v_prev, numerator, rho)
@@ -626,6 +712,26 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                     ],
                 )
 
+            closed_mids = [mid for mid in markets if mid not in venue_step]
+            if closed_mids:
+                # Venues closed this tick still get flat zero-volume
+                # candles (x-axis continuity) with frozen marks.
+                await cur.execute(
+                    """
+                    INSERT INTO candles
+                        (instrument_id, tick_index, open, high, low, close,
+                         volume, vol_state, flow_ret, model_ret, halt_kind,
+                         session_state)
+                    SELECT id, %s, quoted_price, quoted_price, quoted_price,
+                           quoted_price, 0, vol_state, NULL, NULL, NULL,
+                           'CLOSED'
+                    FROM instruments
+                    WHERE is_active AND market_id = ANY(%s)
+                    ORDER BY id
+                    """,
+                    (tick_index, closed_mids),
+                )
+
         # Bounded shorts: knock out any position whose instrument reached its
         # knockout price this tick. Before season snapshots so closed shorts
         # stop contributing to equity.
@@ -648,13 +754,17 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # auction); the MM fallback is skipped for auctioned books (the
         # print is the auction) but still runs for event-halted ones.
         if await data.feature_enabled_flag(conn, "orders.enabled"):
-            auction_window = int(session_cfg.get("session.auction_ticks", 30))
-            closing_auction = (
-                auction_window > 0
+            closing_auction = any(
+                int(m["auction_ticks"]) > 0
                 and engine.ticks_until_close(
-                    tick_index, open_ticks, closed_ticks, offset
+                    tick_index,
+                    int(m["open_ticks"]),
+                    int(m["closed_ticks"]),
+                    int(m["offset_ticks"]),
                 )
-                <= auction_window
+                <= int(m["auction_ticks"])
+                for mid, m in markets.items()
+                if mid in venue_step
             )
             await orders.match_orders(
                 conn, tick_index, stats=stats, closing_auction=closing_auction

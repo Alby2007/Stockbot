@@ -304,6 +304,7 @@ async def resolve_due_events(
     current_tick: int,
     fundamentals: dict[int, float],
     stats: dict[str, int] | None = None,
+    open_ids: set[int] | None = None,
 ) -> tuple[dict[int, float], dict[int, Decimal]]:
     """Apply any events due this tick, mutating and returning
     `fundamentals` (instrument_id -> fundamental value). Earnings/news are
@@ -314,6 +315,12 @@ async def resolve_due_events(
     instrument's base price (the immediate ex-date drop) while this
     function subtracts it from the fundamental (permanent value loss).
     `stats["events_resolved"]` accumulates the count when given.
+
+    `open_ids` scopes resolution to instruments on venues open this tick
+    (regional markets): an event due while its venue is closed stays
+    unresolved and lands in that venue's reopen gap instead -- resolving
+    it mid-close would pay the dividend without the ex-drop reaching the
+    row until reopen. None = resolve everything (single-venue semantics).
     """
     resolved_count = 0
     async with conn.cursor(row_factory=dict_row) as cur:
@@ -327,10 +334,15 @@ async def resolve_due_events(
             FROM events e
             JOIN instruments i ON i.id = e.instrument_id
             WHERE e.resolve_tick <= %s AND NOT e.resolved
+              AND (%s::int[] IS NULL OR e.instrument_id = ANY(%s))
             ORDER BY e.id
             FOR UPDATE OF e
             """,
-            (current_tick,),
+            (
+                current_tick,
+                sorted(open_ids) if open_ids is not None else None,
+                sorted(open_ids) if open_ids is not None else None,
+            ),
         )
         due = await cur.fetchall()
 
