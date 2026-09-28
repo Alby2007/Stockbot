@@ -1021,6 +1021,31 @@ states got pointers (`/portfolio`→`/market`, `/order list`→`/order`,
 `/shorts`→`/short`, `/liquidations`→`/margin`) and `/market` `/movers`
 `/order list` `/shorts` `/liquidations` gained column headers.
 
+**NPC traders P1 done** (`migrations/0057_npc.sql`): `users.is_bot`
+flags synthetic accounts -- a BOT account kind was deliberately rejected
+because every money path resolves `kind='USER'`, so "is it human" is an
+orthogonal flag, not an enum value. `npc_agents` (user_id PK, archetype,
+internal `label`, enabled, quote_ticker, `died_at_tick` permadeath
+marker) is created empty. Exclusions live at the aggregate sites:
+`_HUMAN_ONLY_JOIN` beside `_NET_WORTH_JOINS` covers `leaderboard` and
+the net-worth badge; volume/quests badge queries get `NOT u.is_bot`
+(streak is naturally empty -- bots never claim); `sweep_completions`
+joins `users ... AND NOT u.is_bot` at the measures table so NPC volume
+can't mint FAUCET quest rewards (self-funding would defeat permadeath);
+`scan_for_wash_trades` joins both sides' users and skips bots (synthetics
+can't collude); `join_season` raises `BotAccountError`. Deliberately NOT
+filtered: `net_worth_snapshots` (kept -- per-day equity is the runner's
+half-life telemetry), `net_worth_minor`/per-user reads (the runner
+values its agents through them), and `feed.enabled` stays an emit-side
+switch. Feed rendering is event-class anonymous: mechanics kinds
+(`LIQUIDATION`/`SQUEEZE`/`KNOCKOUT`/`WHALE`/`OPTION_PAYOUT`) name NOBODY
+("a trader was liquidated") -- that's how a real tape reads, it makes
+NPC prints indistinguishable (no "no-name = bot" tell), and it retires
+liquidation-shaming for humans; achievement kinds (`JACKPOT`,
+`SEASON_RESULT`) keep `<@id>` since bots can't reach them. `npc.*`
+config is seeded with `npc.enabled=0`: P1 ships the identity layer with
+zero agents acting; the runner lands in P2.
+
 **Public tape done** (`migrations/0055_feed.sql`, `src/stockbot/feed`,
 `src/stockbot/bot/feed.py`, `/feed-setup` `/feed-remove`): a per-guild
 market-drama channel. `feed_channels` binds one channel per guild;

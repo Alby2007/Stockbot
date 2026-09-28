@@ -75,6 +75,12 @@ def _mention(user_id: Any) -> str:
     return f"<@{int(user_id)}>" if user_id is not None else "someone"
 
 
+# Event-class anonymity (NPC plan C8): market-mechanics kinds render
+# UNATTRIBUTED for everyone -- that's how a real tape works, it makes
+# NPC prints indistinguishable from human ones (no "no name = bot"
+# tell), and it retires the liquidation-shaming vector as a bonus.
+# Human-achievement kinds (jackpot, season results) keep <@id> mentions:
+# NPCs can't reach them (no claims, no seasons) so there's no leak.
 def _fmt_liquidation(items: list[dict[str, Any]]) -> str:
     parts = []
     total_penalty = 0
@@ -83,7 +89,7 @@ def _fmt_liquidation(items: list[dict[str, Any]]) -> str:
         parts.append(f"{verb} {p['qty']:,} {p['ticker']}")
         total_penalty += int(p.get("penalty", 0))
     return (
-        f"💀 {_mention(items[0].get('subject'))} liquidated: " + ", ".join(parts)
+        "💀 a trader was liquidated: " + ", ".join(parts)
         + (f" — {format_money(total_penalty)} penalty" if total_penalty else "")
     )
 
@@ -91,8 +97,8 @@ def _fmt_liquidation(items: list[dict[str, Any]]) -> str:
 def _fmt_squeeze(items: list[dict[str, Any]]) -> str:
     parts = [f"{p['qty']:,} {p['ticker']}" for p in items]
     return (
-        f"📣 {_mention(items[0].get('subject'))} force-covered on borrow "
-        f"recall: " + ", ".join(parts)
+        "📣 borrow recall forced a crowded short to cover: "
+        + ", ".join(parts)
     )
 
 
@@ -102,10 +108,7 @@ def _fmt_knockout(items: list[dict[str, Any]]) -> str:
         f"(KO {format_price(p['ko_price'])})"
         for p in items
     ]
-    return (
-        f"🥊 {_mention(items[0].get('subject'))} knocked out: "
-        + ", ".join(parts)
-    )
+    return "🥊 bounded short knocked out: " + ", ".join(parts)
 
 
 def _fmt_whale(items: list[dict[str, Any]]) -> str:
@@ -114,10 +117,7 @@ def _fmt_whale(items: list[dict[str, Any]]) -> str:
         f"({format_money(p['notional'])})"
         for p in items
     ]
-    return (
-        f"🐋 {_mention(items[0].get('subject'))} whale print: "
-        + ", ".join(parts)
-    )
+    return "🐋 whale print: " + ", ".join(parts)
 
 
 def _fmt_jackpot(items: list[dict[str, Any]]) -> str:
@@ -144,7 +144,7 @@ def _fmt_option_payout(items: list[dict[str, Any]]) -> str:
         f"x{p['qty']:,} paid {format_money(p['payout'])}"
         for p in items
     ]
-    return f"💰 {_mention(items[0].get('subject'))}: " + ", ".join(parts)
+    return "💰 option payout: " + ", ".join(parts)
 
 
 def _fmt_season_result(items: list[dict[str, Any]]) -> str:

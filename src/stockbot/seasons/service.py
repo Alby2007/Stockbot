@@ -42,6 +42,7 @@ from stockbot.margin import service as margin
 from stockbot.market.engine import TICKS_PER_DAY
 from stockbot.seasons.errors import (
     AlreadyEnteredError,
+    BotAccountError,
     NoOpenSeasonError,
     SandboxAlreadyOpenError,
     SeasonNotFoundError,
@@ -205,6 +206,11 @@ async def join_season(conn: AsyncConnection, user_id: int, season_id: int | None
         account_id = (await bootstrap_user(conn, user_id)).account_id
 
         async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT is_bot FROM users WHERE id = %s", (user_id,)
+            )
+            if (row := await cur.fetchone()) is not None and row[0]:
+                raise BotAccountError(user_id)
             await cur.execute(
                 "SELECT 1 FROM season_entries WHERE season_id = %s AND user_id = %s",
                 (season.id, user_id),

@@ -61,6 +61,14 @@ _NET_WORTH_JOINS = """
     ) ov ON TRUE
 """
 
+# Aggregate human-economy surfaces exclude synthetic (NPC) accounts:
+# `users.is_bot` rows trade on real USER accounts but aren't part of the
+# player economy. Per-user-by-id reads (net_worth_minor) keep them --
+# the NPC runner values its own agents through the same path.
+_HUMAN_ONLY_JOIN = """
+    JOIN users u ON u.id = a.user_id AND NOT u.is_bot
+"""
+
 
 async def net_worth_minor(conn: AsyncConnection, user_id: int) -> int:
     """Live net worth for one user's main portfolio."""
@@ -131,6 +139,7 @@ async def evaluate_badges(
                        (s.metadata->>'threshold_minor')::bigint AS threshold
                 FROM accounts a
                 {_NET_WORTH_JOINS}
+                {_HUMAN_ONLY_JOIN}
                 JOIN shop_items s
                   ON s.kind = 'BADGE' AND s.metadata->>'metric' = 'net_worth'
                 WHERE a.kind = 'USER'
@@ -149,6 +158,7 @@ async def evaluate_badges(
             JOIN shop_items s
               ON s.kind = 'BADGE' AND s.metadata->>'metric' = 'volume'
             WHERE u.total_traded_minor >= (s.metadata->>'threshold_minor')::bigint
+              AND NOT u.is_bot
             ON CONFLICT DO NOTHING
             RETURNING user_id, item_key
             """
@@ -179,6 +189,7 @@ async def evaluate_badges(
             JOIN shop_items s
               ON s.kind = 'BADGE' AND s.metadata->>'metric' = 'quests'
             WHERE u.quests_completed >= (s.metadata->>'threshold')::int
+              AND NOT u.is_bot
             ON CONFLICT DO NOTHING
             RETURNING user_id, item_key
             """
@@ -243,6 +254,7 @@ async def leaderboard(conn: AsyncConnection) -> list[LeaderboardRow]:
                    COUNT(*) OVER () AS total
             FROM accounts a
             {_NET_WORTH_JOINS}
+            {_HUMAN_ONLY_JOIN}
             WHERE a.kind = 'USER'
             ORDER BY rank
             """

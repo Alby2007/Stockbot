@@ -35,3 +35,12 @@ class SandboxAlreadyOpenError(SeasonError):
     def __init__(self, season_id: int):
         self.season_id = season_id
         super().__init__(f"sandbox season {season_id} is already running")
+
+
+class BotAccountError(SeasonError):
+    """Synthetic (NPC) accounts can't enter seasons: the stake is
+    faucet-seeded and seasons are a human competition."""
+
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        super().__init__("bot accounts can't join seasons")

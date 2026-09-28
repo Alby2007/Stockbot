@@ -191,6 +191,10 @@ async def sweep_completions(conn: AsyncConnection, tick_index: int) -> int:
                     JOIN {table} t
                       ON t.{col} BETWEEN qi.window_start AND qi.window_end
                      {extra}
+                    -- NPC volume must not mint FAUCET quest rewards:
+                    -- unfiltered, it would partially self-fund the agent
+                    -- population and defeat permadeath (C3).
+                    JOIN users u ON u.id = t.user_id AND NOT u.is_bot
                     WHERE qi.status = 'OPEN' AND qi.kind = %s
                       -- Personal instances measure only their owner;
                       -- global ones measure everyone. A swapped-away

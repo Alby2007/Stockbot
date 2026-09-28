@@ -60,6 +60,11 @@ async def scan_for_wash_trades(
                    AND s.side = 'SELL'
                    AND s.user_id <> b.user_id
                 JOIN instruments i ON i.id = b.instrument_id
+                -- NPC-vs-NPC accidental MM pairs aren't wash trading:
+                -- synthetics don't collude, and flagging them would
+                -- produce admin noise with no actor to sanction (C4).
+                JOIN users bu ON bu.id = b.user_id AND NOT bu.is_bot
+                JOIN users su ON su.id = s.user_id AND NOT su.is_bot
                 CROSS JOIN threshold
                 WHERE b.side = 'BUY'
                   AND b.tick_index IS NOT NULL

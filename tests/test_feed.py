@@ -113,8 +113,52 @@ async def test_poll_coalesces_legs_into_one_channel_post(conn: AsyncConnection) 
     assert "liquidated" in message
     assert "NORT" in message and "WEST" in message and "HELX" in message
     assert "$1.50" in message  # 3 x 50 minor
-    assert "<@9001>" in message
     assert "knocked out" in message  # second line in the same post
+
+
+async def test_market_mechanics_render_unattributed(conn: AsyncConnection) -> None:
+    """C8 anonymity: mechanics kinds name NOBODY (NPCs can't be told
+    apart from humans -- a 'no name' tell would expose every synthetic),
+    while human-achievement kinds keep <@id> mentions."""
+    await _bind(conn, 1, 101)
+    await emit_feed(
+        conn, "LIQUIDATION",
+        {"ticker": "NORT", "side": "SELL", "qty": 5, "fill": 10.0, "penalty": 50},
+        user_id=9001, tick_index=1,
+    )
+    await emit_feed(
+        conn, "WHALE",
+        {"ticker": "NORT", "side": "BUY", "qty": 100, "fill": 10.0,
+         "notional": 100000},
+        user_id=9001, tick_index=1,
+    )
+    await emit_feed(
+        conn, "KNOCKOUT",
+        {"ticker": "NORT", "qty": 1, "entry": 10.0, "ko_price": 12.5},
+        user_id=9001, tick_index=1,
+    )
+    await emit_feed(
+        conn, "OPTION_PAYOUT",
+        {"ticker": "NORT", "side": "CALL", "strike": 10.0, "qty": 2,
+         "payout": 60000},
+        user_id=9001, tick_index=1,
+    )
+    await emit_feed(
+        conn, "JACKPOT", {"amount": 3800}, user_id=9001, tick_index=1
+    )
+
+    delivered: list[str] = []
+
+    async def deliver(channel_id: int, message: str) -> None:
+        delivered.append(message)
+
+    await poll_once(conn, deliver)
+    message = delivered[0]
+    # One mention for the jackpot; none for the four mechanics kinds.
+    assert message.count("<@9001>") == 1
+    assert "a trader was liquidated" in message
+    assert "whale print" in message
+    assert "knocked out" in message
 
 
 async def test_channels_get_independent_posts(conn: AsyncConnection) -> None:

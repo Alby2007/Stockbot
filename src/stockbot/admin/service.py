@@ -231,6 +231,13 @@ CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "news.fizzle_pct": (0.0, 0.9),
     "news.option_payout_min": (0.0, 1e15),  # dollars -- tape threshold
     "news.whale_min_notional": (0.0, 1e15),  # dollars -- tape threshold
+    "npc.action_prob_per_tick": (0.0, 1.0),
+    "npc.death_balance_minor": (0.0, 1e15),
+    "npc.enabled": (0, 1),
+    "npc.max_tick_notional": (0.0, 1e15),  # dollars -- aggregate flow cap
+    "npc.spawn_budget_minor_per_day": (0.0, 1e15),
+    "npc.stake_minor": (0.0, 1e15),
+    "npc.target_adv_share": (0.0, 1.0),
     "trading.enabled": (0, 1),
     "vol.account_flow_cap": (0.0, 1.0),
     "vol.clip_max": (0.01, 100.0),
