@@ -240,6 +240,43 @@ async def _select_window_rows(
     return rows, int(resolved_end) if resolved_end is not None else None
 
 
+async def _viewer_position(
+    conn: AsyncConnection, user_id: int, instrument_id: int
+) -> tuple[float, float] | None:
+    """(avg_cost, signed quantity) for the viewer's main-economy position.
+    Signed quantity flips the P&L math for margin shorts."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT avg_cost, quantity FROM positions
+            WHERE user_id = %s AND instrument_id = %s
+              AND season_id IS NULL AND quantity <> 0
+            """,
+            (user_id, instrument_id),
+        )
+        row = await cur.fetchone()
+    return (float(row[0]), float(row[1])) if row else None
+
+
+async def _viewer_bshort(
+    conn: AsyncConnection, user_id: int, instrument_id: int
+) -> tuple[float, float] | None:
+    """(entry_price, knockout_price) of the viewer's newest OPEN bounded
+    short -- the knockout is the line users actually ask to see."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT entry_price, knockout_price FROM bounded_shorts
+            WHERE user_id = %s AND instrument_id = %s
+              AND season_id IS NULL AND status = 'OPEN'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (user_id, instrument_id),
+        )
+        row = await cur.fetchone()
+    return (float(row[0]), float(row[1])) if row else None
+
+
 async def render_candle_chart(
     conn: AsyncConnection,
     instrument_id: int,
@@ -249,11 +286,17 @@ async def render_candle_chart(
     span: int = 240,
     axis: str = "time",
     theme: str | None = None,
+    viewer_id: int | None = None,
 ) -> tuple[io.BytesIO, int, Any] | None:
     """Candlestick chart of the `span` open ticks ending at `end`.
     Returns (png, resolved_end, end_ts) -- the clamped end tick for
     button state and the newest candle's timestamp for footers -- or
-    None if the window holds no candles."""
+    None if the window holds no candles.
+
+    `viewer_id` overlays that user's own marks (entry line + P&L band,
+    bounded-short knockout) -- the render becomes viewer-specific, so
+    the marks ride the fingerprint like `theme` does. Viewers holding
+    nothing on the instrument share the base render."""
     if axis not in ("time", "ticks"):
         axis = "time"
     palette = await _palette_for(conn, theme)
@@ -263,13 +306,21 @@ async def render_candle_chart(
     if not rows or resolved_end is None:
         return None
     bucket = bucket_for_span(span)
+    position: tuple[float, float] | None = None
+    bshort: tuple[float, float] | None = None
+    if viewer_id is not None:
+        position = await _viewer_position(conn, viewer_id, instrument_id)
+        bshort = await _viewer_bshort(conn, viewer_id, instrument_id)
     # `theme` rides the fingerprint: without it the cache would serve one
-    # user's palette to everyone on the same window.
+    # user's palette to everyone on the same window. Same for the viewer
+    # marks: position changes bust the key so a fresh fill re-renders.
     fp = (
         instrument_id,
         span,
         axis,
         theme or "",
+        position or (),
+        bshort or (),
         tuple((int(r[0]), float(r[4]), int(r[5])) for r in rows),
     )
     cached = _RENDER_CACHE.get(fp)
@@ -282,7 +333,8 @@ async def render_candle_chart(
         # (not pyplot) keeps it off pyplot's shared global state, which isn't
         # thread-safe.
         buf = await asyncio.to_thread(
-            _render_png, rows, ticker, span, bucket, axis, palette
+            _render_png, rows, ticker, span, bucket, axis, palette,
+            position=position, bshort=bshort,
         )
         _RENDER_CACHE[fp] = buf.getvalue()
         while len(_RENDER_CACHE) > _RENDER_CACHE_MAX:
@@ -337,6 +389,8 @@ def _axis_formatter(
 def _render_png(
     rows: list[Any], ticker: str, span: int = 240, bucket: int = 1,
     axis: str = "time", palette: dict[str, str] | None = None,
+    position: tuple[float, float] | None = None,
+    bshort: tuple[float, float] | None = None,
 ) -> io.BytesIO:
     p = palette or _DEFAULT_PALETTE
     rows = list(reversed(rows))
@@ -354,6 +408,14 @@ def _render_png(
     up = [c >= o for o, c in zip(opens, closes, strict=True)]
     price_hi = max(highs)
     price_lo = min(lows)
+    # Viewer marks widen the range so an entry or knockout outside the
+    # visible span still draws -- compressed candles are the honest cost.
+    if position is not None:
+        price_hi = max(price_hi, position[0])
+        price_lo = min(price_lo, position[0])
+    if bshort is not None:
+        price_hi = max(price_hi, *bshort)
+        price_lo = min(price_lo, *bshort)
     price_span = price_hi - price_lo
     # Autoscale on flat/near-flat data collapses ylim to a hair-thin
     # interval and eps-height doji bodies would fill the whole panel --
@@ -491,6 +553,85 @@ def _render_png(
             boxstyle="round,pad=0.25", facecolor=last_color, edgecolor="none"
         ),
     )
+
+    # Viewer overlay (ephemeral /chart mine): entry line + P&L band for an
+    # open position, knockout for an open bounded short. Pills are
+    # suppressed when they'd collide with the last-price pill in the
+    # right gutter -- the top-left line still reports the level.
+    if position is not None:
+        avg_cost, qty = position
+        pnl = (
+            closes[-1] / avg_cost - 1
+            if qty > 0
+            else avg_cost / closes[-1] - 1
+        )
+        pos_color = p["up"] if pnl >= 0 else p["down"]
+        ax.axhspan(
+            min(avg_cost, closes[-1]),
+            max(avg_cost, closes[-1]),
+            color=pos_color,
+            alpha=0.05,
+            lw=0,
+        )
+        ax.axhline(avg_cost, color=pos_color, linestyle=":", linewidth=0.9)
+        if abs(avg_cost - closes[-1]) > view * 0.03:
+            ax.annotate(
+                f"YOU {avg_cost:,.2f}",
+                xy=(1.005, avg_cost),
+                xycoords=("axes fraction", "data"),
+                color=p["pill_text"],
+                fontweight="bold",
+                fontsize=7,
+                va="center",
+                annotation_clip=False,
+                bbox=dict(
+                    boxstyle="round,pad=0.25",
+                    facecolor=pos_color,
+                    edgecolor="none",
+                ),
+            )
+        ax.text(
+            0.01,
+            0.93,
+            f"{'LONG' if qty > 0 else 'SHORT'} {abs(int(qty)):,} "
+            f"@ {avg_cost:,.2f}   {pnl:+.1%}",
+            transform=ax.transAxes,
+            color=pos_color,
+            fontsize=8,
+            va="top",
+            ha="left",
+        )
+
+    if bshort is not None:
+        bs_entry, ko = bshort
+        ax.axhline(ko, color=p["down"], linestyle="--", linewidth=0.8)
+        ax.axhline(bs_entry, color=p["down"], linestyle=":", linewidth=0.9)
+        if abs(ko - closes[-1]) > view * 0.03:
+            ax.annotate(
+                f"KO {ko:,.2f}",
+                xy=(1.005, ko),
+                xycoords=("axes fraction", "data"),
+                color=p["pill_text"],
+                fontweight="bold",
+                fontsize=7,
+                va="center",
+                annotation_clip=False,
+                bbox=dict(
+                    boxstyle="round,pad=0.25",
+                    facecolor=p["down"],
+                    edgecolor="none",
+                ),
+            )
+        ax.text(
+            0.01,
+            0.88 if position is not None else 0.93,
+            f"B.SHORT @ {bs_entry:,.2f} · KO {ko:,.2f}",
+            transform=ax.transAxes,
+            color=p["down"],
+            fontsize=8,
+            va="top",
+            ha="left",
+        )
 
     ax.set_ylim(price_lo - ypad, price_hi + ypad)
     for lo_i, hi_i in spans:

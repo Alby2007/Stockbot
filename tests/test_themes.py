@@ -118,16 +118,16 @@ async def test_prefs_round_trip_preserves_theme(conn: AsyncConnection) -> None:
 
 
 def test_cid_parse_round_trip_and_legacy() -> None:
-    cid = encode_cid("panl", 5, 100, 240, "ticks", "theme_vapor")
-    assert parse_cid(cid) == ("panl", 5, 100, 240, "ticks", "theme_vapor")
+    cid = encode_cid("panl", 5, 100, 240, "ticks", "theme_vapor", False)
+    assert parse_cid(cid) == ("panl", 5, 100, 240, "ticks", "theme_vapor", False)
 
     # Default theme encodes as "-" and parses to None.
     cid = encode_cid("home", 5, 100, 240)
-    assert parse_cid(cid) == ("home", 5, 100, 240, "time", None)
+    assert parse_cid(cid) == ("home", 5, 100, 240, "time", None, False)
 
     # Legacy 5-field (no axis) and 6-field (no theme) still parse.
-    assert parse_cid("cbt:zout:5:100:240") == ("zout", 5, 100, 240, "time", None)
-    assert parse_cid("cbt:zin:5:100:240:ticks") == ("zin", 5, 100, 240, "ticks", None)
+    assert parse_cid("cbt:zout:5:100:240") == ("zout", 5, 100, 240, "time", None, False)
+    assert parse_cid("cbt:zin:5:100:240:ticks") == ("zin", 5, 100, 240, "ticks", None, False)
 
     assert parse_cid("cbt:x:y:z:q:time:") is None
     assert parse_cid("nope:1:2:3") is None

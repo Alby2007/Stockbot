@@ -717,6 +717,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ticker="Instrument ticker, e.g. NORT",
         timeframe="Window (default: your saved view, else 4h)",
         axis="X-axis labels (default: your saved view, else real time)",
+        mine="Private chart with your entry + knockout lines drawn (ephemeral)",
     )
     @app_commands.choices(
         timeframe=[
@@ -741,10 +742,12 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         ticker: str,
         timeframe: str | None = None,
         axis: str | None = None,
+        mine: bool = False,
     ) -> None:
         # Defer up front: the render is slow enough to risk blowing the 3s
-        # response window on a cold pool.
-        await interaction.response.defer()
+        # response window on a cold pool. mine => ephemeral, so position
+        # marks are never visible to anyone else.
+        await interaction.response.defer(ephemeral=mine)
         async with db.connection() as conn:
             snapshot = await get_instrument_snapshot(conn, ticker)
             if snapshot is None:
@@ -788,6 +791,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             result = await render_candle_chart(
                 conn, snapshot.id, snapshot.ticker,
                 span=span, axis=resolved_axis, theme=theme,
+                viewer_id=interaction.user.id if mine else None,
             )
 
         if result is None:
@@ -810,7 +814,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             embed=embed,
             file=file,
             view=build_chart_view(
-                snapshot.id, end, span, resolved_axis, theme
+                snapshot.id, end, span, resolved_axis, theme, mine=mine
             ),
         )
 

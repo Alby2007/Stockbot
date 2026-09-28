@@ -206,7 +206,19 @@ tick_index+close+volume — a repeat request (button spam, second user on
 the same ticker) reuses the PNG bytes; the fingerprint busts on any
 intra-tick fill amendment so a mid-tick trade still re-renders. PNGs
 save at dpi=120 (1200px wide): upload size is the dominant
-/chart latency on slow links. In Docker, `MPLCONFIGDIR=/app/.mplconfig`
+/chart latency on slow links. `/chart mine:True` renders a PRIVATE
+chart (ephemeral defer) with the caller's marks drawn by `_render_png`:
+position entry line + P&L band (`viewer_id` → `positions` avg_cost/qty,
+signed for margin shorts) and the newest OPEN bounded short's dashed
+red `knockout_price` line — gutter pills are suppressed within 3% of
+`view` of the last-price pill. Marks join the render fingerprint like
+`theme` (a new fill busts the key; holders of nothing share the base
+render) and widen `price_hi/lo` so out-of-window entries still draw.
+The `mine` flag rides the cid as field 8 (`:m`/`:-`, parsed len 5–8):
+ephemeral messages have no PATCH route for re-rendered attachments, so
+`handle_chart_component` answers mine-clicks with a fresh ephemeral
+`followup.send` instead of `message.edit` — stale ephemeral charts keep
+working, they just scroll up. In Docker, `MPLCONFIGDIR=/app/.mplconfig`
 is baked with the font cache at image build — `stockbot` has no home
 dir, so without it every container restart rebuilds the fontlist and
 the first render takes seconds. Candle/wick/volume widths drop to 0.6 above

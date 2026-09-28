@@ -65,25 +65,34 @@ AXES = ("time", "ticks")
 
 def encode_cid(
     action: str, iid: int, end: int, span: int, axis: str = "time",
-    theme: str | None = None,
+    theme: str | None = None, mine: bool = False,
 ) -> str:
-    return f"cbt:{action}:{iid}:{end}:{span}:{axis}:{theme or '-'}"
+    return (
+        f"cbt:{action}:{iid}:{end}:{span}:{axis}:{theme or '-'}"
+        f":{'m' if mine else '-'}"
+    )
 
 
 def parse_cid(
     custom_id: str,
-) -> tuple[str, int, int, int, str, str | None] | None:
+) -> tuple[str, int, int, int, str, str | None, bool] | None:
     parts = custom_id.split(":")
-    if parts[0] != "cbt" or len(parts) not in (5, 6, 7):
+    if parts[0] != "cbt" or len(parts) not in (5, 6, 7, 8):
         return None
-    # Legacy 5/6-field ids predate axis/theme -- parse the defaults.
+    # Legacy 5/6/7-field ids predate axis/theme/mine -- parse the defaults.
     axis = parts[5] if len(parts) >= 6 else "time"
     if axis not in AXES:
         return None
-    theme_raw = parts[6] if len(parts) == 7 else "-"
+    theme_raw = parts[6] if len(parts) >= 7 else "-"
     theme = theme_raw if theme_raw not in ("", "-") else None
+    mine_raw = parts[7] if len(parts) == 8 else "-"
+    if mine_raw not in ("m", "-"):
+        return None
     try:
-        return parts[1], int(parts[2]), int(parts[3]), int(parts[4]), axis, theme
+        return (
+            parts[1], int(parts[2]), int(parts[3]), int(parts[4]),
+            axis, theme, mine_raw == "m",
+        )
     except ValueError:
         return None
 
@@ -231,19 +240,21 @@ class _ChartButton(discord.ui.Button[discord.ui.View]):
 
 def build_chart_view(
     iid: int, end: int, span: int, axis: str = "time",
-    theme: str | None = None,
+    theme: str | None = None, mine: bool = False,
 ) -> discord.ui.View:
     """Button rows encoding the current window -- every button's custom_id
-    carries (action, iid, end, span, axis, theme) so no state lives
+    carries (action, iid, end, span, axis, theme, mine) so no state lives
     process-side. The theme rides the cid rather than the clicker's pref:
-    a shared chart message can't repaint per-clicker."""
+    a shared chart message can't repaint per-clicker. `mine` marks
+    ephemeral /chart messages: clicks keep drawing the clicker's own
+    marks and reply with a fresh ephemeral message."""
     view = discord.ui.View(timeout=None)
     for label, action, row in _BUTTONS:
         view.add_item(
             _ChartButton(
                 style=discord.ButtonStyle.secondary,
                 label=label,
-                custom_id=encode_cid(action, iid, end, span, axis, theme),
+                custom_id=encode_cid(action, iid, end, span, axis, theme, mine),
                 row=row,
             )
         )
@@ -253,7 +264,7 @@ def build_chart_view(
         _ChartButton(
             style=discord.ButtonStyle.secondary,
             label=f"Axis: {other}",
-            custom_id=encode_cid("ax", iid, end, span, axis, theme),
+            custom_id=encode_cid("ax", iid, end, span, axis, theme, mine),
             row=1,
         )
     )
@@ -293,7 +304,7 @@ async def _handle(interaction: discord.Interaction) -> None:
             "That chart is stale — run /chart for a fresh one.", ephemeral=True
         )
         return
-    action, iid, end, span, axis, theme = parsed
+    action, iid, end, span, axis, theme, mine = parsed
 
     # Payload-free type-6 ACK up front. New file attachments cannot ride
     # the type-7 edit_message interaction callback (Discord rejects it --
@@ -350,6 +361,7 @@ async def _handle(interaction: discord.Interaction) -> None:
         result = await render_candle_chart(
             conn, iid, ticker, end=new_end, span=new_span, axis=axis,
             theme=theme,
+            viewer_id=interaction.user.id if mine else None,
         )
     if result is None:
         await interaction.followup.send(
@@ -372,8 +384,18 @@ async def _handle(interaction: discord.Interaction) -> None:
             f" · {bucket_for_span(new_span)}t/candle"
         )
     )
-    view = build_chart_view(iid, resolved_end, new_span, axis, theme)
+    view = build_chart_view(iid, resolved_end, new_span, axis, theme, mine=mine)
     file = discord.File(buf, filename=filename)
+    if mine:
+        # Ephemeral messages are interaction-bound: there's no message
+        # PATCH route for them, so a re-rendered PNG can't replace the
+        # original in place. A fresh ephemeral message per click is the
+        # private equivalent -- stale ones keep working (cids are
+        # stateless), they just scroll up.
+        await interaction.followup.send(
+            embed=embed, file=file, view=view, ephemeral=True
+        )
+        return
     msg = interaction.message
     try:
         if msg is not None:

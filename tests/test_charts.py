@@ -97,7 +97,7 @@ async def test_closed_window_anchors_to_last_open_tick(
 
     def fake_render(
         rows: list[Any], ticker: str, span: int, bucket: int, axis: str,
-        palette: dict[str, str] | None = None,
+        palette: dict[str, str] | None = None, **_kwargs: Any,
     ) -> io.BytesIO:
         captured.append(rows)
         return io.BytesIO(b"png")
@@ -139,7 +139,9 @@ async def test_window_skips_intra_window_closed_run(
     monkeypatch.setattr(
         charts,
         "_render_png",
-        lambda rows, ticker, *a: (captured.append(rows), io.BytesIO(b"png"))[1],
+        lambda rows, ticker, *a, **_kw: (
+            captured.append(rows), io.BytesIO(b"png")
+        )[1],
     )
     result = await render_candle_chart(conn, instrument_id, "TEST", span=4)
     assert result is not None
@@ -451,3 +453,76 @@ def test_span_label() -> None:
     assert charts._span_label(4800) == "1w"
     assert charts._span_label(6720) == "~7d"  # max zoom-out
     assert charts._span_label(30) == "30t"  # sub-hour zoom-in
+
+
+async def test_viewer_overlay_marks_position_and_knockout(
+    conn: AsyncConnection,
+) -> None:
+    """viewer_id draws the caller's entry + knockout marks; the marks
+    ride the cache fingerprint, so the private render can't leak into
+    (or miss on) the shared base PNG."""
+    await apply_tick(conn, "chart-test-seed")
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT id FROM instruments WHERE is_active AND kind != 'INDEX' "
+            "ORDER BY id LIMIT 1"
+        )
+        (iid,) = await cur.fetchone()
+        await cur.execute("INSERT INTO users (id) VALUES (777001)")
+        await cur.execute(
+            "INSERT INTO positions "
+            "(user_id, instrument_id, quantity, avg_cost) "
+            "VALUES (777001, %s, 10, 100.0)",
+            (iid,),
+        )
+        await cur.execute(
+            "INSERT INTO bounded_shorts "
+            "(user_id, instrument_id, quantity, entry_price, "
+            " knockout_price, collateral_minor) "
+            "VALUES (777001, %s, 5, 100.0, 115.0, 5000)",
+            (iid,),
+        )
+
+    base = await render_candle_chart(conn, iid, "TEST")
+    mine = await render_candle_chart(conn, iid, "TEST", viewer_id=777001)
+    stranger = await render_candle_chart(conn, iid, "TEST", viewer_id=777002)
+    assert base is not None and mine is not None and stranger is not None
+    base_b, mine_b, stranger_b = base[0].read(), mine[0].read(), stranger[0].read()
+    for png in (base_b, mine_b, stranger_b):
+        assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert mine_b != base_b
+    # A viewer holding nothing shares the base render.
+    assert stranger_b == base_b
+
+
+async def test_viewer_overlay_updates_on_fill_amendment(
+    conn: AsyncConnection,
+) -> None:
+    """The fingerprint keys on (qty, avg_cost) -- a new fill changes the
+    marks and must re-render rather than serve the stale overlay."""
+    await apply_tick(conn, "chart-test-seed")
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT id FROM instruments WHERE is_active AND kind != 'INDEX' "
+            "ORDER BY id LIMIT 1"
+        )
+        (iid,) = await cur.fetchone()
+        await cur.execute("INSERT INTO users (id) VALUES (777003)")
+        await cur.execute(
+            "INSERT INTO positions "
+            "(user_id, instrument_id, quantity, avg_cost) "
+            "VALUES (777003, %s, 10, 100.0)",
+            (iid,),
+        )
+    first = await render_candle_chart(conn, iid, "TEST", viewer_id=777003)
+    assert first is not None
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE positions SET quantity = 25, avg_cost = 98.0 "
+            "WHERE user_id = 777003 AND instrument_id = %s",
+            (iid,),
+        )
+    second = await render_candle_chart(conn, iid, "TEST", viewer_id=777003)
+    assert second is not None
+    assert second[0].read() != first[0].read()

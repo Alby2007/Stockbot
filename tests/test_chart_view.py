@@ -49,17 +49,34 @@ async def _instrument_id(conn: AsyncConnection) -> int:
 
 def test_cid_roundtrip() -> None:
     cid = encode_cid("panl", 21, 1528, 240)
-    assert parse_cid(cid) == ("panl", 21, 1528, 240, "time", None)
+    assert parse_cid(cid) == ("panl", 21, 1528, 240, "time", None, False)
     assert len(cid) < 100  # Discord's custom_id cap
 
     cid2 = encode_cid("zin", 7, 300, 120, "ticks")
-    assert parse_cid(cid2) == ("zin", 7, 300, 120, "ticks", None)
+    assert parse_cid(cid2) == ("zin", 7, 300, 120, "ticks", None, False)
+
+
+def test_cid_roundtrip_mine_flag() -> None:
+    """Ephemeral /chart mine views carry the flag so clicks keep drawing
+    the clicker's own marks and reply ephemerally instead of editing."""
+    cid = encode_cid("panl", 21, 1528, 240, mine=True)
+    assert parse_cid(cid) == ("panl", 21, 1528, 240, "time", None, True)
+    cid2 = encode_cid("zin", 7, 300, 120, "ticks", "neon", mine=True)
+    assert parse_cid(cid2) == ("zin", 7, 300, 120, "ticks", "neon", True)
+    # Field 8 must be m or -, anything else is malformed.
+    assert parse_cid("cbt:panl:1:2:3:time:-:x") is None
+    assert parse_cid("cbt:panl:1:2:3:time:-:m") == (
+        "panl", 1, 2, 3, "time", None, True
+    )
+    view = build_chart_view(21, 1528, 240, mine=True)
+    parsed = [parse_cid(str(b.custom_id)) for b in view.children]
+    assert all(p is not None and p[6] is True for p in parsed)
 
 
 def test_parse_cid_legacy_defaults_to_time() -> None:
     """Buttons on pre-axis charts carry 5-field cids; they parse as the
     default axis so old messages keep working after the upgrade."""
-    assert parse_cid("cbt:panr:5:640:240") == ("panr", 5, 640, 240, "time", None)
+    assert parse_cid("cbt:panr:5:640:240") == ("panr", 5, 640, 240, "time", None, False)
 
 
 @pytest.mark.parametrize(
@@ -123,7 +140,7 @@ def test_build_chart_view_encodes_window() -> None:
     assert len(buttons) == 12
     parsed = [parse_cid(str(b.custom_id)) for b in buttons]
     assert all(
-        p is not None and p[1:] == (21, 1528, 240, "time", None)
+        p is not None and p[1:] == (21, 1528, 240, "time", None, False)
         for p in parsed
     )
     assert {p[0] for p in parsed if p} == {
@@ -148,11 +165,11 @@ def test_build_chart_view_axis_state() -> None:
     view = build_chart_view(21, 1528, 240, axis="ticks")
     buttons = {str(b.custom_id).split(":")[1]: b for b in view.children}
     assert parse_cid(str(buttons["panl"].custom_id)) == (
-        "panl", 21, 1528, 240, "ticks", None
+        "panl", 21, 1528, 240, "ticks", None, False
     )
     ax = buttons["ax"]
     # cid still encodes the CURRENT axis; the label advertises the target.
-    assert parse_cid(str(ax.custom_id)) == ("ax", 21, 1528, 240, "ticks", None)
+    assert parse_cid(str(ax.custom_id)) == ("ax", 21, 1528, 240, "ticks", None, False)
     assert ax.label == "Axis: time"
 
     view_time = build_chart_view(21, 1528, 240, axis="time")
