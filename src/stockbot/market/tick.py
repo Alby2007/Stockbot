@@ -54,6 +54,28 @@ def _scale_factor(
     )
 
 
+async def _venue_has_candles(conn: AsyncConnection, market_id: int) -> bool:
+    """Any OPEN candle ever written on this venue = it has stepped
+    before. Closed ticks write flat 'CLOSED' candles for every active
+    instrument, so a venue seeded mid-close accumulates rows without
+    ever trading -- the probe must count open-state rows only. Runs
+    only at a venue's cycle_pos==0 (a reopen candidate), so the extra
+    row-EXISTS costs one probe per venue per session cycle."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT EXISTS(
+                SELECT 1 FROM candles c
+                JOIN instruments i ON i.id = c.instrument_id
+                WHERE i.market_id = %s AND c.session_state = 'OPEN'
+            )
+            """,
+            (market_id,),
+        )
+        row = await cur.fetchone()
+    return bool(row and row[0])
+
+
 async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
     """Advance the market by exactly one tick. Returns the tick index applied.
 
@@ -96,7 +118,10 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # Per-venue step params for OPEN venues: (clock dt, variance dt,
         # impact reset). Reopen = cycle_pos 0 with a real close behind
         # it; tick 0 is the exception -- the market never closed, so the
-        # first-ever tick must not "reopen" with a closed_ticks gap.
+        # first-ever tick must not "reopen" with a closed_ticks gap. The
+        # same exemption applies PER VENUE (R4): a market debuting
+        # mid-history hits its first cycle_pos==0 with no candles behind
+        # it -- never closed, so no gap -- and steps like a normal tick.
         # gap_var_dt narrows the stochastic horizon to the venue's
         # absolute overnight-var ticks (0033): overnight variance
         # empirically accrues over ~an hour of trading, not the whole
@@ -113,7 +138,12 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             ):
                 continue
             cycle_pos = (tick_index - off) % (open_t + closed_t)
-            if cycle_pos == 0 and closed_t > 0 and tick_index > 0:
+            if (
+                cycle_pos == 0
+                and closed_t > 0
+                and tick_index > 0
+                and await _venue_has_candles(conn, mid)
+            ):
                 var_ticks = m.get("overnight_var_ticks")
                 gap_var = (
                     max(1.0, float(var_ticks))

@@ -126,6 +126,10 @@ steps once with `dt=closed_ticks` (the overnight gap, breaker-bounded
 like any move) and applies `session.open_impact_reset`. Tick 0 is the
 exception: the market never closed, so the first-ever tick steps with
 dt=1 -- otherwise it "reopens" with a closed_ticks gap it never had.
+The same exemption is per-venue (R4): a venue debuting mid-history hits
+its first `cycle_pos==0` with no OPEN candles behind it (closed ticks
+write flat 'CLOSED' candles, so `_venue_has_candles` counts open-state
+rows only) and steps (1,1,1) -- no synthetic gap on the debut print.
 Gap variance is split (0033): stochastic terms scale by
 sqrt(closed_ticks * `session.overnight_var_frac`) (default 0.125 ->
 var_dt=60, ~an hour of trading), while clock-time terms (base drift,
@@ -382,8 +386,12 @@ heartbeat freshness; `python -m stockbot.tools.replay --from N --to M`
 re-derives each OPEN tick's market/sector factors from the master seed
 and diffs them against `market_ticks`, plus checks
 `quoted_price ≈ base·exp(impact)` (1e-6 tol -- the column is
-NUMERIC(18,6)) and candle OHLC/CLOSED-flatness. Replay caveat: sort
-sector keys with Python `sorted()`, never Postgres ORDER BY -- locale
+NUMERIC(18,6)) and candle OHLC/CLOSED-flatness. Replay binds each
+venue to ticks at/after its first OPEN candle (`_venue_debut_ticks`),
+so a market seeded mid-history doesn't retroactively "open" earlier
+ticks or drive union factor draws; a `markets` row that never got
+instruments stays invisible to the bound. Replay caveat: sort sector
+keys with Python `sorted()`, never Postgres ORDER BY -- locale
 collation puts 'index' before 'INDUSTRIAL', ASCII sort puts it last,
 and that shifts every sector draw by one. A `backup` compose service
 pg_dumps daily into the `stockbot-backups` volume (14-day retention).

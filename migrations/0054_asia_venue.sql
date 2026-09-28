@@ -20,14 +20,19 @@ INSERT INTO instruments (
     drift, sigma, beta, gamma, kappa, fundamental_sigma,
     liquidity, lambda_impact, tau_ticks, max_impact,
     fundamental_value, base_price, impact, quoted_price,
-    market_id, index_member, float_shares
+    market_id, index_member, float_shares, adv
 )
 SELECT v.ticker, v.name, s.id,
        v.drift, v.sigma, v.beta, v.gamma, v.kappa, v.fundamental_sigma,
        v.liquidity, v.lambda_impact, v.tau_ticks, v.max_impact,
        v.base_price, v.base_price, 0, v.base_price,
        m.id, TRUE,
-       GREATEST(10_000, ROUND(v.liquidity * 50 / v.base_price))
+       GREATEST(10_000, ROUND(v.liquidity * 50 / v.base_price)),
+       -- 0032 warm-start: adv=0 clamps effective liquidity to the floor
+       -- until the window fills; seed it like add_instrument does.
+       v.liquidity * COALESCE(
+           (SELECT value FROM config WHERE key = 'flow.adv_ref_frac'),
+           0.000000025)
 FROM (VALUES
     ('TOYO', 'Toyoden Technology', 'TECH', -2.927614e-05, 0.0005208747, 0.669, 0.983, 0.02701, 7.224731e-05, 1878996.29, 0.4052, 129.63, 0.03, 43.14::numeric),
     ('SENK', 'Senkai Technology', 'TECH', 1.891067e-06, 0.0005474288, 1.251, 0.971, 0.01501, 7.510536e-05, 5663478.84, 0.7523, 207.76, 0.03, 60.44::numeric),
@@ -84,7 +89,7 @@ INSERT INTO instruments (
     liquidity, lambda_impact, tau_ticks, max_impact,
     fundamental_value, base_price, impact, quoted_price,
     init_margin_pct, maint_margin_pct, float_shares, index_divisor,
-    short_knockout_pct, market_id
+    short_knockout_pct, market_id, adv
 )
 SELECT
     'ASX40', 'ASX-40 Index', s.id, 'INDEX',
@@ -92,7 +97,10 @@ SELECT
     50_000_000, 0.000001, 50, 0.03,
     1000, 1000, 0, 1000,
     0.20, 0.10, 0, d.divisor,
-    0.25, m.id
+    0.25, m.id,
+    50_000_000 * COALESCE(
+        (SELECT value FROM config WHERE key = 'flow.adv_ref_frac'),
+        0.000000025)
 FROM sectors s,
      markets m,
      (SELECT SUM(i.float_shares * i.base_price) / 1000 AS divisor

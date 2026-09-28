@@ -3,6 +3,8 @@ staggered candles, and single-venue byte-identity (R1+R2)."""
 
 from __future__ import annotations
 
+import math
+
 import pytest
 from psycopg import AsyncConnection
 
@@ -654,3 +656,222 @@ async def _iid_of_market(conn: AsyncConnection, code: str) -> int:
         )
         (mid,) = await cur.fetchone()
     return int(mid)
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: debut gap, replay debut bounding, per-venue auction, AS adv
+# ---------------------------------------------------------------------------
+
+
+async def test_venue_debut_tick_is_not_a_gap(conn: AsyncConnection) -> None:
+    """A venue's first-ever open tick steps (1,1) like tick 0 -- the
+    tick-0 exemption is per-venue. AS debuting at tick 1 (its first
+    cycle_pos == 0) while US is mid-session must not draw its
+    (closed, var) gap; AS's NEXT reopen (tick 6) does carry it."""
+    await _set_us_session(conn, 4, 3)
+    as_mid = await _add_asia_venue(conn, open_t=3, closed_t=2, offset=1)
+    _iid, as_ticker = await _second_stock(conn)
+    await _move_ticker_to_market(conn, as_ticker, as_mid)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE instruments SET next_halting_event_tick = NULL "
+            "WHERE ticker = %s",
+            (as_ticker,),
+        )
+    as_iid = await _iid_of(conn, as_ticker)
+
+    for _ in range(7):
+        await apply_tick(conn, SEED)
+
+    states = await _candle_states(conn, as_iid)
+    # Seeded mid-close: tick 0 writes a flat CLOSED candle, tick 1 is the
+    # venue's first real step.
+    assert states[0] == "CLOSED"
+    assert states[1] == "OPEN"
+
+    rng1 = engine.rng_for_tick(SEED, 1)
+    exp_debut = engine.draw_market_factor(rng1, dt=1.0, var_dt=1.0)
+    rng6 = engine.rng_for_tick(SEED, 6)
+    exp_reopen = engine.draw_market_factor(rng6, dt=2.0, var_dt=60.0)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT tick_index, market_factor FROM market_ticks "
+            "WHERE tick_index IN (1, 6)"
+        )
+        stored = {int(t): float(f) for t, f in await cur.fetchall()}
+    assert stored[1] == pytest.approx(exp_debut, abs=1e-9)
+    assert stored[6] == pytest.approx(exp_reopen, abs=1e-9)
+
+
+def test_scale_factor_rescales_heterogeneous_gap() -> None:
+    """Pin the union-draw algebra: a factor drawn at a reopening venue's
+    (840, 60) horizon rescales exactly onto a mid-session venue's (1,1)
+    step; the same-horizon shortcut stays identity."""
+    from stockbot.market.tick import _scale_factor
+
+    drift, z = 1e-5, 0.7
+    drawn = drift * 840.0 + z * math.sqrt(60.0)
+    assert _scale_factor(
+        drawn, drift, 1.0, 1.0, draw_dt=840.0, draw_vdt=60.0
+    ) == pytest.approx(drift + z)
+    assert (
+        _scale_factor(
+            drawn, drift, 840.0, 60.0, draw_dt=840.0, draw_vdt=60.0
+        )
+        == drawn
+    )
+
+
+def test_replay_venue_set_is_bounded_by_debut() -> None:
+    """replay.py applies each venue only from its first OPEN candle: a
+    market seeded mid-history must not retroactively open earlier ticks
+    or drive union factor draws."""
+    from stockbot.tools.replay import (
+        _any_venue_open,
+        _union_gap_dt,
+        _venue_gap_dt,
+    )
+
+    us = {
+        "id": 1, "open_ticks": 4, "closed_ticks": 2,
+        "offset_ticks": 0, "overnight_var_ticks": 60,
+    }
+    as_ = {
+        "id": 2, "open_ticks": 2, "closed_ticks": 4,
+        "offset_ticks": 3, "overnight_var_ticks": 60,
+    }
+    markets = [us, as_]
+    debuts = {1: 0, 2: 9}  # AS's first OPEN candle is tick 9.
+
+    # tick 4: AS's phase is open ((4-3) % 6 == 1 < 2) but it has no marks
+    # yet; with US closed the summary must stay CLOSED.
+    assert not _any_venue_open(markets, 4, debuts)
+    # tick 9: AS's debut open -- in the venue set, but gap-exempt.
+    assert _any_venue_open(markets, 9, debuts)
+    assert _venue_gap_dt(as_, 9, 9) == (1.0, 1.0)
+    assert _union_gap_dt(markets, 9, debuts) == (1.0, 1.0)
+    # tick 15: AS's first real reopen carries its gap -- clock dt is the
+    # close length; vdt is the venue's absolute overnight horizon (60).
+    assert _venue_gap_dt(as_, 15, 9) == (4.0, 60.0)
+    assert _union_gap_dt(markets, 15, debuts) == (4.0, 60.0)
+
+
+async def test_per_venue_auction_only_auctions_its_own_books(
+    conn: AsyncConnection,
+) -> None:
+    """R3 pin: while AS is inside its closing-auction window and US is
+    mid-session, only AS books clear at a uniform auction price -- US
+    books keep matching continuously and MM-fill."""
+    from decimal import Decimal
+
+    from stockbot.orders.service import place_order
+
+    await _set_us_session(conn, 4, 2)  # US cycle 6: open 0-3, closed 4-5
+    as_mid = await _add_asia_venue(conn, open_t=2, closed_t=1, offset=0)
+    async with conn.cursor() as cur:
+        await cur.execute("UPDATE markets SET auction_ticks = 1")
+        # Keep AS's tick-3 reopen gap out of the way of the fill asserts.
+        await cur.execute(
+            "UPDATE markets SET overnight_var_ticks = 1 WHERE id = %s",
+            (as_mid,),
+        )
+        await cur.execute(
+            "SELECT id, ticker FROM instruments WHERE is_active "
+            "AND kind != 'INDEX' ORDER BY id LIMIT 3"
+        )
+        rows = await cur.fetchall()
+    us_ticker = str(rows[0][1])
+    as1_ticker = str(rows[1][1])
+    as2_ticker = str(rows[2][1])
+    await _move_ticker_to_market(conn, as1_ticker, as_mid)
+    await _move_ticker_to_market(conn, as2_ticker, as_mid)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE instruments SET next_halting_event_tick = NULL "
+            "WHERE ticker IN (%s, %s, %s)",
+            (us_ticker, as1_ticker, as2_ticker),
+        )
+    for uid in (7013, 7014, 7015, 7016):
+        await _fund_user(conn, uid)
+
+    await apply_tick(conn, SEED)  # tick 0: both venues open, mid-session
+
+    async def _quoted(t: str) -> Decimal:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT quoted_price FROM instruments WHERE ticker = %s",
+                (t,),
+            )
+            (p,) = await cur.fetchone()
+        return Decimal(str(p))
+
+    # US: a lone MM-fillable bid -- fills continuously at tick 1.
+    us_mark = await _quoted(us_ticker)
+    us_bid = await place_order(
+        conn, user_id=7013, ticker=us_ticker, side="BUY", quantity=1,
+        limit_price=us_mark * Decimal("1.05"),
+    )
+    # AS book 1: a crossing pair -- must print once at the uniform
+    # auction price at tick 1.
+    await execute_trade(
+        conn, user_id=7014, ticker=as1_ticker, side="BUY", quantity=5
+    )
+    as_mark = await _quoted(as1_ticker)
+    as_bid = await place_order(
+        conn, user_id=7015, ticker=as1_ticker, side="BUY", quantity=2,
+        limit_price=as_mark * Decimal("1.05"),
+    )
+    as_ask = await place_order(
+        conn, user_id=7014, ticker=as1_ticker, side="SELL", quantity=2,
+        limit_price=as_mark * Decimal("0.98"),
+    )
+    # AS book 2: a lone MM-fillable bid -- pass 2 is suspended on the
+    # auction venue, so it waits for the next open tick.
+    as2_mark = await _quoted(as2_ticker)
+    as_late_bid = await place_order(
+        conn, user_id=7016, ticker=as2_ticker, side="BUY", quantity=1,
+        limit_price=as2_mark * Decimal("1.05"),
+    )
+
+    await apply_tick(conn, SEED)  # tick 1: AS auctions; US is continuous
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT o.id, o.status, "
+            "(SELECT t.fill_price FROM trades t WHERE t.order_id = o.id "
+            "LIMIT 1) AS fp FROM orders o WHERE o.id IN (%s, %s, %s, %s)",
+            (us_bid.order_id, as_bid.order_id, as_ask.order_id,
+             as_late_bid.order_id),
+        )
+        got = {int(r[0]): (str(r[1]), r[2]) for r in await cur.fetchall()}
+
+    assert got[us_bid.order_id][0] == "FILLED"
+    assert got[as_bid.order_id][0] == "FILLED"
+    assert got[as_ask.order_id][0] == "FILLED"
+    assert got[as_bid.order_id][1] == got[as_ask.order_id][1]  # uniform
+    assert got[as_late_bid.order_id] == ("OPEN", None)
+
+    # tick 2: AS closed. tick 3: AS reopens mid-cycle -- continuous
+    # matching resumes and the leftover bid MM-fills.
+    await apply_tick(conn, SEED)
+    await apply_tick(conn, SEED)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT status FROM orders WHERE id = %s",
+            (as_late_bid.order_id,),
+        )
+        (status,) = await cur.fetchone()
+    assert status == "FILLED"
+
+
+
+async def test_asia_seed_warm_starts_adv(conn: AsyncConnection) -> None:
+    """0054 keeps 0032's warm-start: AS rows seeded adv=0 would sit at
+    the effective_liquidity floor until the rolling window fills."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT COUNT(*) FROM instruments i JOIN markets m "
+            "ON m.id = i.market_id WHERE m.code = 'AS' AND i.adv <= 0"
+        )
+        (zero_adv,) = await cur.fetchone()
+    assert int(zero_adv) == 0
