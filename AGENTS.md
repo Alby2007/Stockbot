@@ -1044,7 +1044,32 @@ NPC prints indistinguishable (no "no-name = bot" tell), and it retires
 liquidation-shaming for humans; achievement kinds (`JACKPOT`,
 `SEASON_RESULT`) keep `<@id>` since bots can't reach them. `npc.*`
 config is seeded with `npc.enabled=0`: P1 ships the identity layer with
-zero agents acting; the runner lands in P2.
+zero agents acting.
+
+**NPC runner P2 done** (`src/stockbot/npc/service.py`, `main.py`, compose
+`npc` service): `python -m stockbot.npc.main` is a third singleton
+process cloned from `market/main.py` -- own `pg_try_advisory_lock` key
+(0x4E504354) + the `conn.commit()` right after (without it, ambient
+tx state silently demotes every later `conn.transaction()` to a
+never-committed savepoint; the same footgun applies inside `run_round`,
+which wraps every phase -- read, per-agent action, death sweep -- in
+explicit transaction blocks, with the stagger `asyncio.sleep` OUTSIDE
+the action tx so pacing doesn't hold locks). The loop polls
+`MAX(tick_index)` and fires `run_round` once per new tick when
+`npc.enabled`. `spawn_agent` is the ONLY NPC money path: bootstrap +
+is_bot + one FAUCET->agent `NPC_STAKE` transfer + npc_agents row in the
+caller's tx; there is deliberately no top-up function (permadeath is
+the safety model). Agent selection is seeded `master_seed|npc|uid|tick`
+against `npc.action_prob_per_tick`; chosen agents get a random delay
+across the tick interval (the stagger keeps flow out of one
+pending_flow batch and off apply_tick's locks at tick+0); aggregate
+round flow is bounded by `npc.max_tick_notional` (dollars). P2 ships
+the grinder archetype only (ported per-tick from the harness: venue-
+open ticker pick via `open_market_ids`, 5-15%-of-balance buy,
+expected-error catch); whale/yolo/shorter/LP/stop_loss land in P3.
+`mark_dead_agents` stamps `died_at_tick` on enabled agents whose NET
+WORTH sits under `npc.death_balance_minor` with zero open positions --
+net worth, not cash, so a fully-invested agent isn't killed.
 
 **Public tape done** (`migrations/0055_feed.sql`, `src/stockbot/feed`,
 `src/stockbot/bot/feed.py`, `/feed-setup` `/feed-remove`): a per-guild

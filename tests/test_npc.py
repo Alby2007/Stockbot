@@ -63,21 +63,15 @@ async def test_bot_earns_no_badges(conn: AsyncConnection) -> None:
             """
         )
         await cur.execute(
-            "UPDATE users SET total_traded_minor = 10, quests_completed = 1 "
-            "WHERE id = 3003"
+            "UPDATE users SET total_traded_minor = 10, quests_completed = 1 WHERE id = 3003"
         )
     await evaluate_badges(conn, tick_index=1440)
     async with conn.cursor() as cur:
-        await cur.execute(
-            "SELECT COUNT(*) FROM entitlements WHERE user_id = 3003"
-        )
+        await cur.execute("SELECT COUNT(*) FROM entitlements WHERE user_id = 3003")
         assert (await cur.fetchone())[0] == 0
     # A human gets all three at these thresholds (proof the sweep ran).
     async with conn.cursor() as cur:
-        await cur.execute(
-            "SELECT COUNT(*) FROM entitlements "
-            "WHERE item_key LIKE 'test_%_badge'"
-        )
+        await cur.execute("SELECT COUNT(*) FROM entitlements WHERE item_key LIKE 'test_%_badge'")
         assert (await cur.fetchone())[0] > 0
 
 
@@ -128,8 +122,12 @@ async def test_bot_trades_but_completes_no_quests(conn: AsyncConnection) -> None
 async def test_bot_cannot_join_season(conn: AsyncConnection) -> None:
     await _make_bot(conn, 3006, 100_000)
     season_id = await create_season(
-        conn, name="No Bots", start_tick=0, end_tick=10_000,
-        entry_fee_minor=0, stake_minor=100_000,
+        conn,
+        name="No Bots",
+        start_tick=0,
+        end_tick=10_000,
+        entry_fee_minor=0,
+        stake_minor=100_000,
     )
     await on_tick(conn, 0)
     with pytest.raises(BotAccountError):
@@ -182,8 +180,142 @@ async def test_bot_keeps_net_worth_snapshots(conn: AsyncConnection) -> None:
     await _make_bot(conn, 3009, 100_000)
     await snapshot_net_worth_if_due(conn, tick_index=1440)
     async with conn.cursor() as cur:
-        await cur.execute(
-            "SELECT equity_minor FROM net_worth_snapshots WHERE user_id = 3009"
-        )
+        await cur.execute("SELECT equity_minor FROM net_worth_snapshots WHERE user_id = 3009")
         row = await cur.fetchone()
     assert row is not None and int(row[0]) > 0
+
+
+# ---- P2: the runner ----
+
+from stockbot.ledger.service import get_balance, get_user_account_id  # noqa: E402
+from stockbot.npc.service import (  # noqa: E402
+    NPC_USER_ID_BASE,
+    load_agents,
+    mark_dead_agents,
+    npc_enabled,
+    run_round,
+    spawn_agent,
+)
+
+
+async def _set_config(conn: AsyncConnection, key: str, value: float) -> None:
+    async with conn.cursor() as cur:
+        await cur.execute("UPDATE config SET value = %s WHERE key = %s", (value, key))
+
+
+async def _ensure_open_tick(conn: AsyncConnection) -> int:
+    """Pin a market_ticks row in the US-open phase (tick % 1440 < 960)
+    so execute_trade's assert_market_open can't flake on committed
+    history. Returns the tick index used."""
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT COALESCE(MAX(tick_index), -1) + 1 FROM market_ticks")
+        t = int((await cur.fetchone())[0])
+        if t % 1440 >= 960:
+            t += 1440 - (t % 1440)
+        await cur.execute(
+            "INSERT INTO market_ticks (tick_index, ts, market_factor, "
+            "sector_factors, session_state) "
+            "VALUES (%s, now(), 1.0, '{}', 'OPEN')",
+            (t,),
+        )
+        return t
+
+
+async def test_spawn_agent_flag_stake_and_row(conn: AsyncConnection) -> None:
+    uid = await spawn_agent(conn, "grinder", stake_minor=50_000)
+    assert uid >= NPC_USER_ID_BASE
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT is_bot FROM users WHERE id = %s", (uid,))
+        assert (await cur.fetchone())[0] is True
+        await cur.execute(
+            "SELECT archetype, enabled, died_at_tick FROM npc_agents WHERE user_id = %s",
+            (uid,),
+        )
+        row = await cur.fetchone()
+        assert row[0] == "grinder" and row[1] is True and row[2] is None
+        # The one-time NPC_STAKE grant, FAUCET -> agent, sums to zero.
+        await cur.execute("SELECT SUM(amount) FROM ledger_entries WHERE reason = 'NPC_STAKE'")
+        assert int((await cur.fetchone())[0]) == 0
+        await cur.execute("SELECT COUNT(*) FROM ledger_entries WHERE reason = 'NPC_STAKE'")
+        assert (await cur.fetchone())[0] == 2
+    account_id = await get_user_account_id(conn, uid)
+    # bootstrap_user's human starting grant applies too -- the NPC gets
+    # grant + stake, both bounded one-time flows.
+    assert await get_balance(conn, account_id) >= 50_000
+
+
+async def test_spawn_shorter_gets_margin_tier(conn: AsyncConnection) -> None:
+    uid = await spawn_agent(conn, "shorter", stake_minor=10_000)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT quantity FROM entitlements WHERE user_id = %s AND item_key = 'margin_tier'",
+            (uid,),
+        )
+        row = await cur.fetchone()
+    assert row is not None and int(row[0]) == 1
+
+
+async def test_run_round_grinder_trades(conn: AsyncConnection) -> None:
+    """prob=1 forces action; a grinder ends the round holding stock or
+    having spent cash, and the ledger still sums to zero."""
+    tick = await _ensure_open_tick(conn)
+    uid = await spawn_agent(conn, "grinder", stake_minor=1_000_000)
+    await _set_config(conn, "npc.action_prob_per_tick", 1)
+    stats = await run_round(conn, "test-seed", tick_index=tick, sleep=False)
+    assert stats["acted"] == 1
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT SUM(e.amount) FROM ledger_entries e", ())
+        assert int((await cur.fetchone())[0]) == 0
+        await cur.execute("SELECT COUNT(*) FROM trades WHERE user_id = %s", (uid,))
+        assert (await cur.fetchone())[0] >= 1
+
+
+async def test_run_round_prob_zero_is_quiet(conn: AsyncConnection) -> None:
+    tick = await _ensure_open_tick(conn)
+    await spawn_agent(conn, "grinder", stake_minor=100_000)
+    await _set_config(conn, "npc.action_prob_per_tick", 0)
+    stats = await run_round(conn, "test-seed", tick_index=tick, sleep=False)
+    assert stats["acted"] == 0
+
+
+async def test_run_round_budget_caps_the_round(conn: AsyncConnection) -> None:
+    """npc.max_tick_notional (dollars) bounds aggregate round flow: with
+    a $1 budget the first agent acts and the rest sit out."""
+    tick = await _ensure_open_tick(conn)
+    await spawn_agent(conn, "grinder", stake_minor=1_000_000)
+    await spawn_agent(conn, "grinder", stake_minor=1_000_000)
+    await _set_config(conn, "npc.action_prob_per_tick", 1)
+    await _set_config(conn, "npc.max_tick_notional", 1)
+    stats = await run_round(conn, "test-seed", tick_index=tick, sleep=False)
+    assert stats["acted"] == 1
+
+
+async def test_mark_dead_agents_permadeath(conn: AsyncConnection) -> None:
+    broke = await spawn_agent(conn, "grinder", stake_minor=1)
+    rich = await spawn_agent(conn, "grinder", stake_minor=1_000_000)
+    async with conn.cursor() as cur:
+        # Drain broke below npc.death_balance_minor (100) -- it still
+        # holds the bootstrap grant on top of the stake.
+        await cur.execute(
+            "UPDATE accounts SET balance = 1 WHERE user_id = %s AND kind = 'USER'",
+            (broke,),
+        )
+    dead = await mark_dead_agents(conn, tick_index=7)
+    assert dead == 1
+    ids = {a.user_id for a in await load_agents(conn)}
+    assert broke not in ids and rich in ids
+    # Permadeath: a later sweep does not resurrect or re-stamp.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE accounts SET balance = 9_999_999 WHERE user_id = %s AND kind = 'USER'",
+            (broke,),
+        )
+    assert await mark_dead_agents(conn, tick_index=8) == 0
+    assert broke not in {a.user_id for a in await load_agents(conn)}
+
+
+async def test_npc_enabled_kill_switch(conn: AsyncConnection) -> None:
+    # 0057 seeds npc.enabled = 0.
+    assert await npc_enabled(conn) is False
+    await _set_config(conn, "npc.enabled", 1)
+    assert await npc_enabled(conn) is True

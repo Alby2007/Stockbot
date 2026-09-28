@@ -61,6 +61,20 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  npc:
+    build: .
+    command: ["python", "-m", "stockbot.npc.main"]
+    environment:
+      DATABASE_URL: postgresql://stockbot:${POSTGRES_PASSWORD:-stockbot}@postgres:5432/stockbot
+      # Same seed as market: per-agent decision RNG is keyed off it.
+      MASTER_SEED: ${MASTER_SEED:-change-me-in-production}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
   # Daily pg_dump into a named volume -- trivial to have, painful to learn
   # you needed. Restore: `docker compose exec backup ls /backups`, copy the
   # .sql.gz out, `gunzip | psql`.
