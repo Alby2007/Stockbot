@@ -1057,12 +1057,16 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   `sync_leaderboard_boards`. The loop hashes the *ranking rows* (not the
   embed — the Updated footer would defeat it) and skips the REST edit
   when unchanged. `message_id` NULL → post + pin; `NotFound` on fetch →
-  repost. Per-channel try/except so a deleted/locked channel never kills
-  the pass; `message_id` commits per binding (a later channel's failure
-  must not roll back an earlier board's stored id → double-post).
-  `/leaderboard-setup` (default_permissions manage_guild) binds +
-  posts immediately; `/leaderboard` shares `leaderboard_embed` with a
-  caller-rank footer param.
+  repost, but NOT inside `_REPOST_GRACE` (120s) of `updated_at` — a fresh
+  board can briefly 404 while Discord propagates it, and treating that as
+  "deleted" double-posts. Per-channel try/except so a deleted/locked
+  channel never kills the pass; `message_id` commits per binding (a later
+  channel's failure must not roll back an earlier board's stored id →
+  double-post). `/leaderboard-setup` (default_permissions manage_guild)
+  reads the old binding (`fetch_binding`), binds + posts immediately,
+  then `delete_board_message` removes the displaced board — rebinding
+  used to leave a frozen pinned orphan behind. `/leaderboard` shares
+  `leaderboard_embed` with a caller-rank footer param.
 - **Rate limits** (H4): `/chart` has `@app_commands.checks.cooldown(1,
   10)` (per-user default); `StockBotTree.on_error` maps
   `CommandOnCooldown` to "Slow down -- retry in Ns". `_instrument_one`

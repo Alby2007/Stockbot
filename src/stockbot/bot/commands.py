@@ -69,6 +69,8 @@ from stockbot.bot.charts import render_candle_chart
 from stockbot.bot.format import format_money, format_pct, format_price
 from stockbot.bot.leaderboard import (
     bind_leaderboard_channel,
+    delete_board_message,
+    fetch_binding,
     leaderboard_embed,
     post_leaderboard_board,
 )
@@ -1092,9 +1094,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
             return
         async with db.connection() as conn, conn.transaction():
+            old = await fetch_binding(conn, interaction.guild_id)
             await bind_leaderboard_channel(conn, interaction.guild_id, channel.id)
             message = await post_leaderboard_board(
                 conn, interaction.guild_id, channel
+            )
+        if old is not None and old.message_id is not None:
+            await delete_board_message(
+                interaction.client, old.channel_id, old.message_id
             )
         await interaction.response.send_message(
             f"Leaderboard board live in {channel.mention} — it refreshes "

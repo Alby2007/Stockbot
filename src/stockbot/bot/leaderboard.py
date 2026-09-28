@@ -13,7 +13,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import discord
@@ -33,11 +33,18 @@ BOARD_LIMIT = 15
 _last_hashes: dict[int, str] = {}
 
 
+# A board message freshly posted can briefly 404 on fetch_message while
+# Discord propagates it -- treat a NotFound inside this window as "still
+# replicating", not "deleted", or the repost path double-posts.
+_REPOST_GRACE = timedelta(seconds=120)
+
+
 @dataclass(frozen=True)
 class BoardBinding:
     guild_id: int
     channel_id: int
     message_id: int | None
+    updated_at: datetime
 
 
 def leaderboard_embed(
@@ -90,19 +97,37 @@ async def bind_leaderboard_channel(
         )
 
 
+async def _to_binding(r: Any) -> BoardBinding:
+    return BoardBinding(
+        guild_id=int(r[0]),
+        channel_id=int(r[1]),
+        message_id=None if r[2] is None else int(r[2]),
+        updated_at=r[3],
+    )
+
+
+async def fetch_binding(
+    conn: AsyncConnection, guild_id: int
+) -> BoardBinding | None:
+    """The guild's current binding (or None) -- used by /leaderboard-setup
+    to remember the old board so it can be deleted after the rebind."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT guild_id, channel_id, message_id, updated_at "
+            "FROM leaderboard_channels WHERE guild_id = %s",
+            (guild_id,),
+        )
+        row = await cur.fetchone()
+    return None if row is None else await _to_binding(row)
+
+
 async def _fetch_bindings(conn: AsyncConnection) -> list[BoardBinding]:
     async with conn.cursor() as cur:
         await cur.execute(
-            "SELECT guild_id, channel_id, message_id FROM leaderboard_channels"
+            "SELECT guild_id, channel_id, message_id, updated_at "
+            "FROM leaderboard_channels"
         )
-        return [
-            BoardBinding(
-                guild_id=int(r[0]),
-                channel_id=int(r[1]),
-                message_id=None if r[2] is None else int(r[2]),
-            )
-            for r in await cur.fetchall()
-        ]
+        return [await _to_binding(r) for r in await cur.fetchall()]
 
 
 async def _store_message_id(
@@ -140,6 +165,23 @@ async def _fetch_channel(client: Any, channel_id: int) -> Any | None:
     if channel is None:
         channel = await client.fetch_channel(channel_id)
     return channel
+
+
+async def delete_board_message(
+    client: Any, channel_id: int, message_id: int
+) -> bool:
+    """Best-effort delete of a previously bound board. Rebinding a guild
+    abandons the old message, and without this every /leaderboard-setup
+    leaves a frozen duplicate pinned in the old channel."""
+    try:
+        channel = client.get_channel(channel_id) or await client.fetch_channel(
+            channel_id
+        )
+        message = await channel.fetch_message(message_id)
+        await message.delete()
+        return True
+    except discord.HTTPException:
+        return False
 
 
 async def sync_leaderboard_boards(client: Any) -> None:
@@ -198,6 +240,14 @@ async def _sync_one(
         try:
             message = await channel.fetch_message(binding.message_id)
         except discord.NotFound:
+            if datetime.now(UTC) - binding.updated_at < _REPOST_GRACE:
+                log.info(
+                    "leaderboard board %s not yet fetchable in %s -- "
+                    "assuming propagation lag, retrying next pass",
+                    binding.message_id,
+                    binding.channel_id,
+                )
+                return
             message = None  # board deleted -- repost below
         if message is not None:
             await message.edit(embed=embed)

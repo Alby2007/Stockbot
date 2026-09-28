@@ -14,6 +14,7 @@ from stockbot import db
 from stockbot.bot import leaderboard as lb
 from stockbot.bot.leaderboard import (
     bind_leaderboard_channel,
+    fetch_binding,
     leaderboard_embed,
     sync_leaderboard_boards,
 )
@@ -38,15 +39,11 @@ async def test_bind_upserts_and_resets_message_id(conn: AsyncConnection) -> None
             (_G + 1,),
         )
     await bind_leaderboard_channel(conn, _G + 1, 222)  # rebind elsewhere
-    async with conn.cursor() as cur:
-        await cur.execute(
-            "SELECT channel_id, message_id FROM leaderboard_channels "
-            "WHERE guild_id = %s",
-            (_G + 1,),
-        )
-        channel_id, message_id = await cur.fetchone()
-    assert channel_id == 222
-    assert message_id is None  # forces a fresh board post
+    binding = await fetch_binding(conn, _G + 1)
+    assert binding is not None
+    assert binding.channel_id == 222
+    assert binding.message_id is None  # forces a fresh board post
+    assert await fetch_binding(conn, _G + 999) is None  # unbound guild
 
 
 def test_leaderboard_embed_ranks_and_footer() -> None:
@@ -86,12 +83,16 @@ class _FakeMessage:
         self.id = message_id
         self.edits: list[object] = []
         self.pinned = False
+        self.deleted = False
 
     async def edit(self, *, embed: object = None) -> None:
         self.edits.append(embed)
 
     async def pin(self) -> None:
         self.pinned = True
+
+    async def delete(self) -> None:
+        self.deleted = True
 
 
 class _FakeChannel:
@@ -237,7 +238,8 @@ async def test_sync_reposts_when_board_message_deleted() -> None:
         async with db.connection() as conn, conn.transaction():
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "UPDATE leaderboard_channels SET message_id = 9876 "
+                    "UPDATE leaderboard_channels SET message_id = 9876, "
+                    "updated_at = now() - interval '10 minutes' "
                     "WHERE guild_id = %s",
                     (guild_id,),
                 )
@@ -247,6 +249,40 @@ async def test_sync_reposts_when_board_message_deleted() -> None:
     finally:
         await _drop_binding(guild_id)
         await db.close_pool()
+
+
+async def test_sync_no_repost_inside_grace_window() -> None:
+    """A board 404ing right after being posted is propagation lag, not a
+    deletion -- sync must wait rather than double-post."""
+    await db.init_pool(get_settings().test_database_url, min_size=1, max_size=2)
+    guild_id = _G + 16
+    try:
+        channel = _FakeChannel(560)  # no message 9876 -> NotFound
+        await _bind_committed(guild_id, 560)
+        async with db.connection() as conn, conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE leaderboard_channels SET message_id = 9876 "
+                    "WHERE guild_id = %s",
+                    (guild_id,),
+                )  # updated_at stays fresh -> inside _REPOST_GRACE
+        await sync_leaderboard_boards(_FakeClient({560: channel}))
+        assert not channel.sent
+        assert await _binding_message_id(guild_id) == 9876  # kept for retry
+    finally:
+        await _drop_binding(guild_id)
+        await db.close_pool()
+
+
+async def test_delete_board_message() -> None:
+    old = _FakeMessage(3131)
+    channel = _FakeChannel(561, existing={3131: old})
+    client = _FakeClient({561: channel})
+    assert await lb.delete_board_message(client, 561, 3131) is True
+    assert old.deleted is True
+    # Gone message / gone channel -> False, never raises.
+    assert await lb.delete_board_message(client, 561, 9999) is False
+    assert await lb.delete_board_message(client, 999, 3131) is False
 
 
 async def test_sync_survives_forbidden_channel() -> None:
