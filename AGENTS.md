@@ -131,7 +131,7 @@ sqrt(closed_ticks * `session.overnight_var_frac`) (default 0.125 ->
 var_dt=60, ~an hour of trading), while clock-time terms (base drift,
 mean reversion, impact decay) keep the full closed_ticks. Without the
 split ~85% of instruments pinned the 4.5% breaker every reopen.
-Regional markets (0053, R1–R3 done): venues live in `markets`
+Regional markets (0053+0054, all four phases done): venues live in `markets`
 (open/closed/offset ticks, tick_size, auction_ticks,
 overnight_var_ticks = the ABSOLUTE gap horizon, 60 for US so R4's longer
 close keeps var calibrated by writing 60 again, NOT rescaling the frac).
@@ -158,6 +158,16 @@ is deliberately venue-agnostic (C5: overnight expiries settle at the
 frozen pre-gap mark); only `reprice_open_options` skips closed venues.
 Closing auctions are per-venue (`auction_market_ids`): a book auctions
 when ITS venue is inside `markets.auction_ticks` of its own close.
+R4 (0054): the AS venue (600/840, offset 720, var_ticks 60 -> 0.0714
+frac on the longer close) seeds 40 stocks + ASX40, a second cap-weighted
+index; index baskets and `delist_instrument`'s divisor rebase are
+venue-scoped (an index's members are its own market's `index_member`
+rows). The sim harness splits the cohort into one wave per distinct
+venue-open tick and `_random_active_ticker` only picks open-venue
+tickers (a closed-venue pick would dead-letter in the TradingError
+catch). Note: `test_iceberg_*`'s old mark*1.02 limit sat exactly on the
+2% cross collar after tick snapping -- tests crossing the book should
+stay under ~1.5%.
 Mean reversion uses the exact OU decay `log_dev*(1-exp(-kappa*dt))`
 (not linear `kappa*log_dev*dt`) -- at dt=480 the linear pull is ~9x the
 deviation and overshoots FV into a halt; the decay form converges onto

@@ -8,7 +8,7 @@ from stockbot.market.tick import apply_tick
 
 async def test_snapshots_have_no_day_change_before_any_ticks(conn: AsyncConnection) -> None:
     snapshots = await all_instrument_snapshots(conn)
-    assert len(snapshots) == 41  # 40 stocks + SBX40 index
+    assert len(snapshots) == 82  # 40 US stocks + SBX40 + 40 AS stocks + ASX40
     assert all(s.day_change_pct is None for s in snapshots)
 
 

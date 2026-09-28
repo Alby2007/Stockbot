@@ -374,7 +374,9 @@ async def test_sbx40_index_tracks_components(conn: AsyncConnection) -> None:
             """
             SELECT i.quoted_price, i.index_divisor,
                    (SELECT SUM(s.float_shares * s.quoted_price)
-                    FROM instruments s WHERE s.kind = 'STOCK' AND s.is_active)
+                    FROM instruments s WHERE s.kind = 'STOCK'
+                      AND s.is_active AND s.index_member
+                      AND s.market_id = i.market_id)
             FROM instruments i WHERE i.ticker = 'SBX40'
             """
         )

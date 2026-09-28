@@ -33,14 +33,14 @@ async def _add_asia_venue(
     closed_t: int = 2,
     offset: int = 1,
 ) -> int:
-    """A second venue on a staggered clock; returns the new market id."""
+    """Reshape the seeded AS venue (0054) to a small staggered clock for
+    tests; returns its market id."""
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            INSERT INTO markets
-                (code, name, open_ticks, closed_ticks, offset_ticks,
-                 tick_size, auction_ticks, overnight_var_ticks)
-            VALUES ('AS', 'Asia Exchange', %s, %s, %s, 0.01, 1, 60)
+            UPDATE markets
+            SET open_ticks = %s, closed_ticks = %s, offset_ticks = %s
+            WHERE code = 'AS'
             RETURNING id
             """,
             (open_t, closed_t, offset),
@@ -570,3 +570,87 @@ async def test_closed_venue_liquidation_legs_defer(
         )
         (n,) = await cur.fetchone()
     assert int(n) == 0
+
+
+# ---------------------------------------------------------------------------
+# R4: the seeded Asia venue
+# ---------------------------------------------------------------------------
+
+
+async def test_seeded_asia_venue_runs_staggered_clock(
+    conn: AsyncConnection,
+) -> None:
+    """R4 smoke: 0054 seeds AS (600 open / 840 closed / offset 720), 40
+    stocks, and the ASX40 index. On the real shape ticks 0-5 have US open
+    and AS closed (AS pos = (tick-720) % 1440 >= 600), so US instruments
+    step while AS writes flat CLOSED candles and ASX40 holds the seed."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT open_ticks, closed_ticks, offset_ticks, "
+            "overnight_var_ticks FROM markets WHERE code = 'AS'"
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    assert (int(row[0]), int(row[1]), int(row[2])) == (600, 840, 720)
+    assert float(row[3]) == pytest.approx(60.0)  # 60/840 ~= 0.0714 frac
+
+    us_mid = await _us_market_id(conn)
+    as_mid = await _iid_of_market(conn, "AS")
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT COUNT(*) FROM instruments i WHERE i.market_id = %s "
+            "AND i.kind = 'STOCK' AND i.index_member",
+            (as_mid,),
+        )
+        (n_as,) = await cur.fetchone()
+        await cur.execute(
+            "SELECT id, index_divisor FROM instruments "
+            "WHERE ticker = 'ASX40' AND market_id = %s",
+            (as_mid,),
+        )
+        asx = await cur.fetchone()
+        await cur.execute(
+            "SELECT i.id FROM instruments i WHERE i.market_id = %s "
+            "AND i.kind = 'STOCK' ORDER BY i.id LIMIT 1",
+            (as_mid,),
+        )
+        (as_iid,) = await cur.fetchone()
+        await cur.execute(
+            "SELECT i.id FROM instruments i WHERE i.market_id = %s "
+            "AND i.kind = 'STOCK' ORDER BY i.id LIMIT 1",
+            (us_mid,),
+        )
+        (us_iid,) = await cur.fetchone()
+    assert int(n_as) == 40
+    assert asx is not None and float(asx[1]) > 0
+
+    for _ in range(3):
+        await apply_tick(conn, SEED)
+
+    as_states = await _candle_states(conn, as_iid)
+    us_states = await _candle_states(conn, us_iid)
+    assert all(s == "CLOSED" for s in as_states.values())
+    assert all(s == "OPEN" for s in us_states.values())
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT quoted_price FROM instruments WHERE ticker = 'ASX40'"
+        )
+        (asx_px,) = await cur.fetchone()
+        await cur.execute(
+            "SELECT quoted_price FROM instruments WHERE ticker = 'SBX40'"
+        )
+        (sbx_px,) = await cur.fetchone()
+    # ASX40 never traded a tick -- still the 1000 seed level.
+    assert float(asx_px) == pytest.approx(1000.0)
+    # SBX40 repriced off its live US basket -- moved off the seed level.
+    assert float(sbx_px) != pytest.approx(1000.0)
+
+
+async def _iid_of_market(conn: AsyncConnection, code: str) -> int:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT id FROM markets WHERE code = %s", (code,)
+        )
+        (mid,) = await cur.fetchone()
+    return int(mid)

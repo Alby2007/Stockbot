@@ -709,7 +709,7 @@ async def delist_instrument(conn: AsyncConnection, ticker: str) -> DelistReport:
             await cur.execute(
                 """
                 SELECT id, ticker, kind, is_active, quoted_price,
-                       index_member, index_divisor, base_price
+                       index_member, index_divisor, base_price, market_id
                 FROM instruments
                 WHERE ticker = %s OR kind = 'INDEX'
                 ORDER BY id
@@ -719,7 +719,6 @@ async def delist_instrument(conn: AsyncConnection, ticker: str) -> DelistReport:
             )
             locked = await cur.fetchall()
         target = next((r for r in locked if r["ticker"] == ticker), None)
-        index = next((r for r in locked if r["kind"] == "INDEX"), None)
         if target is None:
             raise UnknownInstrumentError(ticker)
         if not target["is_active"]:
@@ -733,15 +732,26 @@ async def delist_instrument(conn: AsyncConnection, ticker: str) -> DelistReport:
         # basket outright (a zero level would hit the positive-prices CHECK
         # on the next tick).
         if target["index_member"]:
+            # The basket is venue-scoped (R4): the index for the TARGET's
+            # market re-bases over that venue's members only.
+            index = next(
+                (
+                    r
+                    for r in locked
+                    if r["kind"] == "INDEX"
+                    and int(r["market_id"]) == int(target["market_id"])
+                ),
+                None,
+            )
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
                     SELECT COALESCE(SUM(i.float_shares * i.quoted_price), 0)
                     FROM instruments i
                     WHERE i.kind = 'STOCK' AND i.index_member AND i.is_active
-                      AND i.id <> %s
+                      AND i.id <> %s AND i.market_id = %s
                     """,
-                    (iid,),
+                    (iid, int(target["market_id"])),
                 )
                 basket_row = await cur.fetchone()
             basket_after = float(basket_row[0]) if basket_row else 0.0

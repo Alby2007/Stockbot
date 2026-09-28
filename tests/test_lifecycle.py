@@ -77,9 +77,11 @@ def _minor(amount: Decimal) -> int:
 
 async def _index_row(conn: AsyncConnection) -> dict:
     async with conn.cursor(row_factory=dict_row) as cur:
+        # Two index rows exist post-0054 (SBX40 on US, ASX40 on AS); the
+        # lifecycle tests exercise the US basket.
         await cur.execute(
             "SELECT id, index_divisor, base_price, quoted_price "
-            "FROM instruments WHERE kind = 'INDEX'"
+            "FROM instruments WHERE kind = 'INDEX' ORDER BY id LIMIT 1"
         )
         row = await cur.fetchone()
     assert row is not None
@@ -536,7 +538,12 @@ async def test_delist_index_member_rebases_divisor(conn: AsyncConnection) -> Non
             SELECT COALESCE(SUM(i.float_shares * i.quoted_price), 0)
             FROM instruments i
             WHERE i.kind = 'STOCK' AND i.index_member AND i.is_active
-            """
+              AND i.market_id = (
+                  SELECT market_id FROM instruments
+                  WHERE ticker = %s
+              )
+            """,
+            (ticker,),
         )
         basket = float((await cur.fetchone())[0])
     assert basket / divisor_after == pytest.approx(level_before, rel=1e-9)

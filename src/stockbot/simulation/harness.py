@@ -63,6 +63,8 @@ from stockbot.ledger.service import (
 )
 from stockbot.margin.errors import MarginError
 from stockbot.margin.service import compute_health
+from stockbot.market import engine
+from stockbot.market.data import markets_map, open_market_ids
 from stockbot.market.tick import apply_tick
 from stockbot.observability import run_periodic_audit
 from stockbot.orders.service import cancel_order, list_open_orders, place_order
@@ -197,6 +199,12 @@ async def initialize_agents(conn: AsyncConnection, agents: list[Agent]) -> None:
 
 
 async def _random_active_ticker(conn: AsyncConnection, rng: random.Random) -> str | None:
+    # Venue filter (R4): with staggered clocks a closed venue's tickers
+    # would just raise MarketClosedError in the broad catch below, so
+    # only pick from venues open at the current tick.
+    open_mids = await open_market_ids(conn)
+    if not open_mids:
+        return None
     async with conn.cursor() as cur:
         # ORDER BY matters: rng.choice() over the result must be
         # deterministic for a given seed, and Postgres row order isn't.
@@ -204,8 +212,10 @@ async def _random_active_ticker(conn: AsyncConnection, rng: random.Random) -> st
             """
             SELECT ticker FROM instruments
             WHERE is_active AND circuit_halted_until_tick IS NULL
+              AND market_id = ANY(%s)
             ORDER BY ticker
-            """
+            """,
+            (sorted(open_mids),),
         )
         tickers = [row[0] for row in await cur.fetchall()]
     return rng.choice(tickers) if tickers else None
@@ -588,24 +598,49 @@ async def run_simulation(
 
     user_ids = [a.user_id for a in agents]
     archetype_by_user = {a.user_id: a.archetype for a in agents}
+    markets = await markets_map(conn)
 
     starting_net_worth = await net_worth_by_user(conn, user_ids)
     timeline: list[dict[str, object]] = []
     last_tick = -1
 
     for day in range(num_days):
-        # Agents act right after the day's first tick -- the session-open
-        # gap tick. With ticks_per_day == one session cycle, acting after
-        # the LAST tick lands in the closed phase and every trade/quote
-        # is silently swallowed by the broad TradingError catch.
-        last_tick = await apply_tick(conn, master_seed)
+        # Agents act right after a venue's session-open gap tick. With
+        # ticks_per_day == one session cycle and staggered venues (R4),
+        # each venue gets its own intra-day wave: the cohort splits
+        # round-robin across the distinct open ticks so AS agents act
+        # while AS is actually open (a wave landing in a venue's close
+        # would dead-letter its orders in the broad TradingError catch).
+        # Wave 0 always rides tick 0 of the day -- US's open -- matching
+        # the pre-R4 single-venue cadence.
+        day_base = last_tick + 1
+        open_points = {0}
+        for m in markets.values():
+            for k in range(ticks_per_day):
+                if engine.session_phase(
+                    day_base + k,
+                    int(m["open_ticks"]),
+                    int(m["closed_ticks"]),
+                    int(m["offset_ticks"]),
+                ) == "OPEN":
+                    open_points.add(k)
+                    break
+        waves = sorted(open_points)
+        groups = [agents[i::len(waves)] for i in range(len(waves))]
+
         sim_today = SIM_CLAIM_EPOCH + timedelta(days=day)
-        for agent in agents:
-            await _run_agent_day(
-                conn, agent, rng, sim_today, f"{master_seed}|claims"
-            )
-        for _ in range(ticks_per_day - 1):
+        day_tick = 0
+        for wave, open_at in enumerate(waves):
+            while day_tick <= open_at:
+                last_tick = await apply_tick(conn, master_seed)
+                day_tick += 1
+            for agent in groups[wave]:
+                await _run_agent_day(
+                    conn, agent, rng, sim_today, f"{master_seed}|claims"
+                )
+        while day_tick < ticks_per_day:
             last_tick = await apply_tick(conn, master_seed)
+            day_tick += 1
 
         if day % snapshot_every_days == 0 or day == num_days - 1:
             net_worth = await net_worth_by_user(conn, user_ids)

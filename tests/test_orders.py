@@ -382,11 +382,13 @@ async def test_iceberg_shows_display_qty_but_fills_full_size(
     # Seller needs inventory to sell 200 shares.
     await execute_trade(conn, user_id=3021, ticker=ticker, side="BUY", quantity=200)
     # Refresh the mark after the buy moved it, then rest the iceberg ask
-    # just above it and a crossing bid at the same price.
+    # just above it and a crossing bid at the same price. 1% stays well
+    # inside the 2% cross collar -- mark*1.02 lands right on the boundary
+    # after tick-grid snapping and flips on rounding dust.
     mark = await _quoted(conn, ticker)
     ask = await place_order(
         conn, user_id=3021, ticker=ticker, side="SELL", quantity=200,
-        limit_price=mark * Decimal("1.02"), display_qty=25,
+        limit_price=mark * Decimal("1.01"), display_qty=25,
     )
 
     async with conn.cursor() as cur:
@@ -405,7 +407,7 @@ async def test_iceberg_shows_display_qty_but_fills_full_size(
 
     bid = await place_order(
         conn, user_id=3020, ticker=ticker, side="BUY", quantity=200,
-        limit_price=mark * Decimal("1.02"),
+        limit_price=mark * Decimal("1.01"),
     )
     await match_orders(conn, 999999)
     assert await _order_status(conn, ask.order_id) == "FILLED"

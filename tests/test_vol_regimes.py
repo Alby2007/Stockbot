@@ -184,6 +184,9 @@ async def test_vol_state_stays_bounded_and_writes_sigma_eff(conn) -> None:
             """
             SELECT vol_state, sigma_eff, sigma FROM instruments
             WHERE is_active AND kind = 'STOCK'
+              -- US scope: AS (0054) is closed for this whole 30-tick
+              -- run, so its stocks legitimately keep sigma_eff NULL.
+              AND market_id = (SELECT id FROM markets WHERE code = 'US')
             """
         )
         rows = await cur.fetchall()
