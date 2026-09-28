@@ -75,5 +75,11 @@ jobs:
               2>/dev/null || cp -a ~/stockbot-release/. ~/stockbot/
             rm -rf ~/stockbot-release /tmp/stockbot-release.tar.gz
             cd ~/stockbot
+            # Rebuilds accumulate dangling image layers + build cache; the
+            # disk filled once already ("no space left on device" mid-pull).
+            # image/builder prune never touch running containers, volumes,
+            # or the postgres data volume -- only unused images and cache.
+            docker image prune -af >/dev/null 2>&1 || true
+            docker builder prune -af >/dev/null 2>&1 || true
             docker compose up -d --build postgres bot market backup
           '
