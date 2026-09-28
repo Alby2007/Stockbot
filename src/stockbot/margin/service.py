@@ -42,6 +42,7 @@ from stockbot.market.data import (
     flow_config,
     half_spread_for,
     instrument_session_cfg,
+    open_market_ids,
     record_flow,
     spread_config,
 )
@@ -595,15 +596,26 @@ async def _liquidate_account(
     season_id: int | None,
     account_id: int,
     tick_index: int | None,
+    open_market_ids: set[int] | None = None,
 ) -> int:
     """Reduce an undermargined account until ratio >= target or it has no
     positions left. Returns the number of liquidation legs executed.
+
+    `open_market_ids` (regional markets R3) scopes liquidation legs to
+    venues open this tick: a closed venue's frozen mark can't fill, so
+    those positions are skipped and the account stays undermargined --
+    the sweep retries it next tick (deferral is the sweep itself). The
+    insurance-fund/ADL backstop likewise defers while any closed-venue
+    short remains unliquidatable. None = every venue eligible.
 
     Assumes the caller's transaction already holds locks on the account's
     position instruments (true inside apply_tick and in check_and_liquidate).
     """
     from stockbot.trading.service import FEE_BPS  # lazy: circular at top level
 
+    _mids = (
+        sorted(open_market_ids) if open_market_ids is not None else None
+    )
     cfg = await margin_config(conn)
     target = cfg["margin.liquidation_target_ratio"]
     penalty_bps = cfg["margin.liquidation_penalty_bps"]
@@ -632,11 +644,12 @@ async def _liquidate_account(
                 WHERE p.user_id = %s
                   AND p.season_id IS NOT DISTINCT FROM %s
                   AND p.quantity < 0
+                  AND (%s::int[] IS NULL OR i.market_id = ANY(%s))
                 ORDER BY -p.quantity * i.quoted_price * i.maint_margin_pct DESC
                 LIMIT 1
                 FOR UPDATE OF p
                 """,
-                (user_id, season_id),
+                (user_id, season_id, _mids, _mids),
             )
             worst = await cur.fetchone()
         if worst is None:
@@ -685,11 +698,12 @@ async def _liquidate_account(
                     WHERE p.user_id = %s
                       AND p.season_id IS NOT DISTINCT FROM %s
                       AND p.quantity > 0
+                      AND (%s::int[] IS NULL OR i.market_id = ANY(%s))
                     ORDER BY p.quantity * i.quoted_price DESC
                     LIMIT 1
                     FOR UPDATE OF p
                     """,
-                    (user_id, season_id),
+                    (user_id, season_id, _mids, _mids),
                 )
                 longest = await cur.fetchone()
             if longest is None:
@@ -734,7 +748,8 @@ async def _liquidate_account(
                    i.lambda_impact, i.max_impact, i.quoted_price, i.maint_margin_pct,
                    i.vol_state, i.flow_skew,
                    COALESCE(i.sigma_eff, i.sigma) AS sigma,
-                   i.next_event_tick, i.last_halt_end_tick
+                   i.next_event_tick, i.last_halt_end_tick,
+                   i.market_id
             FROM positions p
             JOIN instruments i ON i.id = p.instrument_id
             WHERE p.user_id = %s
@@ -747,6 +762,13 @@ async def _liquidate_account(
         remaining_shorts = await cur.fetchall()
 
     health = await compute_health(conn, user_id, season_id)
+    # Deferral (R3): shorts on closed venues can't fill at a frozen
+    # mark -- the sweep retries them at that venue's reopen.
+    if open_market_ids is not None and any(
+        int(pos["market_id"]) not in open_market_ids
+        for pos in remaining_shorts
+    ):
+        return legs
     if health.equity_minor < 0 or health.undermargined:
         for pos in remaining_shorts:
             await _liquidate_leg(
@@ -837,6 +859,7 @@ async def check_and_liquidate(
             season_id=season_id,
             account_id=account_id,
             tick_index=tick,
+            open_market_ids=await open_market_ids(conn, tick),
         )
         await _warn_margin_risk(
             conn,
@@ -848,12 +871,20 @@ async def check_and_liquidate(
         return legs
 
 
-async def sweep_undermargined(conn: AsyncConnection, tick_index: int) -> int:
+async def sweep_undermargined(
+    conn: AsyncConnection,
+    tick_index: int,
+    open_market_ids: set[int] | None = None,
+) -> int:
     """Tick-time liquidation sweep. Runs inside apply_tick's transaction where
     every instrument is already locked; each account row is taken FOR UPDATE
     lazily on its first write/read inside the legs (instruments-then-accounts
     ordering holds because all instrument locks are already held). Returns
-    the number of liquidation legs executed across all accounts."""
+    the number of liquidation legs executed across all accounts.
+
+    `open_market_ids` (R3) scopes legs to venues open this tick; an
+    account left undermargined on closed-venue positions alone defers to
+    that venue's reopen."""
     async with conn.cursor() as cur:
         await cur.execute(
             """
@@ -878,6 +909,7 @@ async def sweep_undermargined(conn: AsyncConnection, tick_index: int) -> int:
             season_id=sid,
             account_id=int(account_id),
             tick_index=tick_index,
+            open_market_ids=open_market_ids,
         )
         await _warn_margin_risk(
             conn,
@@ -961,7 +993,9 @@ def effective_borrow_bps_per_tick(
 
 
 async def sweep_recalls(
-    conn: AsyncConnection, tick_index: int
+    conn: AsyncConnection,
+    tick_index: int,
+    open_market_ids: set[int] | None = None,
 ) -> int:
     """Borrow recalls on crowded shorts: when an instrument's short
     interest exceeds margin.recall_si_pct, every open short covers a
@@ -985,8 +1019,13 @@ async def sweep_recalls(
             SELECT id, short_interest_pct
             FROM instruments
             WHERE is_active AND short_interest_pct > %s
+              AND (%s::int[] IS NULL OR market_id = ANY(%s))
             """,
-            (threshold,),
+            (
+                threshold,
+                sorted(open_market_ids) if open_market_ids is not None else None,
+                sorted(open_market_ids) if open_market_ids is not None else None,
+            ),
         )
         crowded = await cur.fetchall()
 

@@ -732,18 +732,27 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                     (tick_index, closed_mids),
                 )
 
-        # Bounded shorts: knock out any position whose instrument reached its
-        # knockout price this tick. Before season snapshots so closed shorts
-        # stop contributing to equity.
-        kos = await shorts.sweep_knockouts(conn, tick_index)
+        # Bounded shorts: knock out open-venue positions whose mark hit
+        # the knockout this tick. Closed-venue marks are frozen and can't
+        # KO (R3). Before season snapshots so closed shorts stop
+        # contributing to equity.
+        open_mids = set(venue_step)
+        kos = await shorts.sweep_knockouts(
+            conn, tick_index, open_market_ids=open_mids
+        )
 
         # Options: settle expiries at this tick's mark and reprice open
         # marks to the new model values. Before match_orders so settlement
         # uses the tick's own mark (same semantics as KOs); NOT gated on
         # options.enabled -- the kill switch stops new exposure, never
         # strands existing contracts.
+        # Settlement is venue-agnostic on purpose: an option expiring
+        # during its venue's close settles at the frozen pre-gap mark
+        # (C5). Repricing skips closed-venue underlyings (frozen spot).
         opt_settled = await options.settle_expired_options(conn, tick_index)
-        await options.reprice_open_options(conn, tick_index)
+        await options.reprice_open_options(
+            conn, tick_index, open_market_ids=open_mids
+        )
 
         # Resting limit orders: fill any whose limit the new marks satisfy.
         # Before the margin sweep so a fill's impact and equity change land
@@ -754,8 +763,13 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # auction); the MM fallback is skipped for auctioned books (the
         # print is the auction) but still runs for event-halted ones.
         if await data.feature_enabled_flag(conn, "orders.enabled"):
-            closing_auction = any(
-                int(m["auction_ticks"]) > 0
+            # Per-venue auction windows: a book auctions when ITS venue is
+            # within markets.auction_ticks of its own close.
+            auction_mids = {
+                mid
+                for mid, m in markets.items()
+                if mid in venue_step
+                and int(m["auction_ticks"]) > 0
                 and engine.ticks_until_close(
                     tick_index,
                     int(m["open_ticks"]),
@@ -763,11 +777,13 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                     int(m["offset_ticks"]),
                 )
                 <= int(m["auction_ticks"])
-                for mid, m in markets.items()
-                if mid in venue_step
-            )
+            }
             await orders.match_orders(
-                conn, tick_index, stats=stats, closing_auction=closing_auction
+                conn,
+                tick_index,
+                stats=stats,
+                open_market_ids=open_mids,
+                auction_market_ids=auction_mids,
             )
 
         # Phase 2 margin maintenance, all inside the tick transaction where
@@ -779,13 +795,19 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # short_interest_pct (one-tick lag on the squeeze boost, benign).
         await margin.refresh_short_interest(conn)
         await margin.accrue_borrow_fees(conn)
-        recalls = await margin.sweep_recalls(conn, tick_index)
-        liqs = await margin.sweep_undermargined(conn, tick_index)
+        recalls = await margin.sweep_recalls(
+            conn, tick_index, open_market_ids=open_mids
+        )
+        liqs = await margin.sweep_undermargined(
+            conn, tick_index, open_market_ids=open_mids
+        )
 
         # Price alerts fire on the tick-close mark -- after every
         # mark-mutating step above (steps, crosses, MM fills) so an alert
         # never waits a tick for a price it already crossed.
-        alert_fires = await alerts.sweep_alerts(conn, tick_index)
+        alert_fires = await alerts.sweep_alerts(
+            conn, tick_index, open_market_ids=open_mids
+        )
 
         # H4: trailing ADV refresh -- a sliding-window SMA of per-tick
         # notional volume (candles.volume * close). Once per tick, never

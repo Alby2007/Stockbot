@@ -786,7 +786,8 @@ async def match_orders(
     conn: AsyncConnection,
     tick_index: int,
     stats: dict[str, int] | None = None,
-    closing_auction: bool = False,
+    open_market_ids: set[int] | None = None,
+    auction_market_ids: set[int] | None = None,
 ) -> int:
     """Match the book (crosses, then MM fills) for this tick.
 
@@ -805,10 +806,15 @@ async def match_orders(
     participation budget across iterations so a cascade can't drain more
     depth than one tick allows.
 
-    `closing_auction` (Plan C) is set on the session's last open ticks
-    (`session.auction_ticks`): pass 1 becomes a single-price clearing
-    auction per book and the MM fallback is restricted to books that had
-    no auction -- event-halted names keep their risk-reducing MM path.
+    `open_market_ids` (regional markets R3) scopes matching to venues
+    open this tick -- orders on closed venues rest untouched against
+    frozen marks. None = every instrument eligible.
+
+    `auction_market_ids` (Plan C, per-venue post-0053) holds the venues
+    inside their closing-auction window (`markets.auction_ticks`): pass 1
+    becomes a single-price clearing auction for books on those venues and
+    the MM fallback is restricted to books that had no auction --
+    event-halted names keep their risk-reducing MM path.
     """
     if stats is not None:
         stats.setdefault("crosses", 0)
@@ -872,7 +878,8 @@ async def match_orders(
             max_fill_failures=max_fill_failures,
             flow_halt_ticks=flow_halt_ticks,
             event_halt_lead=event_halt_lead,
-            closing_auction=closing_auction,
+            open_market_ids=open_market_ids,
+            auction_market_ids=auction_market_ids,
             stats=stats,
         )
         triggered = await _trigger_due_stops(conn, tick_index)
@@ -1066,7 +1073,8 @@ async def _match_once(
     max_fill_failures: int,
     flow_halt_ticks: int,
     event_halt_lead: int,
-    closing_auction: bool,
+    open_market_ids: set[int] | None,
+    auction_market_ids: set[int] | None,
     stats: dict[str, int] | None = None,
 ) -> int:
     """One matching pass over the book: crosses (or the closing auction),
@@ -1074,6 +1082,12 @@ async def _match_once(
     across cascade iterations so the participation cap is per-tick, not
     per-pass."""
     fills = 0
+    _open_mids = (
+        sorted(open_market_ids) if open_market_ids is not None else None
+    )
+    _auction_mids = (
+        sorted(auction_market_ids) if auction_market_ids is not None else None
+    )
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
@@ -1091,8 +1105,10 @@ async def _match_once(
             WHERE o.status = 'OPEN'
               AND i.is_active
               AND (o.order_type = 'LIMIT' OR o.triggered_tick IS NOT NULL)
+              AND (%s::int[] IS NULL OR i.market_id = ANY(%s))
             ORDER BY o.instrument_id, o.id
             """,
+            (_open_mids, _open_mids),
         )
         open_orders = await cur.fetchall()
 
@@ -1160,7 +1176,11 @@ async def _match_once(
         # the price collar-width at a time. Anchor to the mark this
         # instrument opened the tick with instead.
         open_mark = open_marks.setdefault(_iid, mark)
-        if closing_auction:
+        book_auction = (
+            auction_market_ids is not None
+            and int(ref["market_id"]) in auction_market_ids
+        )
+        if book_auction:
             # Plan C: on the last open tick the continuous book clears
             # once at a uniform price -- the closing auction.
             fills += await _auction_clear(
@@ -1297,10 +1317,21 @@ async def _match_once(
               AND (o.order_type = 'STOP'
                 OR (o.side = 'BUY'  AND i.quoted_price <= o.limit_price * (1 - %s))
                 OR (o.side = 'SELL' AND i.quoted_price >= o.limit_price * (1 + %s)))
-              AND (NOT %s OR %s >= i.next_halting_event_tick - %s)
+              AND (%s::int[] IS NULL OR i.market_id <> ALL(%s)
+                   OR %s >= i.next_halting_event_tick - %s)
+              AND (%s::int[] IS NULL OR i.market_id = ANY(%s))
             ORDER BY o.id
             """,
-            (epsilon, epsilon, closing_auction, tick_index, event_halt_lead),
+            (
+                epsilon,
+                epsilon,
+                _auction_mids,
+                _auction_mids,
+                tick_index,
+                event_halt_lead,
+                _open_mids,
+                _open_mids,
+            ),
         )
         candidates = await cur.fetchall()
 

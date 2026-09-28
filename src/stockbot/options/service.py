@@ -710,10 +710,15 @@ async def _settle_where(
     return len(settled)
 
 
-async def reprice_open_options(conn: AsyncConnection, tick_index: int) -> int:
+async def reprice_open_options(
+    conn: AsyncConnection,
+    tick_index: int,
+    open_market_ids: set[int] | None = None,
+) -> int:
     """Refresh mark_minor (mark-to-model) for every open option. Cheap:
     one SELECT + per-row UPDATE; OI stays small under max_oi_frac.
-    Runs in both phases so closed-session marks stay current."""
+    `open_market_ids` (R3) skips underlyings on closed venues -- their
+    spot is frozen, so repricing would only spin the row. None = all."""
     rho = await _config_float(conn, "vol.rho", 0.94)
     sess_cfg = await session_config(conn)
     venues = await markets_map(conn)
@@ -728,7 +733,12 @@ async def reprice_open_options(conn: AsyncConnection, tick_index: int) -> int:
             FROM option_positions o
             JOIN instruments i ON i.id = o.instrument_id
             WHERE o.status = 'OPEN'
+              AND (%s::int[] IS NULL OR i.market_id = ANY(%s))
             """,
+            (
+                sorted(open_market_ids) if open_market_ids is not None else None,
+                sorted(open_market_ids) if open_market_ids is not None else None,
+            ),
         )
         rows = await cur.fetchall()
     for row in rows:

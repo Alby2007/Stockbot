@@ -427,6 +427,24 @@ async def current_session(
     return market_phase(dict(row), tick), tick, cfg
 
 
+async def open_market_ids(
+    conn: AsyncConnection, tick_index: int | None = None
+) -> set[int]:
+    """Venue ids OPEN at `tick_index` (default: the last applied tick).
+    No ticks applied yet -> every venue counts open (same as
+    `current_session`)."""
+    markets = await markets_map(conn)
+    if tick_index is None:
+        tick_index = await current_tick_index(conn)
+    if tick_index is None:
+        return set(markets)
+    return {
+        mid
+        for mid, m in markets.items()
+        if market_phase(m, tick_index) == "OPEN"
+    }
+
+
 async def feature_enabled_flag(conn: AsyncConnection, key: str) -> bool:
     """Non-raising kill-switch read for tick-internal call sites
     (match_orders) that silently skip rather than error to a user."""

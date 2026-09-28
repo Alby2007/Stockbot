@@ -152,11 +152,19 @@ async def list_alerts(
     return {"open": open_rows, "closed": closed_rows}
 
 
-async def sweep_alerts(conn: AsyncConnection, tick_index: int) -> int:
+async def sweep_alerts(
+    conn: AsyncConnection,
+    tick_index: int,
+    open_market_ids: set[int] | None = None,
+) -> int:
     """Flip every OPEN alert whose instrument's mark crossed its target
     this tick, enqueueing one ALERT_TRIGGERED outbox row per alert. Runs
     inside apply_tick's transaction after all mark-mutating steps, so
-    alerts always see the true tick-close price."""
+    alerts always see the true tick-close price.
+
+    `open_market_ids` scopes the sweep to venues open this tick --
+    closed-venue marks are frozen, so an alert there can only fire on a
+    stale print (regional markets R3). None = no venue filter."""
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
@@ -167,10 +175,15 @@ async def sweep_alerts(conn: AsyncConnection, tick_index: int) -> int:
             WHERE i.id = a.instrument_id AND a.status = 'OPEN' AND i.is_active
               AND ((a.direction = 'ABOVE' AND i.quoted_price >= a.target_price)
                 OR (a.direction = 'BELOW' AND i.quoted_price <= a.target_price))
+              AND (%s::int[] IS NULL OR i.market_id = ANY(%s))
             RETURNING a.user_id, i.ticker, a.direction, a.target_price,
                       i.quoted_price AS mark
             """,
-            (tick_index,),
+            (
+                tick_index,
+                sorted(open_market_ids) if open_market_ids is not None else None,
+                sorted(open_market_ids) if open_market_ids is not None else None,
+            ),
         )
         fired = await cur.fetchall()
         for row in fired:

@@ -131,7 +131,7 @@ sqrt(closed_ticks * `session.overnight_var_frac`) (default 0.125 ->
 var_dt=60, ~an hour of trading), while clock-time terms (base drift,
 mean reversion, impact decay) keep the full closed_ticks. Without the
 split ~85% of instruments pinned the 4.5% breaker every reopen.
-Regional markets (0053, R1 done): venues live in `markets`
+Regional markets (0053, R1–R3 done): venues live in `markets`
 (open/closed/offset ticks, tick_size, auction_ticks,
 overnight_var_ticks = the ABSOLUTE gap horizon, 60 for US so R4's longer
 close keeps var calibrated by writing 60 again, NOT rescaling the frac).
@@ -145,6 +145,19 @@ fill paths. `assert_market_open(conn, instrument_id)` is venue-scoped --
 call it AFTER resolving the instrument. Tests flip session shape by
 UPDATEing the `markets` row (NOT `session.*` config, which only survives
 as fallback defaults for missing venues).
+R2/R3 mechanics: `apply_tick` is one unified pipeline -- `venue_step`
+maps instruments to their venue's (dt, var_dt) or carries them through
+closed (flat candle, frozen mark); shared factor draws rescale per
+instrument via `_scale_factor`. Sweeps take `open_market_ids` (a
+`market_id = ANY(...)` filter, None = every venue): order matching,
+KO sweep, alert sweep, recalls, and liquidation legs. Liquidation
+defers per-LEG -- `_liquidate_account` skips closed-venue positions and
+leaves the account undermargined for the next tick; the ADL/insurance
+backstop never settles a leg whose venue is closed. Option settlement
+is deliberately venue-agnostic (C5: overnight expiries settle at the
+frozen pre-gap mark); only `reprice_open_options` skips closed venues.
+Closing auctions are per-venue (`auction_market_ids`): a book auctions
+when ITS venue is inside `markets.auction_ticks` of its own close.
 Mean reversion uses the exact OU decay `log_dev*(1-exp(-kappa*dt))`
 (not linear `kappa*log_dev*dt`) -- at dt=480 the linear pull is ~9x the
 deviation and overshoots FV into a halt; the decay form converges onto

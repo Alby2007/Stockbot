@@ -453,10 +453,18 @@ async def cover_bounded_short(
     )
 
 
-async def sweep_knockouts(conn: AsyncConnection, tick_index: int) -> int:
+async def sweep_knockouts(
+    conn: AsyncConnection,
+    tick_index: int,
+    open_market_ids: set[int] | None = None,
+) -> int:
     """Knock out every open bounded short whose instrument's quoted price has
     reached its knockout level. Called inside apply_tick's transaction after
     instrument prices are written; knockout checks the tick-close price.
+
+    `open_market_ids` scopes the sweep to venues open this tick -- a
+    closed venue's frozen mark can never print a knockout (regional
+    markets R3). None = every instrument eligible (single-venue callers).
     """
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
@@ -468,10 +476,15 @@ async def sweep_knockouts(conn: AsyncConnection, tick_index: int) -> int:
             WHERE i.id = bs.instrument_id
               AND bs.status = 'OPEN'
               AND i.quoted_price >= bs.knockout_price
+              AND (%s::int[] IS NULL OR i.market_id = ANY(%s))
             RETURNING bs.user_id, i.ticker, bs.quantity, bs.entry_price,
                       bs.knockout_price
             """,
-            (tick_index,),
+            (
+                tick_index,
+                sorted(open_market_ids) if open_market_ids is not None else None,
+                sorted(open_market_ids) if open_market_ids is not None else None,
+            ),
         )
         knocked = await cur.fetchall()
         # Outbox: same transaction as the UPDATE above -- one notification

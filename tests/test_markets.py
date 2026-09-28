@@ -303,3 +303,270 @@ async def test_reopen_gap_uses_venue_horizon(conn: AsyncConnection) -> None:
         )
         (mf5,) = await cur.fetchone()
     assert float(mf5) == pytest.approx(exp5, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# R3: region-gated sweeps
+# ---------------------------------------------------------------------------
+
+
+async def _us_market_id(conn: AsyncConnection) -> int:
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT id FROM markets ORDER BY id LIMIT 1")
+        (mid,) = await cur.fetchone()
+    return int(mid)
+
+
+async def _second_stock(conn: AsyncConnection) -> tuple[int, str]:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT id, ticker FROM instruments WHERE is_active "
+            "AND kind != 'INDEX' ORDER BY id OFFSET 1 LIMIT 1"
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    return int(row[0]), str(row[1])
+
+
+async def _iid_of(conn: AsyncConnection, ticker: str) -> int:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT id FROM instruments WHERE ticker = %s", (ticker,)
+        )
+        (iid,) = await cur.fetchone()
+    return int(iid)
+
+
+async def _fund_user(
+    conn: AsyncConnection, user_id: int, amount: int = 10_000_000
+) -> int:
+    account_id = (await bootstrap_user(conn, user_id)).account_id
+    await post_transfer(
+        conn,
+        from_account_id=await get_system_account_id(conn, "FAUCET"),
+        to_account_id=account_id,
+        amount=amount,
+        reason="TEST_TOPUP",
+    )
+    return account_id
+
+
+async def test_closed_venue_order_does_not_match(
+    conn: AsyncConnection,
+) -> None:
+    """R3: a marketable resting order on a closed venue stays unfilled
+    while other venues trade; it fills once its venue is passed open."""
+    from decimal import Decimal
+
+    from stockbot.orders.service import match_orders, place_order
+
+    us_mid = await _us_market_id(conn)
+    as_mid = await _add_asia_venue(conn)
+    _iid, as_ticker = await _second_stock(conn)
+    await _move_ticker_to_market(conn, as_ticker, as_mid)
+    await _fund_user(conn, 9102)
+
+    placed = await place_order(
+        conn,
+        user_id=9102,
+        ticker=as_ticker,
+        side="BUY",
+        quantity=1,
+        limit_price=Decimal("1000000"),
+    )
+    # No ticks applied yet -> every venue counts open for placement.
+    assert await match_orders(conn, 0, open_market_ids={us_mid}) == 0
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT status, filled_quantity FROM orders WHERE id = %s",
+            (placed.order_id,),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    assert str(row[0]) == "OPEN" and int(row[1]) == 0
+
+    assert await match_orders(conn, 1, open_market_ids={us_mid, as_mid}) >= 1
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT status FROM orders WHERE id = %s", (placed.order_id,)
+        )
+        (status,) = await cur.fetchone()
+    assert status == "FILLED"
+
+
+async def test_closed_venue_knockout_defers(conn: AsyncConnection) -> None:
+    """R3: a KO-eligible bounded short on a closed venue survives the
+    sweep and knocks out once its venue is open."""
+    from stockbot.shorts.service import open_bounded_short, sweep_knockouts
+
+    us_mid = await _us_market_id(conn)
+    as_mid = await _add_asia_venue(conn)
+    _iid, as_ticker = await _second_stock(conn)
+    await _move_ticker_to_market(conn, as_ticker, as_mid)
+    await _fund_user(conn, 9103)
+
+    res = await open_bounded_short(
+        conn, user_id=9103, ticker=as_ticker, quantity=1
+    )
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE bounded_shorts SET knockout_price = 0 WHERE id = %s",
+            (res.short_id,),
+        )
+
+    assert await sweep_knockouts(conn, 0, open_market_ids={us_mid}) == 0
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT status FROM bounded_shorts WHERE id = %s",
+            (res.short_id,),
+        )
+        (status,) = await cur.fetchone()
+    assert status == "OPEN"
+
+    assert (
+        await sweep_knockouts(conn, 1, open_market_ids={us_mid, as_mid}) == 1
+    )
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT status FROM bounded_shorts WHERE id = %s",
+            (res.short_id,),
+        )
+        (status,) = await cur.fetchone()
+    assert status == "KNOCKED_OUT"
+
+
+async def test_closed_venue_alert_does_not_fire(
+    conn: AsyncConnection,
+) -> None:
+    """R3: an already-crossed alert on a closed venue waits for the
+    reopen rather than firing on the frozen mark."""
+    from decimal import Decimal
+
+    from stockbot.alerts.service import create_alert, sweep_alerts
+
+    us_mid = await _us_market_id(conn)
+    as_mid = await _add_asia_venue(conn)
+    _iid, as_ticker = await _second_stock(conn)
+    await _move_ticker_to_market(conn, as_ticker, as_mid)
+    await _fund_user(conn, 9104)
+
+    alert_id = await create_alert(
+        conn,
+        user_id=9104,
+        ticker=as_ticker,
+        direction="ABOVE",
+        target=Decimal("0.0001"),
+    )
+    assert await sweep_alerts(conn, 0, open_market_ids={us_mid}) == 0
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT status FROM price_alerts WHERE id = %s", (alert_id,)
+        )
+        (status,) = await cur.fetchone()
+    assert status == "OPEN"
+
+    assert await sweep_alerts(conn, 1, open_market_ids={us_mid, as_mid}) == 1
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT status FROM price_alerts WHERE id = %s", (alert_id,)
+        )
+        (status,) = await cur.fetchone()
+    assert status == "TRIGGERED"
+
+
+async def test_closed_venue_liquidation_legs_defer(
+    conn: AsyncConnection,
+) -> None:
+    """R3: an undermargined account short on both venues gets its
+    open-venue legs executed while the closed-venue leg stays open for
+    the venue's reopen."""
+    from decimal import Decimal
+
+    from stockbot.admin.service import add_instrument
+    from stockbot.margin.service import sweep_undermargined
+
+    us_mid = await _us_market_id(conn)
+    as_mid = await _add_asia_venue(conn)
+    us_iid, us_ticker = await _first_stock(conn)
+    await add_instrument(
+        conn,
+        ticker="ASSTK",
+        name="AS Stock Corp",
+        sector_key="TECH",
+        base_price=10.0,
+    )
+    as_iid = await _iid_of(conn, "ASSTK")
+    await _move_ticker_to_market(conn, "ASSTK", as_mid)
+
+    await _fund_user(conn, 9105)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO entitlements (user_id, item_key, quantity) "
+            "VALUES (9105, 'margin_tier', 1) "
+            "ON CONFLICT (user_id, item_key) "
+            "DO UPDATE SET quantity = EXCLUDED.quantity"
+        )
+        await cur.execute(
+            "UPDATE instruments SET init_margin_pct = 0.5, "
+            "maint_margin_pct = 0.3 WHERE id IN (%s, %s)",
+            (us_iid, as_iid),
+        )
+        await cur.execute(
+            "SELECT balance FROM accounts "
+            "WHERE user_id = 9105 AND kind = 'USER'"
+        )
+        (cash,) = await cur.fetchone()
+        await cur.execute(
+            "SELECT quoted_price FROM instruments WHERE id = %s", (us_iid,)
+        )
+        (p_us,) = await cur.fetchone()
+        await cur.execute(
+            "SELECT quoted_price FROM instruments WHERE id = %s", (as_iid,)
+        )
+        (p_as,) = await cur.fetchone()
+    # Short ~1.8x equity split across the two venues.
+    qty_us = max(
+        1, int(Decimal(cash) * Decimal("0.9") / (Decimal(p_us) * 100))
+    )
+    qty_as = max(
+        1, int(Decimal(cash) * Decimal("0.9") / (Decimal(p_as) * 100))
+    )
+    await execute_trade(
+        conn, user_id=9105, ticker=us_ticker, side="SELL", quantity=qty_us
+    )
+    await execute_trade(
+        conn, user_id=9105, ticker="ASSTK", side="SELL", quantity=qty_as
+    )
+
+    # Gap both marks up 4x -> undermargined on both legs.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE instruments SET quoted_price = quoted_price * 4, "
+            "base_price = base_price * 4, impact = 0 "
+            "WHERE id IN (%s, %s)",
+            (us_iid, as_iid),
+        )
+
+    legs = await sweep_undermargined(conn, 10, open_market_ids={us_mid})
+    assert legs >= 1
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT p.quantity FROM positions p JOIN instruments i "
+            "ON i.id = p.instrument_id WHERE p.user_id = 9105 "
+            "AND i.ticker = 'ASSTK'"
+        )
+        (as_qty,) = await cur.fetchone()
+    assert int(as_qty) < 0  # closed-venue leg untouched
+
+    legs = await sweep_undermargined(
+        conn, 11, open_market_ids={us_mid, as_mid}
+    )
+    assert legs >= 1
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT COUNT(*) FROM positions p JOIN instruments i "
+            "ON i.id = p.instrument_id WHERE p.user_id = 9105 "
+            "AND i.ticker = 'ASSTK' AND p.quantity < 0"
+        )
+        (n,) = await cur.fetchone()
+    assert int(n) == 0
