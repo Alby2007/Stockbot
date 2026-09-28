@@ -38,6 +38,7 @@ import argparse
 import math
 import sys
 from dataclasses import dataclass, field
+from typing import Any
 
 import psycopg
 
@@ -64,31 +65,60 @@ class Report:
         )
 
 
-def _session_parts(cfg: dict[str, float]) -> tuple[int, int, int]:
-    return (
-        int(cfg.get("session.open_ticks", 960)),
-        int(cfg.get("session.closed_ticks", 480)),
-        int(cfg.get("session.phase_offset_ticks", 0)),
+def _load_markets(cur: psycopg.Cursor) -> list[dict[str, Any]]:
+    """Venue rows as plain dicts -- post-0053 the session shape lives on
+    `markets`, not `session.*` config."""
+    cur.execute(
+        "SELECT id, code, open_ticks, closed_ticks, offset_ticks, "
+        "auction_ticks, tick_size, overnight_var_ticks FROM markets ORDER BY id"
     )
+    cols = [d.name for d in cur.description or ()]
+    return [dict(zip(cols, r, strict=True)) for r in cur.fetchall()]
 
 
-def _gap_dt(
-    tick_index: int,
-    open_ticks: int,
-    closed_ticks: int,
-    offset: int,
-    var_frac: float = 1.0,
-) -> tuple[float, float]:
-    """(clock dt, variance dt) for the step at `tick_index` -- the reopen
-    scales stochastic terms by closed_ticks*var_frac (0033), clock terms by
-    closed_ticks. Non-gap ticks return (1.0, 1.0)."""
+def _venue_gap_dt(market: dict[str, Any], tick_index: int) -> tuple[float, float]:
+    """(clock dt, variance dt) for one venue's step at `tick_index` -- the
+    reopen scales stochastic terms by the venue's absolute overnight
+    variance horizon (`overnight_var_ticks`), clock terms by closed_ticks.
+    Non-gap ticks return (1.0, 1.0)."""
+    open_ticks = int(market["open_ticks"])
+    closed_ticks = int(market["closed_ticks"])
+    offset = int(market["offset_ticks"])
     cycle = open_ticks + closed_ticks
     if cycle <= 0:
         return 1.0, 1.0
     cycle_pos = (tick_index - offset) % cycle
     if cycle_pos == 0 and closed_ticks > 0 and tick_index > 0:
-        return float(closed_ticks), max(1.0, closed_ticks * var_frac)
+        var_ticks = market.get("overnight_var_ticks")
+        vdt = float(var_ticks) if var_ticks is not None else float(closed_ticks)
+        return float(closed_ticks), max(1.0, vdt)
     return 1.0, 1.0
+
+
+def _union_gap_dt(markets: list[dict[str, Any]], tick_index: int) -> tuple[float, float]:
+    """(clock dt, variance dt) for the shared factor draw at `tick_index`:
+    the largest gap across venues reopening this tick, else (1.0, 1.0).
+    Per-instrument steps rescale the shared draw by sqrt(their own var_dt
+    / the draw's var_dt), so this only sets the recorded draw scale."""
+    dt, vdt = 1.0, 1.0
+    for m in markets:
+        mdt, mvdt = _venue_gap_dt(m, tick_index)
+        if mvdt > vdt:
+            dt, vdt = mdt, mvdt
+    return dt, vdt
+
+
+def _any_venue_open(markets: list[dict[str, Any]], tick_index: int) -> bool:
+    return any(
+        engine.session_phase(
+            tick_index,
+            int(m["open_ticks"]),
+            int(m["closed_ticks"]),
+            int(m["offset_ticks"]),
+        )
+        == "OPEN"
+        for m in markets
+    )
 
 
 def replay_factors(
@@ -106,10 +136,7 @@ def replay_factors(
     )
     rows = cur.fetchall()
 
-    cur.execute("SELECT key, value FROM config WHERE key LIKE 'session.%'")
-    session_cfg = {k: float(v) for k, v in cur.fetchall()}
-    open_ticks, closed_ticks, offset = _session_parts(session_cfg)
-    var_frac = float(session_cfg.get("session.overnight_var_frac", 1.0))
+    markets = _load_markets(cur)
 
     cur.execute(
         "SELECT DISTINCT s.key FROM instruments i "
@@ -121,22 +148,21 @@ def replay_factors(
     sector_keys = sorted(row[0] for row in cur.fetchall())
 
     for tick_index, stored_mf, stored_sf, phase in rows:
-        # Cross-check the recorded phase: a wrong stored session_state is
+        # Cross-check the recorded phase: post-0053 the market_ticks row is
+        # an "any venue open" summary -- a wrong stored session_state is
         # itself a bug (a CLOSED row would silently skip factor replay).
-        expected_phase = engine.session_phase(
-            tick_index, open_ticks, closed_ticks, offset
-        )
+        expected_phase = "OPEN" if _any_venue_open(markets, tick_index) else "CLOSED"
         if phase != expected_phase:
             report.factor_mismatches.append(
                 f"tick {tick_index}: session_state stored={phase} "
-                f"expected={expected_phase} (current session config)"
+                f"expected={expected_phase} (any-venue-open summary)"
             )
         if phase == "CLOSED":
             report.ticks_skipped_closed += 1
             continue
         report.ticks_checked += 1
         rng = engine.rng_for_tick(master_seed, tick_index)
-        dt, vdt = _gap_dt(tick_index, open_ticks, closed_ticks, offset, var_frac)
+        dt, vdt = _union_gap_dt(markets, tick_index)
         expected_mf = engine.draw_market_factor(rng, dt=dt, var_dt=vdt)
         expected_sf = engine.draw_sector_factors(
             rng, sector_keys, dt=dt, var_dt=vdt
@@ -185,10 +211,9 @@ def check_candles(
     cur.execute(
         """
         SELECT i.ticker, c.tick_index, c.open, c.high, c.low, c.close, c.volume,
-               t.session_state
+               c.session_state
         FROM candles c
         JOIN instruments i ON i.id = c.instrument_id
-        JOIN market_ticks t ON t.tick_index = c.tick_index
         WHERE c.tick_index BETWEEN %s AND %s
         """,
         (tick_from, tick_to),
@@ -222,28 +247,26 @@ def check_vol_state(
     first stored candle per instrument in the range self-seeds the EWMA,
     so transitions are verified, not absolute levels.
     """
-    cur.execute(
-        "SELECT key, value FROM config WHERE key LIKE 'vol.%' OR key LIKE 'session.%'"
-    )
+    cur.execute("SELECT key, value FROM config WHERE key LIKE 'vol.%'")
     cfg = {str(k): float(v) for k, v in cur.fetchall()}
     rho = cfg.get("vol.rho", 0.94)
-    open_ticks, closed_ticks, offset = _session_parts(cfg)
-    var_frac = float(cfg.get("session.overnight_var_frac", 1.0))
+    markets = _load_markets(cur)
+    markets_by_id = {int(m["id"]): m for m in markets}
 
     cur.execute(
         """
         SELECT c.instrument_id, c.tick_index, c.open, c.close,
-               c.vol_state, c.flow_ret, c.model_ret, i.sigma, t.session_state
+               c.vol_state, c.flow_ret, c.model_ret, i.sigma, c.session_state,
+               i.market_id
         FROM candles c
         JOIN instruments i ON i.id = c.instrument_id
-        JOIN market_ticks t ON t.tick_index = c.tick_index
         WHERE c.tick_index BETWEEN %s AND %s
         ORDER BY c.instrument_id, c.tick_index
         """,
         (tick_from, tick_to),
     )
     v_prev: dict[int, float] = {}
-    for iid, tick, o, c, vs, fr, mr, sigma, phase in cur.fetchall():
+    for iid, tick, o, c, vs, fr, mr, sigma, phase, market_id in cur.fetchall():
         if vs is None:
             continue  # pre-0022 candle: nothing stored to verify
         iid = int(iid)
@@ -257,7 +280,10 @@ def check_vol_state(
                 )
             v_prev[iid] = stored
             continue
-        _dt, vdt = _gap_dt(int(tick), open_ticks, closed_ticks, offset, var_frac)
+        market = markets_by_id.get(int(market_id))
+        _dt, vdt = (
+            _venue_gap_dt(market, int(tick)) if market is not None else (1.0, 1.0)
+        )
         # model_ret is the pre-fill step return; the candle close already
         # contains this tick's fills, so ln(close/open) would double-count
         # flow. Fall back to it only for rows predating the column.
@@ -298,7 +324,7 @@ def check_vol_state(
                 )
             v_mkt = stored
             continue
-        _dt, vdt = _gap_dt(int(tick), open_ticks, closed_ticks, offset, var_frac)
+        _dt, vdt = _union_gap_dt(markets, int(tick))
         numerator = abs(float(mf)) / (
             engine.MARKET_SIGMA * math.sqrt(vdt) * engine.SQRT_2_OVER_PI
         )

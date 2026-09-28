@@ -41,8 +41,8 @@ from stockbot.market import engine
 from stockbot.market.data import (
     flow_config,
     half_spread_for,
+    instrument_session_cfg,
     record_flow,
-    session_config,
     spread_config,
 )
 
@@ -302,6 +302,7 @@ async def _liquidate_leg(
     from stockbot.trading.service import FEE_BPS, update_candle_with_fill
 
     instrument_id = int(position["instrument_id"])
+    venue_cfg = await instrument_session_cfg(conn, instrument_id)
     qty = int(position["quantity"])
     base_price = float(position["base_price"])
     signed = base_price * close_qty * (1 if qty < 0 else -1)
@@ -311,7 +312,7 @@ async def _liquidate_leg(
     # for user-initiated fills (execute_trade, shorts), not the safety net.
     spread_cfg = {
         **await spread_config(conn),
-        **await session_config(conn),
+        **venue_cfg,
         **await flow_config(conn),
     }
     half_spread = half_spread_for(position, tick_index, spread_cfg)

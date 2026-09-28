@@ -84,12 +84,13 @@ class FeatureDisabledError(TradingError):
 
 
 class MarketClosedError(TradingError):
-    """Trading while the market is in its closed session."""
+    """Trading while the instrument's venue is in its closed session."""
 
-    def __init__(self, ticks_until_open: int):
+    def __init__(self, ticks_until_open: int, venue: str | None = None):
         self.ticks_until_open = ticks_until_open
+        label = f"the {venue} market" if venue else "the market"
         super().__init__(
-            f"the market is closed -- it reopens in ~{ticks_until_open} min"
+            f"{label} is closed -- it reopens in ~{ticks_until_open} min"
         )
 
 

@@ -61,7 +61,16 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             assert next_tick_row is not None
             tick_index: int = next_tick_row[0]
 
-        session_cfg = await data.session_config(conn)
+        # R1 tenancy: the tick phase is still global -- it reads the
+        # single seeded market's session shape via market_cfg (identical
+        # to the old session_config values). R2 partitions instruments
+        # by their own venue's phase and this branch disappears.
+        market = await data.default_market(conn)
+        session_cfg = (
+            data.market_cfg(market, await data.session_config(conn))
+            if market
+            else await data.session_config(conn)
+        )
         open_ticks, closed_ticks, offset = data.session_parts(session_cfg)
         phase = engine.session_phase(tick_index, open_ticks, closed_ticks, offset)
 
@@ -87,9 +96,11 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                     """
                     INSERT INTO candles
                         (instrument_id, tick_index, open, high, low, close,
-                         volume, vol_state, flow_ret, model_ret, halt_kind)
+                         volume, vol_state, flow_ret, model_ret, halt_kind,
+                         session_state)
                     SELECT id, %s, quoted_price, quoted_price, quoted_price,
-                           quoted_price, 0, vol_state, NULL, NULL, NULL
+                           quoted_price, 0, vol_state, NULL, NULL, NULL,
+                           'CLOSED'
                     FROM instruments WHERE is_active
                     ORDER BY id
                     """,
@@ -170,7 +181,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                        i.kappa, i.fundamental_sigma, i.tau_ticks, i.base_price,
                        i.fundamental_value, i.impact, i.circuit_halted_until_tick,
                        i.float_shares, i.index_divisor, i.dividend_drift_offset,
-                       i.index_member,
+                       i.index_member, i.market_id,
                        i.vol_state, i.sigma_eff, i.drift_state, i.flow_skew
                 FROM instruments i
                 JOIN sectors s ON s.id = i.sector_id
@@ -577,7 +588,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
 
             if results:
                 candle_rows = sql.SQL(", ").join(
-                    sql.SQL("({}, 0, {})").format(
+                    sql.SQL("({}, 0, {}, 'OPEN')").format(
                         sql.SQL(", ").join(sql.Placeholder() for _ in range(6)),
                         sql.SQL(", ").join(sql.Placeholder() for _ in range(4)),
                     )
@@ -588,7 +599,8 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                         """
                         INSERT INTO candles
                             (instrument_id, tick_index, open, high, low, close,
-                             volume, vol_state, flow_ret, model_ret, halt_kind)
+                             volume, vol_state, flow_ret, model_ret, halt_kind,
+                             session_state)
                         VALUES {}
                         """
                     ).format(candle_rows),

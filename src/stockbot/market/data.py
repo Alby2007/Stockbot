@@ -37,6 +37,9 @@ class InstrumentSnapshot:
     adv: Decimal = Decimal(0)
     float_shares: int = 0
     shortable_after_tick: int | None = None  # borrow lockout (IPO listings)
+    market_id: int = 0
+    market_code: str = ""
+    market_name: str = ""
 
     @property
     def day_change_pct(self) -> float | None:
@@ -65,11 +68,12 @@ async def _fetch_snapshots(
     """
     current_tick = await current_tick_index(conn)
     day_ago_tick = max((current_tick or 0) - TICKS_PER_DAY, 0)
-    spread_cfg = {
+    base_cfg = {
         **await spread_config(conn),
         **await session_config(conn),
         **await flow_config(conn),
     }
+    venues = await markets_map(conn)
 
     async with conn.cursor() as cur:
         await cur.execute(
@@ -80,7 +84,7 @@ async def _fetch_snapshots(
                    COALESCE(i.sigma_eff, i.sigma) AS sigma, i.liquidity,
                    i.next_event_tick, i.last_halt_end_tick, i.flow_skew,
                    i.next_halting_event_tick,
-                   i.adv, i.float_shares, i.shortable_after_tick
+                   i.adv, i.float_shares, i.shortable_after_tick, i.market_id
             FROM instruments i
             JOIN sectors s ON s.id = i.sector_id
             LEFT JOIN LATERAL (
@@ -102,9 +106,17 @@ async def _fetch_snapshots(
 
     halt_lead = await event_halt_lead_ticks(conn)
     snapshots: list[InstrumentSnapshot] = []
+    venue_cfgs: dict[int, dict[str, float]] = {}
     for r in rows:
-        # Bid/ask on the tick grid, outward-rounded so the display is the
-        # worst case a market fill can land at (G1/G3).
+        mid = int(r[20])
+        # Per-venue session shape + tick grid (R1: one venue -> the same
+        # dict every row; cached so multi-venue costs one merge each).
+        spread_cfg = venue_cfgs.get(mid)
+        if spread_cfg is None:
+            spread_cfg = market_cfg(venues[mid], base_cfg)
+            venue_cfgs[mid] = spread_cfg
+        # Bid/ask on the venue's tick grid, outward-rounded so the display
+        # is the worst case a market fill can land at (G1/G3).
         mark = float(r[5])
         row = {
             "sigma": float(r[11]),
@@ -118,6 +130,7 @@ async def _fetch_snapshots(
         half_ask = half * engine.flow_skew_mult(mark, skew, spread_cfg)
         tick = engine.tick_size(mark, spread_cfg)
         bid_f, ask_f = engine.quote_ticks_skewed(mark, half_bid, half_ask, tick)
+        venue = venues[mid]
         snapshots.append(
             InstrumentSnapshot(
                 id=r[0],
@@ -137,6 +150,9 @@ async def _fetch_snapshots(
                 adv=r[17],
                 float_shares=int(r[18]),
                 shortable_after_tick=r[19],
+                market_id=mid,
+                market_code=str(venue["code"]),
+                market_name=str(venue["name"]),
             )
         )
     return snapshots
@@ -278,7 +294,12 @@ async def flow_config(conn: AsyncConnection) -> dict[str, float]:
 
 async def session_config(conn: AsyncConnection) -> dict[str, float]:
     """The `session.*` config namespace (open/closed ticks, phase offset,
-    open impact reset), read fresh like `spread_config`."""
+    open impact reset), read fresh like `spread_config`.
+
+    Legacy global read: with multiple venues these keys only survive as
+    FALLBACKS -- per-venue values live on the `markets` row and come
+    through `market_cfg`. New code should resolve the instrument's venue
+    (`market_for_instrument`) instead of reading this directly."""
     async with conn.cursor() as cur:
         await cur.execute("SELECT key, value FROM config WHERE key LIKE 'session.%'")
         return {str(k): float(v) for k, v in await cur.fetchall()}
@@ -300,15 +321,110 @@ def session_open_fraction(cfg: dict[str, float]) -> float:
     return open_ticks / max(open_ticks + closed_ticks, 1)
 
 
-async def current_session(conn: AsyncConnection) -> tuple[str, int | None, dict[str, float]]:
-    """('OPEN'|'CLOSED', last applied tick, session cfg). No ticks applied
-    yet counts as OPEN so bootstrap/trading-before-first-tick still works."""
-    cfg = await session_config(conn)
+async def markets_map(conn: AsyncConnection) -> dict[int, dict[str, Any]]:
+    """Every venue row keyed by id. Tiny table -- callers that need many
+    lookups should hold the map rather than query per instrument."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute("SELECT * FROM markets ORDER BY id")
+        return {int(r["id"]): dict(r) for r in await cur.fetchall()}
+
+
+async def market_for_instrument(
+    conn: AsyncConnection, instrument_id: int
+) -> dict[str, Any] | None:
+    """The venue row an instrument lists on (None for a missing id --
+    callers raise UnknownInstrumentError themselves)."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT m.* FROM instruments i
+            JOIN markets m ON m.id = i.market_id
+            WHERE i.id = %s
+            """,
+            (instrument_id,),
+        )
+        row = await cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+async def default_market(conn: AsyncConnection) -> dict[str, Any] | None:
+    """The first venue by id -- 'the market' while only one exists."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute("SELECT * FROM markets ORDER BY id LIMIT 1")
+        row = await cur.fetchone()
+    return dict(row) if row is not None else None
+
+
+def market_cfg(
+    market: dict[str, Any], global_cfg: dict[str, float] | None = None
+) -> dict[str, float]:
+    """A `session.*`-shaped cfg dict for one venue, layered over the
+    global config (which supplies non-venue keys like open_impact_reset).
+    `session_parts`/`session_open_fraction`/`engine.session_phase` read
+    it unchanged. `session.overnight_var_ticks` is the venue's absolute
+    stochastic-gap horizon (NULL falls back to closed_ticks * the global
+    frac); `spread.tick_min` is overridden by the venue's grid."""
+    cfg = dict(global_cfg or {})
+    cfg["session.open_ticks"] = float(market["open_ticks"])
+    cfg["session.closed_ticks"] = float(market["closed_ticks"])
+    cfg["session.phase_offset_ticks"] = float(market["offset_ticks"])
+    cfg["session.auction_ticks"] = float(market["auction_ticks"])
+    if market.get("overnight_var_ticks") is not None:
+        # The market row stores the absolute gap horizon in ticks; the
+        # config consumers (tick gap step, options variance accrual) read
+        # the per-tick frac, so derive it back. Holding the TICKS constant
+        # as closed_ticks grows is what keeps reopen sigma calibrated.
+        closed = float(market["closed_ticks"])
+        cfg["session.overnight_var_frac"] = (
+            float(market["overnight_var_ticks"]) / closed if closed > 0 else 1.0
+        )
+    if market.get("tick_size") is not None:
+        cfg["spread.tick_min"] = float(market["tick_size"])
+    return cfg
+
+
+def market_phase(market: dict[str, Any], tick_index: int) -> str:
+    """'OPEN'|'CLOSED' for a tick on this venue's own clock."""
+    return engine.session_phase(
+        tick_index,
+        int(market["open_ticks"]),
+        int(market["closed_ticks"]),
+        int(market["offset_ticks"]),
+    )
+
+
+async def instrument_session_cfg(
+    conn: AsyncConnection, instrument_id: int
+) -> dict[str, float]:
+    """The `session.*`-shaped cfg for one instrument's venue, layered on
+    the global fallbacks. Instrument-scoped quote/fill paths merge this
+    where they used to merge the global `session_config`."""
+    market = await market_for_instrument(conn, instrument_id)
+    global_cfg = await session_config(conn)
+    return market_cfg(market, global_cfg) if market is not None else global_cfg
+
+
+async def current_session(
+    conn: AsyncConnection, market_id: int | None = None
+) -> tuple[str, int | None, dict[str, float]]:
+    """('OPEN'|'CLOSED', last applied tick, venue cfg) for one market.
+    `market_id=None` resolves the first venue -- 'the market' while only
+    one exists. No ticks applied yet counts as OPEN so bootstrap/trading-
+    before-first-tick still works."""
+    if market_id is None:
+        row0 = await default_market(conn)
+    else:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("SELECT * FROM markets WHERE id = %s", (market_id,))
+            row0 = await cur.fetchone()
+    if row0 is None:
+        raise ValueError(f"unknown market id {market_id}")
+    row = row0
+    cfg = market_cfg(dict(row), await session_config(conn))
     tick = await current_tick_index(conn)
     if tick is None:
         return "OPEN", None, cfg
-    open_ticks, closed_ticks, offset = session_parts(cfg)
-    return engine.session_phase(tick, open_ticks, closed_ticks, offset), tick, cfg
+    return market_phase(dict(row), tick), tick, cfg
 
 
 async def feature_enabled_flag(conn: AsyncConnection, key: str) -> bool:
@@ -327,21 +443,32 @@ async def assert_feature_enabled(conn: AsyncConnection, key: str, label: str) ->
         raise FeatureDisabledError(label)
 
 
-async def assert_market_open(conn: AsyncConnection) -> None:
-    """Raise MarketClosedError when the last applied tick is a closed tick.
+async def assert_market_open(conn: AsyncConnection, instrument_id: int) -> None:
+    """Raise MarketClosedError when the last applied tick is a closed tick
+    on the instrument's own venue.
 
     The session of "now" is the phase of the most recent committed tick:
     a trade between tick T and T+1 executes against tick-T marks, so it
-    belongs to T's session."""
+    belongs to T's session on that venue's clock."""
     # Lazy: trading.errors -> trading/__init__ -> trading.service imports
     # this module back, so a top-level import here would be circular.
     from stockbot.trading.errors import MarketClosedError
 
-    phase, tick, cfg = await current_session(conn)
-    if phase == "CLOSED" and tick is not None:
-        open_ticks, closed_ticks, offset = session_parts(cfg)
+    market = await market_for_instrument(conn, instrument_id)
+    if market is None:
+        return  # caller raises UnknownInstrumentError
+    tick = await current_tick_index(conn)
+    if tick is None:
+        return
+    if market_phase(market, tick) == "CLOSED":
         raise MarketClosedError(
-            engine.ticks_until_open(tick, open_ticks, closed_ticks, offset)
+            engine.ticks_until_open(
+                tick,
+                int(market["open_ticks"]),
+                int(market["closed_ticks"]),
+                int(market["offset_ticks"]),
+            ),
+            venue=market["name"],
         )
 
 
@@ -417,9 +544,14 @@ async def book_depth(
     the honest claim is "the MM absorbs ~cap per tick", nothing more.
     """
     current_tick = await current_tick_index(conn)
+    market = await market_for_instrument(conn, instrument_id)
     cfg = {
         **await spread_config(conn),
-        **await session_config(conn),
+        **(
+            market_cfg(market, await session_config(conn))
+            if market is not None
+            else await session_config(conn)
+        ),
         **await flow_config(conn),
     }
     async with conn.cursor(row_factory=dict_row) as cur:

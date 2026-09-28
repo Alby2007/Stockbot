@@ -97,10 +97,14 @@ def parse_cid(
         return None
 
 
-async def _last_open_tick(conn: AsyncConnection) -> int | None:
+async def _last_open_tick(conn: AsyncConnection, instrument_id: int) -> int | None:
+    """Last open tick *on this instrument's venue* -- per-instrument so a
+    chart never anchors on a tick where its own venue was closed."""
     async with conn.cursor() as cur:
         await cur.execute(
-            "SELECT MAX(tick_index) FROM market_ticks WHERE session_state = 'OPEN'"
+            "SELECT MAX(tick_index) FROM candles "
+            "WHERE instrument_id = %s AND session_state = 'OPEN'",
+            (instrument_id,),
         )
         row = await cur.fetchone()
     return int(row[0]) if row and row[0] is not None else None
@@ -115,9 +119,8 @@ async def _open_tick_offset(
         await cur.execute(
             """
             SELECT c.tick_index FROM candles c
-            LEFT JOIN market_ticks mt ON mt.tick_index = c.tick_index
             WHERE c.instrument_id = %s AND c.tick_index <= %s
-              AND COALESCE(mt.session_state, 'OPEN') = 'OPEN'
+              AND c.session_state = 'OPEN'
             ORDER BY c.tick_index DESC OFFSET %s LIMIT 1
             """,
             (instrument_id, end, offset),
@@ -131,9 +134,8 @@ async def _earliest_open_tick(conn: AsyncConnection, instrument_id: int) -> int 
         await cur.execute(
             """
             SELECT c.tick_index FROM candles c
-            LEFT JOIN market_ticks mt ON mt.tick_index = c.tick_index
             WHERE c.instrument_id = %s
-              AND COALESCE(mt.session_state, 'OPEN') = 'OPEN'
+              AND c.session_state = 'OPEN'
             ORDER BY c.tick_index LIMIT 1
             """,
             (instrument_id,),
@@ -151,10 +153,9 @@ async def _distance_from_last_open(
         await cur.execute(
             """
             SELECT COUNT(*) FROM candles c
-            LEFT JOIN market_ticks mt ON mt.tick_index = c.tick_index
             WHERE c.instrument_id = %s
               AND c.tick_index > %s AND c.tick_index <= %s
-              AND COALESCE(mt.session_state, 'OPEN') = 'OPEN'
+              AND c.session_state = 'OPEN'
             """,
             (instrument_id, end, last_open),
         )
@@ -209,7 +210,7 @@ async def next_window(
     """Resolve a button action to the new (end, span). All movement is in
     open-candle units so session boundaries fall out of the open-only
     filter -- a pan across a close just skips it."""
-    last_open = await _last_open_tick(conn)
+    last_open = await _last_open_tick(conn, iid)
     anchor = last_open if last_open is not None else end
     if action == "panl":
         new_end = await _open_tick_offset(conn, iid, end, max(1, span // 2))

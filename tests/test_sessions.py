@@ -26,13 +26,11 @@ SEED = "sessions-test-seed"
 
 
 async def _set_session(conn: AsyncConnection, open_t: int, closed_t: int) -> None:
+    """Session shape lives on the markets row post-0053 (per-venue)."""
     async with conn.cursor() as cur:
         await cur.execute(
-            "UPDATE config SET value = %s WHERE key = 'session.open_ticks'", (open_t,)
-        )
-        await cur.execute(
-            "UPDATE config SET value = %s WHERE key = 'session.closed_ticks'",
-            (closed_t,),
+            "UPDATE markets SET open_ticks = %s, closed_ticks = %s",
+            (open_t, closed_t),
         )
 
 
@@ -357,7 +355,7 @@ async def test_closing_auction_clears_uniform_and_skips_mm(
     # the other open ticks (the scenario asserts the MM fallback resumes).
     async with conn.cursor() as cur:
         await cur.execute(
-            "UPDATE config SET value = 1 WHERE key = 'session.auction_ticks'"
+            "UPDATE markets SET auction_ticks = 1"
         )
     await _run_to_phase(conn, "OPEN")
     # Determinism: clear any pending-earnings halt flag the seed draws.
@@ -467,7 +465,7 @@ async def test_closing_auction_window_spans_n_ticks(
     await _set_session(conn, 4, 2)
     async with conn.cursor() as cur:
         await cur.execute(
-            "UPDATE config SET value = 2 WHERE key = 'session.auction_ticks'"
+            "UPDATE markets SET auction_ticks = 2"
         )
         await cur.execute(
             "UPDATE instruments SET next_halting_event_tick = NULL "
@@ -667,7 +665,7 @@ async def test_auction_tick_keeps_event_halt_risk_reducing_path(
     await _set_session(conn, 4, 2)
     async with conn.cursor() as cur:
         await cur.execute(
-            "UPDATE config SET value = 1 WHERE key = 'session.auction_ticks'"
+            "UPDATE markets SET auction_ticks = 1"
         )
     await _run_to_phase(conn, "OPEN")
 
@@ -780,9 +778,7 @@ async def test_overnight_gap_scales_variance_not_clock(
     await _set_session(conn, 2, 40)
     async with conn.cursor() as cur:
         await cur.execute(
-            "UPDATE config SET value = %s "
-            "WHERE key = 'session.overnight_var_frac'",
-            (0.125,),
+            "UPDATE markets SET overnight_var_ticks = 5"
         )
 
     # Ticks 0-1 open, 2-41 closed, 42 reopens. Stop one tick before it.

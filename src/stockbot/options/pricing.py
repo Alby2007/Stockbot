@@ -17,11 +17,18 @@ against that table so the bug can't silently return.
 the long-run `sigma` with persistence `vol.rho` -- pricing a 30d
 contract off today's regime value would misprice it across regimes, so
 the OU term uses the EWMA's time-mean over the horizon:
-mean sigma = sigma + (sigma_eff - sigma) * (1 - rho^T) / (T(1 - rho)).
+mean sigma = sigma + (sigma_eff - sigma) * (1 - rho^N) / (N(1 - rho)),
+where N counts STEP CALLS in the horizon = open ticks (the EWMA updates
+once per step; closed ticks never step).
 
-`ticks_left` is CALENDAR ticks, not open ticks -- the session gap tick
-steps with dt=closed_ticks, so total variance per cycle is preserved.
-Chart windows count open ticks, which is a display choice only.
+Three clocks, post-0033: stochastic accrual runs on EFFECTIVE ticks
+(each open tick = 1 unit, each closed tick = `session.overnight_var_frac`
+-- the gap tick steps once with var_dt = closed*frac, so a closed
+stretch realizes frac of its nominal variance), OU/mean-reversion decay
+runs on CALENDAR ticks (the gap step reverts with full dt=closed_ticks),
+and the vol EWMA runs on open ticks. Callers pass all three via
+`var_ticks`/`open_ticks` from `session_variance_ticks`; the one-argument
+form treats every tick as open (session-less market).
 """
 
 from __future__ import annotations
@@ -31,6 +38,57 @@ from dataclasses import dataclass
 
 CALL = "CALL"
 PUT = "PUT"
+
+
+def session_variance_ticks(
+    now_tick: int, ticks_left: int, session_cfg: dict[str, float]
+) -> tuple[float, float, float]:
+    """(accrual, calendar, open) tick counts over the horizon.
+
+    Stochastic variance accrues at 1 unit per open tick and
+    `session.overnight_var_frac` per closed tick (the whole closed
+    stretch lands on the reopen's gap step with var_dt = closed*frac).
+    The horizon is ticks (now_tick, now_tick + ticks_left]: the expiry
+    tick's own step has run before settlement reads its mark. With
+    sessions disabled (closed_ticks = 0) every tick accrues 1 --
+    identical to the pre-session model.
+    """
+    t = max(int(ticks_left), 0)
+    open_t = int(session_cfg.get("session.open_ticks", 0))
+    closed_t = int(session_cfg.get("session.closed_ticks", 0))
+    span = open_t + closed_t
+    if t == 0 or span <= 0 or closed_t == 0:
+        return float(t), float(t), float(t)
+    frac = float(session_cfg.get("session.overnight_var_frac", 1.0))
+    offset = int(session_cfg.get("session.phase_offset_ticks", 0))
+
+    # Open ticks i in [0, x]: pos(i) = (i - offset) % span < open_t. For
+    # i >= offset the j = i - offset range is non-negative and counts
+    # straightforwardly. For i < offset (phase_offset > 0 lands tick 0
+    # mid-cycle) j wraps negative; m = -j is open iff m % span > span -
+    # open_t or m % span == 0 -- again open_t residues per cycle.
+    def opens_upto(x: int) -> int:
+        if x < 0:
+            return 0
+
+        def neg_open(m_max: int) -> int:
+            """m in [1, m_max] with (-m) % span < open_t."""
+            q, rem = divmod(max(m_max, 0), span)
+            return q * open_t + max(0, rem + open_t - span)
+
+        n = 0
+        hi = x - offset
+        if hi >= 0:
+            n += (hi // span) * open_t + min(hi % span + 1, open_t)
+        pre = min(x, offset - 1)  # i in [0, pre] sits left of the offset
+        if pre >= 0:
+            # m = offset - i runs from offset - pre through offset.
+            n += neg_open(offset) - neg_open(offset - pre - 1)
+        return n
+
+    n_open = opens_upto(now_tick + t) - opens_upto(now_tick)
+    n_closed = t - n_open
+    return n_open + frac * n_closed, float(t), float(n_open)
 
 
 @dataclass(frozen=True)
@@ -47,23 +105,40 @@ def total_variance(
     fundamental_sigma: float,
     ticks_left: float,
     vol_cfg: VolBlend,
+    *,
+    var_ticks: float | None = None,
+    open_ticks: float | None = None,
 ) -> float:
-    """Var[log P_T] over `ticks_left` ticks under the price model."""
+    """Var[log P_T] over `ticks_left` CALENDAR ticks under the price model.
+
+    `var_ticks` is the stochastic-accrual horizon (closed ticks count at
+    `overnight_var_frac`, post-0033) and `open_ticks` the vol-EWMA window
+    (one update per step call = per open tick). Both default to
+    `ticks_left` -- the session-less market.
+    """
     t = max(float(ticks_left), 0.0)
-    if t == 0.0:
+    var_t = t if var_ticks is None else max(float(var_ticks), 0.0)
+    blend_t = var_t if open_ticks is None else max(float(open_ticks), 0.0)
+    if t == 0.0 or var_t == 0.0:
         return 0.0
-    if 0.0 <= vol_cfg.rho < 1.0:
+    if 0.0 <= vol_cfg.rho < 1.0 and blend_t > 0.0:
         mean_sigma = vol_cfg.sigma + (sigma_eff - vol_cfg.sigma) * (
-            (1.0 - vol_cfg.rho**t) / (t * (1.0 - vol_cfg.rho))
+            (1.0 - vol_cfg.rho**blend_t) / (blend_t * (1.0 - vol_cfg.rho))
         )
     else:
         mean_sigma = sigma_eff
+    # The OU deviation accrues innovation only on step calls (var_t/t of
+    # calendar rate on average) but mean-reverts in calendar time.
+    accrual = var_t / t
     ou_var: float = (
-        mean_sigma**2 / (2.0 * kappa) * (-math.expm1(-2.0 * kappa * t))
+        accrual
+        * mean_sigma**2
+        / (2.0 * kappa)
+        * (-math.expm1(-2.0 * kappa * t))
         if kappa > 0.0
-        else mean_sigma**2 * t
+        else mean_sigma**2 * var_t
     )
-    return float(fundamental_sigma**2 * t + ou_var)
+    return float(fundamental_sigma**2 * var_t + ou_var)
 
 
 def _norm_cdf(x: float) -> float:

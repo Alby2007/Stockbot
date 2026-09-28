@@ -177,9 +177,10 @@ async def test_expiry_on_closed_tick_settles_at_pre_gap_mark(
     """C5: an option expiring overnight settles on the CLOSED tick at the
     last open mark -- not after the overnight gap."""
     async with conn.cursor() as cur:
-        await cur.execute("UPDATE config SET value = 2 WHERE key = 'session.open_ticks'")
-        await cur.execute("UPDATE config SET value = 3 WHERE key = 'session.closed_ticks'")
-        await cur.execute("UPDATE config SET value = 0 WHERE key = 'session.phase_offset_ticks'")
+        # Venue session shape lives on the markets row post-0053.
+        await cur.execute(
+            "UPDATE markets SET open_ticks = 2, closed_ticks = 3, offset_ticks = 0"
+        )
     await apply_tick(conn, SEED)  # tick 0: OPEN (open window is ticks 0-1)
     bought = await _buy(conn, 8006, strike=Decimal("60"))
     spot_at_close = await _mark(conn)
@@ -319,3 +320,182 @@ async def test_settle_is_replay_safe(conn: AsyncConnection) -> None:
     bal = await get_balance(conn, main)
     assert await settle_expired_options(conn, 3) == 0
     assert await get_balance(conn, main) == bal
+
+
+async def test_quote_returns_unfloored_premium(conn: AsyncConnection) -> None:
+    """The quote must name the REAL computed premium -- flooring it at
+    min_premium would quote a price buy_option then refuses to fill."""
+    from stockbot.options.service import quote_option_premium
+
+    await bootstrap_user(conn, 8017)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = 50 WHERE key = 'options.min_premium_minor'"
+        )
+    # Deep OTM: model premium is a fraction of a minor unit.
+    quote = await quote_option_premium(conn, "NORT", "CALL", Decimal("290"), 7)
+    assert 0 <= quote < 50  # unfloored -- pre-fix this came back as 50
+    with pytest.raises(ValueError, match="per-share minimum"):
+        await buy_option(
+            conn,
+            user_id=8017,
+            ticker="NORT",
+            side="CALL",
+            strike=Decimal("290"),
+            expiry_days=7,
+            quantity=1,
+        )
+
+
+async def test_opened_tick_set_before_first_market_tick(
+    conn: AsyncConnection,
+) -> None:
+    """A buy before the market has ever ticked still records
+    opened_tick=0 -- NULL broke expiry-age displays and backfills."""
+    bought = await _buy(conn, 8018)
+    rows = await list_open_options(conn, 8018)
+    assert len(rows) == 1
+    assert rows[0]["opened_tick"] == 0
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT opened_tick FROM option_positions WHERE id = %s",
+            (bought.option_id,),
+        )
+        assert (await cur.fetchone())[0] == 0
+
+
+async def test_sell_settlement_rounds_per_share(conn: AsyncConnection) -> None:
+    """settlement_minor records the per-share proceeds rounded, not
+    floored -- the stored value must match the paid amount / qty."""
+    from decimal import ROUND_HALF_UP
+
+    bought = await _buy(conn, 8019, quantity=3)
+    sold = await sell_option(conn, user_id=8019, option_id=bought.option_id)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT settlement_minor FROM option_positions WHERE id = %s",
+            (bought.option_id,),
+        )
+        per_share = int((await cur.fetchone())[0])
+    assert per_share == int(
+        (Decimal(sold.payout_minor) / 3).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+    )
+
+
+async def test_league_options_count_toward_trades(conn: AsyncConnection) -> None:
+    """MIN_TRADES scoring counts option opens AND sells -- a pure-options
+    league player must be able to qualify."""
+    from stockbot.seasons.service import create_season, join_season, on_tick
+
+    sid = await create_season(
+        conn,
+        name="optleague",
+        start_tick=0,
+        end_tick=10_000,
+        entry_fee_minor=0,
+        stake_minor=50_000,
+    )
+    await on_tick(conn, 0)  # activate: SCHEDULED -> ACTIVE
+    await bootstrap_user(conn, 8020)
+    await join_season(conn, 8020, sid)
+    bought = await _buy(conn, 8020, season_id=sid)
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT trades_count FROM season_entries "
+            "WHERE season_id = %s AND user_id = %s",
+            (sid, 8020),
+        )
+        assert (await cur.fetchone())[0] == 1
+
+    await sell_option(conn, user_id=8020, option_id=bought.option_id)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT trades_count FROM season_entries "
+            "WHERE season_id = %s AND user_id = %s",
+            (sid, 8020),
+        )
+        assert (await cur.fetchone())[0] == 2
+
+
+async def test_season_close_settles_options_before_sweep(
+    conn: AsyncConnection,
+) -> None:
+    """Options still open at close settle at intrinsic BEFORE the league
+    balance sweeps to SINK -- otherwise the payout lands post-sweep in a
+    dead account and strands there forever."""
+    from stockbot.seasons.service import (
+        close_season,
+        create_season,
+        join_season,
+        on_tick,
+    )
+
+    sid = await create_season(
+        conn,
+        name="optsweep",
+        start_tick=0,
+        end_tick=10_000,
+        entry_fee_minor=0,
+        stake_minor=50_000,
+    )
+    await on_tick(conn, 0)
+    await bootstrap_user(conn, 8021)
+    await join_season(conn, 8021, sid)
+    bought = await _buy(conn, 8021, strike=Decimal("60"), season_id=sid)
+    await _set_mark(conn, 75.0)  # ITM -> $15/share intrinsic
+
+    await close_season(conn, sid)
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT status, settlement_minor FROM option_positions WHERE id = %s",
+            (bought.option_id,),
+        )
+        assert (await cur.fetchone()) == ("SETTLED", 1500)
+        await cur.execute(
+            "SELECT account_id FROM season_entries "
+            "WHERE season_id = %s AND user_id = %s",
+            (sid, 8021),
+        )
+        league_acct = int((await cur.fetchone())[0])
+    # Intrinsic payout landed pre-sweep, then everything left to SINK.
+    assert await get_balance(conn, league_acct) == 0
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT amount FROM ledger_entries WHERE account_id = %s "
+            "AND reason = 'OPTION_SETTLEMENT'",
+            (league_acct,),
+        )
+        assert (await cur.fetchone())[0] == 15_000  # $15/share x qty 10
+    # The next global expiry sweep must NOT pay the dead account again.
+    assert await settle_expired_options(conn, 10_000) == 0
+    assert await get_balance(conn, league_acct) == 0
+
+
+async def test_sandbox_close_settles_options_before_sweep(
+    conn: AsyncConnection,
+) -> None:
+    """Same close-time settle for sandbox seasons (no scoring, same
+    stake-sweep shape)."""
+    from stockbot.seasons.service import close_season
+
+    await bootstrap_user(conn, 8022)
+    sid = await open_sandbox(conn, 8022)
+    bought = await _buy(conn, 8022, strike=Decimal("60"), season_id=sid)
+    await _set_mark(conn, 75.0)
+    entry = await get_sandbox_entry(conn, 8022)
+    assert entry is not None
+
+    await close_season(conn, sid)
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT status, settlement_minor FROM option_positions WHERE id = %s",
+            (bought.option_id,),
+        )
+        assert (await cur.fetchone()) == ("SETTLED", 1500)
+    assert await get_balance(conn, int(entry[1])) == 0
+    assert await settle_expired_options(conn, 10_000) == 0

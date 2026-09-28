@@ -99,10 +99,10 @@ from stockbot.market.data import (
     InstrumentSnapshot,
     all_instrument_snapshots,
     book_depth,
-    current_session,
     current_tick_index,
     get_instrument_snapshot,
-    session_parts,
+    market_phase,
+    markets_map,
 )
 from stockbot.market.engine import TICKS_PER_DAY, ticks_until_close, ticks_until_open
 from stockbot.options.service import (
@@ -526,30 +526,50 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def market(interaction: discord.Interaction) -> None:
         async with db.connection() as conn:
             snapshots = await all_instrument_snapshots(conn)
-            phase, cur_tick, session_cfg = await current_session(conn)
+            venues = await markets_map(conn)
+            cur_tick = await current_tick_index(conn)
 
-        status = ""
-        if cur_tick is not None:
-            open_ticks, closed_ticks, offset = session_parts(session_cfg)
-            if phase == "OPEN":
-                until = ticks_until_close(cur_tick, open_ticks, closed_ticks, offset)
-                status = f"Session: **OPEN** — closes in ~{until} min\n"
+        # One status line + one section per venue, in market-id order.
+        status_lines: list[str] = []
+        for m in venues.values():
+            label = f"**{m['code']}** {m['name']}"
+            if cur_tick is not None:
+                open_t = int(m["open_ticks"])
+                closed_t = int(m["closed_ticks"])
+                off = int(m["offset_ticks"])
+                if market_phase(m, cur_tick) == "OPEN":
+                    until = ticks_until_close(cur_tick, open_t, closed_t, off)
+                    status_lines.append(f"{label}: OPEN — closes in ~{until} min")
+                else:
+                    until = ticks_until_open(cur_tick, open_t, closed_t, off)
+                    status_lines.append(f"{label}: CLOSED — reopens in ~{until} min")
             else:
-                until = ticks_until_open(cur_tick, open_ticks, closed_ticks, offset)
-                status = f"Session: **CLOSED** — reopens in ~{until} min\n"
+                status_lines.append(f"{label}: not yet open")
 
-        lines = ["ticker  sector           price       24h"]
-        for s in sorted(snapshots, key=lambda s: (s.sector_key, s.ticker)):
-            marker = " (halted)" if s.is_halted else ""
-            change = format_pct(s.day_change_pct) if s.day_change_pct is not None else "   n/a"
-            lines.append(
-                f"{s.ticker:<6} {s.sector_key:<11} {format_price(s.quoted_price):>12} "
-                f"{change:>9}{marker}"
+        sections: list[str] = []
+        for mid in venues:
+            rows = sorted(
+                (s for s in snapshots if s.market_id == mid),
+                key=lambda s: (s.sector_key, s.ticker),
             )
+            if not rows:
+                continue
+            lines = [f"── {venues[mid]['code']} ──", "ticker  sector           price       24h"]
+            for s in rows:
+                marker = " (halted)" if s.is_halted else ""
+                change = format_pct(s.day_change_pct) if s.day_change_pct is not None else "   n/a"
+                lines.append(
+                    f"{s.ticker:<6} {s.sector_key:<11} {format_price(s.quoted_price):>12} "
+                    f"{change:>9}{marker}"
+                )
+            sections.append("\n".join(lines))
 
         embed = discord.Embed(
             title="Market",
-            description=status + "```\n" + "\n".join(lines) + "\n```",
+            description="\n".join(status_lines)
+            + "```\n"
+            + "\n\n".join(sections)
+            + "\n```",
         )
         await interaction.response.send_message(embed=embed)
 
@@ -577,6 +597,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
             mcfg = await margin_config(conn)
             tick_now = await current_tick_index(conn)
+            venues = await markets_map(conn)
             # Pro Terminal: deeper stats gated on the entitlement (the
             # analyst_tools ownership pattern from /calendar).
             pro = await owns_item(conn, interaction.user.id, "pro_terminal")
@@ -595,6 +616,20 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
         embed = discord.Embed(title=f"{snapshot.ticker} \u2014 {snapshot.name}")
         embed.add_field(name="Sector", value=snapshot.sector_name)
+        venue = venues.get(snapshot.market_id)
+        if venue is not None:
+            venue_str = f"{venue['name']} ({venue['code']})"
+            if tick_now is not None:
+                open_t = int(venue["open_ticks"])
+                closed_t = int(venue["closed_ticks"])
+                off = int(venue["offset_ticks"])
+                if market_phase(venue, tick_now) == "OPEN":
+                    until = ticks_until_close(tick_now, open_t, closed_t, off)
+                    venue_str += f" — OPEN, closes ~{until}m"
+                else:
+                    until = ticks_until_open(tick_now, open_t, closed_t, off)
+                    venue_str += f" — CLOSED, reopens ~{until}m"
+            embed.add_field(name="Venue", value=venue_str)
         # "Mark (mid)" reads better once bid/ask are on screen: the mark
         # IS the mid, and saying so keeps users from reading it as a
         # tradeable price.
@@ -844,8 +879,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             return
 
         def _lines(items: list[InstrumentSnapshot]) -> str:
-            return "ticker      price       24h\n" + "\n".join(
-                f"{s.ticker:<6} {format_price(s.quoted_price):>10} "
+            return "ticker  v    price       24h\n" + "\n".join(
+                f"{s.ticker:<6} {s.market_code:<3} {format_price(s.quoted_price):>10} "
                 f"{format_pct(s.day_change_pct):>9}"  # type: ignore[arg-type]
                 for s in items
             )
@@ -862,17 +897,21 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         async with db.connection() as conn:
             snapshots = await all_instrument_snapshots(conn)
 
-        by_sector: dict[str, list[InstrumentSnapshot]] = {}
+        # Venue x sector: shared sector factors mean the same key can
+        # appear on multiple venues with different constituents.
+        by_sector: dict[tuple[str, str], list[InstrumentSnapshot]] = {}
         for s in snapshots:
-            by_sector.setdefault(s.sector_key, []).append(s)
+            by_sector.setdefault((s.market_code, s.sector_key), []).append(s)
 
         lines = []
-        for sector_key in sorted(by_sector):
-            members = by_sector[sector_key]
+        for (market_code, sector_key), members in sorted(by_sector.items()):
             changes = [s.day_change_pct for s in members if s.day_change_pct is not None]
             avg_change = sum(changes) / len(changes) if changes else None
             change_str = format_pct(avg_change) if avg_change is not None else "   n/a"
-            lines.append(f"{sector_key:<11} {members[0].sector_name:<16} {change_str:>9}")
+            venue = f"{market_code:<4}" if len({s.market_code for s in snapshots}) > 1 else ""
+            lines.append(
+                f"{venue}{sector_key:<11} {members[0].sector_name:<16} {change_str:>9}"
+            )
 
         embed = discord.Embed(title="Sectors (avg 24h change)")
         embed.description = "```\n" + "\n".join(lines) + "\n```"
@@ -885,9 +924,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
-                    SELECT i.ticker, e.resolve_tick, e.estimate
+                    SELECT i.ticker, e.resolve_tick, e.estimate, m.code
                     FROM events e
                     JOIN instruments i ON i.id = e.instrument_id
+                    JOIN markets m ON m.id = i.market_id
                     WHERE e.kind = 'EARNINGS' AND NOT e.resolved
                     ORDER BY e.resolve_tick
                     LIMIT 20
@@ -902,14 +942,16 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
             return
 
+        multi_venue = len({r[3] for r in rows}) > 1
         lines = [
-            f"{ticker:<6} in {(resolve_tick - current_tick) / TICKS_PER_DAY:>5.1f} day(s)"
+            f"{ticker + ('·' + code if multi_venue else ''):<9} in "
+            f"{(resolve_tick - current_tick) / TICKS_PER_DAY:>5.1f} day(s)"
             + (
                 f"   street {format_pct(float(estimate))}"
                 if estimate is not None
                 else ""
             )
-            for ticker, resolve_tick, estimate in rows
+            for ticker, resolve_tick, estimate, code in rows
         ]
         embed = discord.Embed(title="Earnings calendar")
         embed.description = "```\n" + "\n".join(lines) + "\n```"
@@ -2878,6 +2920,13 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     premium_each = await quote_option_premium(
                         conn, ticker, side, Decimal(str(strike)), expiry
                     )
+                    if premium_each <= 0:
+                        await interaction.response.send_message(
+                            "That contract prices at ~$0/share — try a nearer "
+                            "strike or shorter expiry.",
+                            ephemeral=True,
+                        )
+                        return
                     qty = int(Decimal(str(dollars)) * 100) // premium_each
                     if qty < 1:
                         await interaction.response.send_message(

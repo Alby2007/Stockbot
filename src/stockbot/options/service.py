@@ -46,6 +46,9 @@ from stockbot.market.data import (
     event_halt_lead_ticks,
     event_halted,
     flow_config,
+    instrument_session_cfg,
+    market_cfg,
+    markets_map,
     participation_cap,
     record_flow,
     session_config,
@@ -53,7 +56,13 @@ from stockbot.market.data import (
 )
 from stockbot.market.engine import TICKS_PER_DAY
 from stockbot.options.errors import OptionNotFoundError, StrikeOutOfBandError
-from stockbot.options.pricing import VolBlend, bs_delta, bs_price, total_variance
+from stockbot.options.pricing import (
+    VolBlend,
+    bs_delta,
+    bs_price,
+    session_variance_ticks,
+    total_variance,
+)
 from stockbot.trading.errors import (
     EventHaltedError,
     InstrumentHaltedError,
@@ -188,20 +197,38 @@ async def _vol_blend(conn: AsyncConnection, instrument: dict[str, Any]) -> VolBl
     return VolBlend(sigma=float(instrument["sigma"]), rho=rho)
 
 
+async def _horizon_ticks(
+    conn: AsyncConnection, now_tick: int, ticks_left: int, instrument_id: int
+) -> tuple[float, float, float]:
+    """(accrual, calendar, open) ticks in the pricing horizon, counted on
+    the instrument's own venue clock. Post-0033 a closed stretch realizes
+    only `overnight_var_frac` of nominal variance -- counting calendar
+    ticks wholesale overstates long-dated variance ~30%."""
+    return session_variance_ticks(
+        now_tick,
+        ticks_left,
+        await instrument_session_cfg(conn, instrument_id),
+    )
+
+
 def _model_values(
     instrument: dict[str, Any],
     side: str,
     strike: float,
-    ticks_left: int,
+    horizon: tuple[float, float, float],
     vol_cfg: VolBlend,
 ) -> tuple[float, float]:
-    """(fair value per share, delta) at the current mark."""
+    """(fair value per share, delta) at the current mark. `horizon` is
+    (accrual, calendar, open) ticks from `_horizon_ticks`."""
+    var_t, cal_t, open_t = horizon
     var = total_variance(
         float(instrument["sigma_eff"]),
         float(instrument["kappa"]),
         float(instrument["fundamental_sigma"]),
-        ticks_left,
+        cal_t,
         vol_cfg,
+        var_ticks=var_t,
+        open_ticks=open_t,
     )
     spot = float(instrument["quoted_price"])
     return bs_price(side, spot, strike, var), bs_delta(side, spot, strike, var)
@@ -315,9 +342,9 @@ async def buy_option(
         if interaction_id is not None:
             await record_idempotency_key(conn, interaction_id)
         await assert_feature_enabled(conn, "options.enabled", "options")
-        await assert_market_open(conn)
 
         instrument = await _lock_instrument(conn, ticker)
+        await assert_market_open(conn, int(instrument["id"]))
         account_id = await _resolve_account(conn, user_id, season_id)
 
         tick = await _current_tick(conn)
@@ -331,7 +358,13 @@ async def buy_option(
         ticks_left = expiry_tick - (tick or 0)
         vol_cfg = await _vol_blend(conn, instrument)
         model, delta = _model_values(
-            instrument, side, float(strike), ticks_left, vol_cfg
+            instrument,
+            side,
+            float(strike),
+            await _horizon_ticks(
+                conn, tick or 0, ticks_left, int(instrument["id"])
+            ),
+            vol_cfg,
         )
         markup = await _config_float(conn, "options.premium_markup", 0.10)
         premium_per_share_minor = int(
@@ -351,7 +384,7 @@ async def buy_option(
 
         spread_cfg = {
             **await spread_config(conn),
-            **await session_config(conn),
+            **await instrument_session_cfg(conn, int(instrument["id"])),
             **await flow_config(conn),
         }
         liq_eff = engine.effective_liquidity(
@@ -395,6 +428,15 @@ async def buy_option(
         # notional -- delta-basis credit would climb fee tiers ~450x
         # faster than spot trading.
         await record_volume(conn, user_id, premium_minor)
+        if season_id is not None:
+            # Counts toward MIN_TRADES scoring eligibility like a spot
+            # fill -- a pure-options league player must be rankable.
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE season_entries SET trades_count = trades_count + 1 "
+                    "WHERE season_id = %s AND user_id = %s",
+                    (season_id, user_id),
+                )
 
         # O3: dormant at hedge_frac=0. Signed buy-side for CALL, sell-side
         # for PUT (the MM hedges opposite the user's exposure).
@@ -423,7 +465,7 @@ async def buy_option(
                     quantity,
                     premium_per_share_minor,
                     mark_minor,
-                    tick,
+                    tick or 0,
                 ),
             )
             row = await cur.fetchone()
@@ -453,7 +495,6 @@ async def sell_option(
     cover_bounded_short. NOT gated on options.enabled: closes never trap.
     """
     async with conn.transaction():
-        await assert_market_open(conn)
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
@@ -472,12 +513,19 @@ async def sell_option(
             opt = await cur.fetchone()
         if opt is None or int(opt["user_id"]) != user_id:
             raise OptionNotFoundError(option_id)
+        await assert_market_open(conn, int(opt["instrument_id"]))
 
         tick = await _current_tick(conn)
         ticks_left = int(opt["expiry_tick"]) - (tick or 0)
         vol_cfg = await _vol_blend(conn, opt)
         model, delta = _model_values(
-            opt, str(opt["side"]), float(opt["strike"]), ticks_left, vol_cfg
+            opt,
+            str(opt["side"]),
+            float(opt["strike"]),
+            await _horizon_ticks(
+                conn, tick or 0, ticks_left, int(opt["instrument_id"])
+            ),
+            vol_cfg,
         )
         markdown = await _config_float(conn, "options.sell_markdown", 0.12)
         payout_minor = _to_minor_units(
@@ -504,7 +552,7 @@ async def sell_option(
         # Reverse the open's hedge flow at the current delta (O3-dormant).
         spread_cfg = {
             **await spread_config(conn),
-            **await session_config(conn),
+            **await instrument_session_cfg(conn, int(opt["instrument_id"])),
             **await flow_config(conn),
         }
         liq_eff = engine.effective_liquidity(
@@ -528,11 +576,24 @@ async def sell_option(
                 """,
                 (
                     tick,
-                    payout_minor // int(opt["quantity"]),
+                    # Per-share close price -- nearest, not floored, so
+                    # settlement*qty stays within half a unit of payout.
+                    int(
+                        (Decimal(payout_minor) / int(opt["quantity"])).quantize(
+                            Decimal("1"), rounding=ROUND_HALF_UP
+                        )
+                    ),
                     _to_minor_units(Decimal(str(model))),
                     option_id,
                 ),
             )
+        if opt["season_id"] is not None:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE season_entries SET trades_count = trades_count + 1 "
+                    "WHERE season_id = %s AND user_id = %s",
+                    (int(opt["season_id"]), user_id),
+                )
 
     return SellResult(
         option_id=option_id,
@@ -554,6 +615,30 @@ async def settle_expired_options(conn: AsyncConnection, tick_index: int) -> int:
     a SYSTEM account and may go negative by design (same as the ADL
     backstop) -- never clamp a payout on a contract the system promised
     to honour (C3)."""
+    return await _settle_where(
+        conn, tick_index, "AND o.expiry_tick <= %s", (tick_index,)
+    )
+
+
+async def settle_season_options(
+    conn: AsyncConnection, season_id: int, tick_index: int
+) -> int:
+    """Intrinsic-settle every still-open option of a CLOSING season at the
+    current mark -- regardless of expiry. Callers run this BEFORE the
+    entry balances sweep to SINK: the payout lands in the league account
+    and follows league wealth, instead of settling post-close into a
+    dead account the sweep already passed."""
+    return await _settle_where(
+        conn, tick_index, "AND o.season_id = %s", (season_id,)
+    )
+
+
+async def _settle_where(
+    conn: AsyncConnection,
+    tick_index: int,
+    extra_where: str,
+    params: tuple[object, ...],
+) -> int:
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
@@ -572,12 +657,14 @@ async def settle_expired_options(conn: AsyncConnection, tick_index: int) -> int:
             FROM instruments i
             WHERE i.id = o.instrument_id
               AND o.status = 'OPEN'
-              AND o.expiry_tick <= %s
+            """
+            + extra_where
+            + """
             RETURNING o.id, o.user_id, i.ticker, o.side, o.strike,
                       o.quantity, o.season_id, i.quoted_price,
                       o.settlement_minor
             """,
-            (tick_index, tick_index),
+            (tick_index, *params),
         )
         settled = await cur.fetchall()
         mm_id = await get_system_account_id(conn, "MARKET_MAKER")
@@ -628,11 +715,15 @@ async def reprice_open_options(conn: AsyncConnection, tick_index: int) -> int:
     one SELECT + per-row UPDATE; OI stays small under max_oi_frac.
     Runs in both phases so closed-session marks stay current."""
     rho = await _config_float(conn, "vol.rho", 0.94)
+    sess_cfg = await session_config(conn)
+    venues = await markets_map(conn)
+    venue_cfgs = {mid: market_cfg(m, sess_cfg) for mid, m in venues.items()}
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
             SELECT o.id, o.side, o.strike, o.expiry_tick,
                    i.quoted_price, i.kappa, i.fundamental_sigma, i.sigma,
+                   i.market_id,
                    COALESCE(i.sigma_eff, i.sigma) AS sigma_eff
             FROM option_positions o
             JOIN instruments i ON i.id = o.instrument_id
@@ -641,12 +732,18 @@ async def reprice_open_options(conn: AsyncConnection, tick_index: int) -> int:
         )
         rows = await cur.fetchall()
     for row in rows:
+        row_cfg = venue_cfgs.get(int(row["market_id"]), sess_cfg)
+        var_t, cal_t, open_t = session_variance_ticks(
+            tick_index, int(row["expiry_tick"]) - tick_index, row_cfg
+        )
         var = total_variance(
             float(row["sigma_eff"]),
             float(row["kappa"]),
             float(row["fundamental_sigma"]),
-            int(row["expiry_tick"]) - tick_index,
+            cal_t,
             VolBlend(sigma=float(row["sigma"]), rho=rho),
+            var_ticks=var_t,
+            open_ticks=open_t,
         )
         model = bs_price(
             str(row["side"]),
@@ -700,6 +797,8 @@ async def option_chain(conn: AsyncConnection, ticker: str) -> dict[str, Any]:
         raise UnknownInstrumentError(ticker)
     rho = await _config_float(conn, "vol.rho", 0.94)
     markup = await _config_float(conn, "options.premium_markup", 0.10)
+    sess_cfg = await instrument_session_cfg(conn, int(inst["id"]))
+    tick = await _current_tick(conn)
     vol_cfg = VolBlend(sigma=float(inst["sigma"]), rho=rho)
     spot = float(inst["quoted_price"])
 
@@ -707,12 +806,17 @@ async def option_chain(conn: AsyncConnection, ticker: str) -> dict[str, Any]:
     cells: dict[str, dict[float, dict[str, float]]] = {"CALL": {}, "PUT": {}}
     for days in EXPIRY_CHOICES_DAYS:
         ticks_left = days * TICKS_PER_DAY
+        var_t, cal_t, open_t = session_variance_ticks(
+            tick or 0, ticks_left, sess_cfg
+        )
         var = total_variance(
             float(inst["sigma_eff"]),
             float(inst["kappa"]),
             float(inst["fundamental_sigma"]),
-            ticks_left,
+            cal_t,
             vol_cfg,
+            var_ticks=var_t,
+            open_ticks=open_t,
         )
         for k in strikes:
             for side in ("CALL", "PUT"):
@@ -738,7 +842,7 @@ async def quote_option_premium(
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT quoted_price, kappa, fundamental_sigma, sigma,
+            SELECT id, quoted_price, kappa, fundamental_sigma, sigma,
                    COALESCE(sigma_eff, sigma) AS sigma_eff, is_active
             FROM instruments WHERE ticker = %s
             """,
@@ -749,19 +853,26 @@ async def quote_option_premium(
         raise UnknownInstrumentError(ticker)
     rho = await _config_float(conn, "vol.rho", 0.94)
     markup = await _config_float(conn, "options.premium_markup", 0.10)
+    tick = await _current_tick(conn)
+    var_t, cal_t, open_t = session_variance_ticks(
+        tick or 0,
+        expiry_days * TICKS_PER_DAY,
+        await instrument_session_cfg(conn, int(inst["id"])),
+    )
     var = total_variance(
         float(inst["sigma_eff"]),
         float(inst["kappa"]),
         float(inst["fundamental_sigma"]),
-        expiry_days * TICKS_PER_DAY,
+        cal_t,
         VolBlend(sigma=float(inst["sigma"]), rho=rho),
+        var_ticks=var_t,
+        open_ticks=open_t,
     )
     model = bs_price(side, float(inst["quoted_price"]), float(strike), var)
-    return max(
-        int(
-            (Decimal(str(model * (1 + markup))) * 100).quantize(
-                Decimal("1"), rounding=ROUND_CEILING
-            )
-        ),
-        int(await _config_float(conn, "options.min_premium_minor", 1)),
+    # Unfloored: buy_option REJECTS below min_premium rather than charging
+    # it -- a floored quote would name a price the buy can't fill.
+    return int(
+        (Decimal(str(model * (1 + markup))) * 100).quantize(
+            Decimal("1"), rounding=ROUND_CEILING
+        )
     )

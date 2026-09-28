@@ -271,8 +271,9 @@ async def test_sigma_eff_widens_fill_spread(conn) -> None:
 async def test_gap_tick_does_not_pin_vol_clip(conn) -> None:
     """Finding 2: the overnight gap's |r| is normalized by sigma*sqrt(dt),
     so a routine reopen must not slam vol_state into the clip."""
-    await _set_config(conn, "session.open_ticks", 8)
-    await _set_config(conn, "session.closed_ticks", 4)
+    # Session shape lives on the markets row post-0053.
+    async with conn.cursor() as cur:
+        await cur.execute("UPDATE markets SET open_ticks = 8, closed_ticks = 4")
     # Two full cycles: tick 12 and tick 24 are gap ticks (dt=4).
     for _ in range(26):
         await apply_tick(conn, _SEED)
@@ -297,8 +298,8 @@ async def test_gap_tick_does_not_pin_vol_clip(conn) -> None:
 
 
 async def test_closed_ticks_freeze_vol_state(conn) -> None:
-    await _set_config(conn, "session.open_ticks", 3)
-    await _set_config(conn, "session.closed_ticks", 2)
+    async with conn.cursor() as cur:
+        await cur.execute("UPDATE markets SET open_ticks = 3, closed_ticks = 2")
     for _ in range(5):  # ticks 0-2 open, 3-4 closed
         await apply_tick(conn, _SEED)
     async with conn.cursor() as cur:

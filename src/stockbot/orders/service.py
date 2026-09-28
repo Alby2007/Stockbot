@@ -47,6 +47,9 @@ from stockbot.market.data import (
     event_halted,
     flow_config,
     half_spread_for,
+    instrument_session_cfg,
+    market_cfg,
+    markets_map,
     participation_cap,
     record_flow,
     session_config,
@@ -205,7 +208,6 @@ async def place_order(
         if interaction_id is not None:
             await record_idempotency_key(conn, interaction_id)
         await assert_feature_enabled(conn, "orders.enabled", "order placement")
-        await assert_market_open(conn)
         # Paid order-type unlocks (0041): gated at placement; a resting
         # order keeps working even if the entitlement later lapses.
         if display_qty is not None:
@@ -221,11 +223,16 @@ async def place_order(
         if row is None or not row[1]:
             raise UnknownInstrumentError(ticker)
         instrument_id = int(row[0])
+        await assert_market_open(conn, instrument_id)
         next_halt_tick = row[3]
 
-        # Tick-size rounding (G3): resting prices snap to the same grid
-        # fills print on, so a displayed quote is always attainable.
-        tick_cfg = await spread_config(conn)
+        # Tick-size rounding (G3): resting prices snap to the venue's
+        # grid (markets.tick_size -> spread.tick_min overlay), so a
+        # displayed quote is always attainable.
+        tick_cfg = {
+            **await spread_config(conn),
+            **await instrument_session_cfg(conn, instrument_id),
+        }
         tick_grid = Decimal(str(engine.tick_size(float(row[2]), tick_cfg)))
         if trail_amount is not None and stop_price is None:
             # Trail-only stop: anchor the initial stop one trail-width off
@@ -724,7 +731,8 @@ async def _ratchet_trailing_stops(conn: AsyncConnection) -> int:
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT o.id, o.side, o.stop_price, o.trail_amount, i.quoted_price
+            SELECT o.id, o.side, o.stop_price, o.trail_amount, i.quoted_price,
+                   i.market_id
             FROM orders o
             JOIN instruments i ON i.id = o.instrument_id
             WHERE o.status = 'OPEN' AND o.triggered_tick IS NULL
@@ -735,12 +743,16 @@ async def _ratchet_trailing_stops(conn: AsyncConnection) -> int:
         rows = await cur.fetchall()
     if not rows:
         return 0
-    spread_cfg = await spread_config(conn)
+    base_cfg = await spread_config(conn)
+    venues = await markets_map(conn)
+    venue_cfgs = {mid: market_cfg(m, base_cfg) for mid, m in venues.items()}
     moved = 0
     async with conn.cursor() as cur:
         for order in rows:
             mark = float(order["quoted_price"])
-            grid = engine.tick_size(mark, spread_cfg)
+            grid = engine.tick_size(
+                mark, venue_cfgs.get(int(order["market_id"]), base_cfg)
+            )
             raw = (
                 mark - float(order["trail_amount"])
                 if order["side"] == "SELL"
@@ -1070,7 +1082,7 @@ async def _match_once(
                    o.opened_tick, o.allow_short,
                    o.instrument_id, i.ticker, i.base_price, i.impact,
                    i.quoted_price, i.liquidity, i.lambda_impact, i.max_impact,
-                   i.next_halting_event_tick,
+                   i.next_halting_event_tick, i.market_id,
                    COALESCE(i.sigma_eff, i.sigma) AS sigma,
                    i.next_event_tick, i.last_halt_end_tick,
                    i.circuit_halted_until_tick
@@ -1084,11 +1096,21 @@ async def _match_once(
         )
         open_orders = await cur.fetchall()
 
-    spread_cfg = {
+    base_cfg = {
         **await spread_config(conn),
         **await session_config(conn),
         **await flow_config(conn),
     }
+    # Per-venue session shape + tick grid: each book's quotes and its
+    # auction window follow its own market's clock (identical under one
+    # venue -- this merge is what R4's second venue hangs off).
+    venues = await markets_map(conn)
+    venue_cfgs = {
+        mid: market_cfg(m, base_cfg) for mid, m in venues.items()
+    }
+
+    def _cfg_for(order: dict[str, Any]) -> dict[str, float]:
+        return venue_cfgs.get(int(order["market_id"]), base_cfg)
 
     # --- Pass 1: crossing book -------------------------------------------
     # Per (instrument, season scope): bids and asks walk price-time
@@ -1112,6 +1134,7 @@ async def _match_once(
 
     for (_iid, _sid), sides in books.items():
         ref = (sides["BUY"] or sides["SELL"])[0]
+        book_cfg = _cfg_for(ref)  # every order in a book shares the venue
         base_price = float(ref["base_price"])
         max_impact = float(ref["max_impact"])
         mark = float(ref["quoted_price"])
@@ -1151,7 +1174,7 @@ async def _match_once(
                 collar=collar,
                 tick_index=tick_index,
                 flow_halt_ticks=flow_halt_ticks,
-                spread_cfg=spread_cfg,
+                spread_cfg=book_cfg,
                 sellable=sellable,
                 stats=stats,
             )
@@ -1182,8 +1205,8 @@ async def _match_once(
                 cross_price = Decimal((ask if bid_maker else bid)["limit_price"])
             else:
                 # Two marketable orders have no maker price -- print at the
-                # mark, snapped to the grid like every other fill.
-                tick = engine.tick_size(mark, spread_cfg)
+                # mark, snapped to the venue's grid like every other fill.
+                tick = engine.tick_size(mark, book_cfg)
                 cross_price = Decimal(str(engine.round_to_tick(mark, tick)))
             if abs(cross_price - Decimal(str(open_mark))) / Decimal(
                 str(open_mark)
@@ -1262,7 +1285,7 @@ async def _match_once(
                    o.allow_short, o.instrument_id, i.ticker,
                    i.base_price,
                    i.impact, i.liquidity, i.adv, i.lambda_impact, i.max_impact,
-                   i.vol_state, i.flow_skew,
+                   i.vol_state, i.flow_skew, i.market_id,
                    COALESCE(i.sigma_eff, i.sigma) AS sigma,
                    i.next_event_tick, i.last_halt_end_tick
             FROM orders o
@@ -1283,9 +1306,10 @@ async def _match_once(
 
     cap = await participation_cap(conn)
     for order in candidates:
+        ocfg = _cfg_for(order)
         remaining_qty = int(order["quantity"]) - int(order["filled_quantity"])
         sign = 1 if order["side"] == "BUY" else -1
-        tick = engine.tick_size(float(order["base_price"]), spread_cfg)
+        tick = engine.tick_size(float(order["base_price"]), ocfg)
         # Participation cap: a resting order works over multiple ticks --
         # fill up to cap*liquidity in notional this tick, the rest next
         # tick. Estimated on the full-size fill price (conservative). The
@@ -1294,16 +1318,16 @@ async def _match_once(
         liq_eff = engine.effective_liquidity(
             float(order["liquidity"]),
             float(order["adv"]),
-            spread_cfg,
+            ocfg,
             float(order["vol_state"]),
         )
         # One half-spread for both the cap-estimate and actual-size fills:
         # same order, same side -- the flow skew depends only on direction.
-        half_spread = half_spread_for(order, tick_index, spread_cfg)
+        half_spread = half_spread_for(order, tick_index, ocfg)
         half_spread *= engine.flow_skew_mult(
             float(order["base_price"]) * remaining_qty * sign,
             float(order["flow_skew"]),
-            spread_cfg,
+            ocfg,
         )
         fill_full, _ = engine.apply_trade_impact(
             base_price=float(order["base_price"]),
@@ -1380,8 +1404,8 @@ async def _match_once(
                             f"order {order['id']} fill {result.fill_price} "
                             f"breached limit {limit}"
                         )
-                async with conn.cursor() as cur:
-                    await cur.execute(
+                async with conn.cursor() as wcur:
+                    await wcur.execute(
                         """
                         UPDATE orders
                         SET filled_quantity = filled_quantity + %s,
@@ -1398,7 +1422,7 @@ async def _match_once(
                         (trade_qty, trade_qty, trade_qty, tick_index,
                          result.fill_price, order["id"]),
                     )
-                    updated = await cur.fetchone()
+                    updated = await wcur.fetchone()
                     if updated is None:
                         # Cancelled between the candidate snapshot and this
                         # write -- roll the fill back rather than overwrite
@@ -1412,7 +1436,7 @@ async def _match_once(
                         await _cancel_oco_siblings(conn, [int(order["id"])])
                         # MM fallback: the order's counterparty is always
                         # the market maker -- this side is always taker.
-                        await cur.execute(
+                        await wcur.execute(
                             """
                             INSERT INTO notifications (user_id, kind, payload)
                             VALUES (%s, 'ORDER_FILLED', %s)
@@ -1452,8 +1476,8 @@ async def _match_once(
             # A deterministic failure would retry identically every tick
             # forever, so count strikes and auto-cancel after a few -- a
             # parked zombie order inflates tick latency linearly.
-            async with conn.transaction(), conn.cursor() as cur:
-                await cur.execute(
+            async with conn.transaction(), conn.cursor() as wcur:
+                await wcur.execute(
                     """
                     UPDATE orders
                     SET fill_failures = fill_failures + 1,
@@ -1465,7 +1489,7 @@ async def _match_once(
                     """,
                     (max_fill_failures, order["id"]),
                 )
-                struck = await cur.fetchone()
+                struck = await wcur.fetchone()
                 if struck is not None and struck[0] == "CANCELLED":
                     # Strike-out is terminal too: an OCO leg that can
                     # never fill can't leave its sibling trading alone.

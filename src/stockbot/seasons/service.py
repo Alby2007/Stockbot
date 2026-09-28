@@ -626,6 +626,13 @@ async def _close_season_claimed(conn: AsyncConnection, season_id: int) -> None:
     if season.sandbox_user_id is not None:
         # Sandbox reset: no scoring, trophies, standings, or result DMs --
         # just sweep the stake back to SINK and cancel resting orders.
+        # Settle season options FIRST: their intrinsic payout must land in
+        # the league account before the sweep, not post-close into a dead
+        # account (the entry row persists, so a later expiry settle would
+        # still resolve -- and strand the cash there forever).
+        from stockbot.options.service import settle_season_options
+
+        await settle_season_options(conn, season_id, max(tick, 0))
         sink_id = await get_system_account_id(conn, "SINK")
         for entry in entries:
             balance = await get_balance(conn, int(entry["account_id"]))
@@ -793,6 +800,14 @@ async def _close_season_claimed(conn: AsyncConnection, season_id: int) -> None:
                     ),
                 ),
             )
+
+    # Season options settle at intrinsic NOW -- the equity snapshots above
+    # already counted their model marks (which include residual time value),
+    # and the intrinsic payout joins the league cash for the sweep. Waiting
+    # for expiry would pay into an account the sweep already emptied.
+    from stockbot.options.service import settle_season_options
+
+    await settle_season_options(conn, season_id, max(tick, 0))
 
     # League wealth never leaves the league: sweep whatever is left to SINK.
     for entry in entries:

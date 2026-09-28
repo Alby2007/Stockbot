@@ -37,10 +37,7 @@ async def test_render_covers_closed_session_rows(conn: AsyncConnection) -> None:
     and muted-candle paths."""
     async with conn.cursor() as cur:
         await cur.execute(
-            "UPDATE config SET value = %s WHERE key = 'session.open_ticks'", (2,)
-        )
-        await cur.execute(
-            "UPDATE config SET value = %s WHERE key = 'session.closed_ticks'", (3,)
+            "UPDATE markets SET open_ticks = 2, closed_ticks = 3"
         )
         await cur.execute("SELECT id FROM instruments ORDER BY id LIMIT 1")
         (instrument_id,) = await cur.fetchone()
@@ -50,9 +47,8 @@ async def test_render_covers_closed_session_rows(conn: AsyncConnection) -> None:
 
     async with conn.cursor() as cur:
         await cur.execute(
-            "SELECT COUNT(*) FROM candles c "
-            "JOIN market_ticks mt ON mt.tick_index = c.tick_index "
-            "WHERE c.instrument_id = %s AND mt.session_state = 'CLOSED'",
+            "SELECT COUNT(*) FROM candles "
+            "WHERE instrument_id = %s AND session_state = 'CLOSED'",
             (instrument_id,),
         )
         (closed_count,) = await cur.fetchone()
@@ -72,10 +68,7 @@ async def test_closed_window_anchors_to_last_open_tick(
     short closed tail as the 'closed now' signal."""
     async with conn.cursor() as cur:
         await cur.execute(
-            "UPDATE config SET value = %s WHERE key = 'session.open_ticks'", (2,)
-        )
-        await cur.execute(
-            "UPDATE config SET value = %s WHERE key = 'session.closed_ticks'", (3,)
+            "UPDATE markets SET open_ticks = 2, closed_ticks = 3"
         )
         await cur.execute("SELECT id FROM instruments ORDER BY id LIMIT 1")
         (instrument_id,) = await cur.fetchone()
@@ -121,10 +114,7 @@ async def test_window_skips_intra_window_closed_run(
     (cycle 8): ticks 0-2 open, 3-7 closed, 8-9 open."""
     async with conn.cursor() as cur:
         await cur.execute(
-            "UPDATE config SET value = %s WHERE key = 'session.open_ticks'", (3,)
-        )
-        await cur.execute(
-            "UPDATE config SET value = %s WHERE key = 'session.closed_ticks'", (5,)
+            "UPDATE markets SET open_ticks = 3, closed_ticks = 5"
         )
         await cur.execute(
             "SELECT id FROM instruments WHERE is_active AND kind != 'INDEX' "

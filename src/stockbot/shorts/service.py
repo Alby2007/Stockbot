@@ -42,9 +42,9 @@ from stockbot.market.data import (
     event_halted,
     flow_config,
     half_spread_for,
+    instrument_session_cfg,
     participation_cap,
     record_flow,
-    session_config,
     spread_config,
 )
 from stockbot.seasons.service import get_active_entry
@@ -203,16 +203,16 @@ async def open_bounded_short(
         if interaction_id is not None:
             await record_idempotency_key(conn, interaction_id)
         await assert_feature_enabled(conn, "shorts.enabled", "bounded shorts")
-        await assert_market_open(conn)
 
         instrument = await _lock_instrument(conn, ticker)
+        await assert_market_open(conn, int(instrument["id"]))
         account_id = await _resolve_account(conn, user_id, season_id)
 
         base_price = float(instrument["base_price"])
         tick = await _current_tick(conn)
         spread_cfg = {
             **await spread_config(conn),
-            **await session_config(conn),
+            **await instrument_session_cfg(conn, int(instrument["id"])),
             **await flow_config(conn),
         }
         liq_eff = engine.effective_liquidity(
@@ -346,8 +346,8 @@ async def cover_bounded_short(
     async with conn.transaction():
         # Closes are NOT gated on shorts.enabled: kill switches halt new
         # exposure, they must never trap users in open positions (same
-        # reason cancel_order isn't gated). Market session still applies.
-        await assert_market_open(conn)
+        # reason cancel_order isn't gated). Market session still applies
+        # on the short's own venue clock.
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
@@ -367,13 +367,14 @@ async def cover_bounded_short(
             short = await cur.fetchone()
         if short is None or int(short["user_id"]) != user_id:
             raise ShortNotFoundError(short_id)
+        await assert_market_open(conn, int(short["instrument_id"]))
 
         base_price = float(short["base_price"])
         quantity = int(short["quantity"])
         tick = await _current_tick(conn)
         spread_cfg = {
             **await spread_config(conn),
-            **await session_config(conn),
+            **await instrument_session_cfg(conn, int(short["instrument_id"])),
             **await flow_config(conn),
         }
         liq_eff = engine.effective_liquidity(

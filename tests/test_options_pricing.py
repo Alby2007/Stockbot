@@ -10,6 +10,7 @@ from stockbot.options.pricing import (
     VolBlend,
     bs_delta,
     bs_price,
+    session_variance_ticks,
     total_variance,
 )
 
@@ -112,3 +113,60 @@ def test_mm_edge_calibration() -> None:
     buyback = model * (1 - markdown)
     assert (premium - model) / premium == pytest.approx(0.0909, abs=1e-3)
     assert 1 - buyback / premium == pytest.approx(0.20, abs=1e-3)
+
+
+_SESS_CFG = {
+    "session.open_ticks": 960,
+    "session.closed_ticks": 480,
+    "session.phase_offset_ticks": 0,
+    "session.overnight_var_frac": 0.125,
+}
+
+
+def test_session_variance_ticks_weights_closed_stretch() -> None:
+    """Post-0033 a closed tick realizes only `overnight_var_frac` of its
+    nominal stochastic variance (the gap tick steps var_dt, not dt) -- the
+    accrual horizon must be `open + frac*closed`, NOT calendar ticks."""
+    # A whole-cycle horizon sees the same 960 open + 480 closed slice from
+    # any starting tick.
+    for now in (0, 700, 1100):
+        var_t, cal_t, open_t = session_variance_ticks(now, 1440, _SESS_CFG)
+        assert var_t == pytest.approx(960 + 480 * 0.125)  # 1020
+        assert cal_t == 1440
+        assert open_t == 960
+    # Mid-closed-stretch start: (1100, 1700] is 339 closed + 261 open.
+    var_t, cal_t, open_t = session_variance_ticks(1100, 600, _SESS_CFG)
+    assert (open_t, cal_t - open_t) == (261, 339)
+    assert var_t == pytest.approx(261 + 339 * 0.125)
+    # No session config -> everything is open (back-compat).
+    assert session_variance_ticks(5, 100, {}) == (100.0, 100, 100)
+
+
+def test_total_variance_charges_effective_not_calendar_ticks() -> None:
+    """Calendar pricing overstated a cycle's realized variance ~29% (1440
+    priced vs 960+480*0.125=1020 realized). The stochastic accrual uses
+    effective ticks; OU decay and the sigma regime keep calendar/open
+    time -- the same split the engine makes between dt and var_dt."""
+    var_t, cal_t, open_t = session_variance_ticks(0, 1440, _SESS_CFG)
+    v_cal = total_variance(NORT_SIGMA, NORT_KAPPA, NORT_FSIGMA, 1440, VOL_CFG)
+    v_eff = total_variance(
+        NORT_SIGMA,
+        NORT_KAPPA,
+        NORT_FSIGMA,
+        cal_t,
+        VOL_CFG,
+        var_ticks=var_t,
+        open_ticks=open_t,
+    )
+    assert v_eff < v_cal
+    # The fundamental Brownian term is pure accrual -- it scales by exactly
+    # the realized-ticks ratio.
+    assert NORT_FSIGMA**2 * var_t == pytest.approx(NORT_FSIGMA**2 * 1020)
+    # Back-compat: explicit horizons equal the old calendar form when the
+    # session is all-open (var == cal == open == ticks_left).
+    assert total_variance(
+        NORT_SIGMA, NORT_KAPPA, NORT_FSIGMA, 100, VOL_CFG,
+        var_ticks=100.0, open_ticks=100,
+    ) == pytest.approx(
+        total_variance(NORT_SIGMA, NORT_KAPPA, NORT_FSIGMA, 100, VOL_CFG)
+    )

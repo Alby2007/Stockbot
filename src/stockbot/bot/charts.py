@@ -160,9 +160,12 @@ async def _select_window_rows(
         await cur.execute(
             """
             WITH last_open AS (
+                -- Per-instrument: the venue's own last open candle, not
+                -- the global market's (F1 -- a second venue's candles are
+                -- CLOSED during the other's session).
                 SELECT MAX(tick_index) AS t
-                FROM market_ticks
-                WHERE session_state = 'OPEN'
+                FROM candles
+                WHERE instrument_id = %s AND session_state = 'OPEN'
             ),
             eff AS (
                 -- LEAST ignores NULL: end=None -> last_open; a panned end
@@ -171,18 +174,16 @@ async def _select_window_rows(
                 SELECT LEAST(%s, (SELECT t FROM last_open)) AS end_tick
             ),
             picked AS (
-                -- Open-phase candles only (missing market_ticks default
-                -- OPEN); rn numbers newest-first so grp buckets anchor at
-                -- the window's right edge and the OLDEST bucket may be
-                -- partial.
+                -- Open-phase candles only; rn numbers newest-first so grp
+                -- buckets anchor at the window's right edge and the
+                -- OLDEST bucket may be partial.
                 (SELECT c.tick_index,
                         (ROW_NUMBER() OVER (ORDER BY c.tick_index DESC) - 1)
                             / %s AS grp
                  FROM candles c
-                 LEFT JOIN market_ticks mt ON mt.tick_index = c.tick_index
                  WHERE c.instrument_id = %s
                    AND c.tick_index <= (SELECT end_tick FROM eff)
-                   AND COALESCE(mt.session_state, 'OPEN') = 'OPEN'
+                   AND c.session_state = 'OPEN'
                  ORDER BY c.tick_index DESC
                  LIMIT %s)
                 UNION ALL
@@ -205,7 +206,7 @@ async def _select_window_rows(
                    MAX(c.halt_kind) AS halt_kind,
                    -- 'OPEN' > 'CLOSED': a bucket mixing the session
                    -- boundary renders as the open-phase candle it mostly is.
-                   MAX(COALESCE(mt.session_state, 'OPEN')) AS session_state,
+                   MAX(c.session_state) AS session_state,
                    -- Buckets label by their right edge's timestamp, like
                    -- real charts label a bar by its close.
                    MAX(mt.ts) AS ts
@@ -217,6 +218,7 @@ async def _select_window_rows(
             ORDER BY tick_index DESC
             """,
             (
+                instrument_id,
                 end_tick,
                 bucket,
                 instrument_id,
@@ -230,10 +232,11 @@ async def _select_window_rows(
 
         await cur.execute(
             """
-            SELECT LEAST(%s, (SELECT MAX(tick_index) FROM market_ticks
-                              WHERE session_state = 'OPEN'))
+            SELECT LEAST(%s, (SELECT MAX(tick_index) FROM candles
+                              WHERE instrument_id = %s
+                                AND session_state = 'OPEN'))
             """,
-            (end_tick,),
+            (end_tick, instrument_id),
         )
         end_row = await cur.fetchone()
     resolved_end = end_row[0] if end_row else None

@@ -555,6 +555,7 @@ async def add_instrument(
     beta: float | None = None,
     gamma: float | None = None,
     liquidity: float | None = None,
+    market_code: str | None = None,
 ) -> int:
     """List a new instrument. Unspecified engine params default to the
     sector's medians (market-wide for an empty sector). New listings never
@@ -590,6 +591,21 @@ async def add_instrument(
             raise ValueError("cannot list into the index sector")
         sector_id = int(sector["id"])
 
+        async with conn.cursor() as cur:
+            if market_code is None:
+                await cur.execute(
+                    "SELECT id FROM markets ORDER BY id LIMIT 1"
+                )
+            else:
+                await cur.execute(
+                    "SELECT id FROM markets WHERE upper(code) = upper(%s)",
+                    (market_code.strip(),),
+                )
+            mkt_row = await cur.fetchone()
+        if mkt_row is None:
+            raise ValueError(f"unknown market {market_code!r}")
+        market_id = int(mkt_row[0])
+
         defaults = await _sector_medians(conn, sector_id)
         defaults.update(params)
         p = defaults
@@ -607,14 +623,14 @@ async def add_instrument(
                 await cur.execute(
                     """
                     INSERT INTO instruments (
-                        ticker, name, sector_id, kind,
+                        ticker, name, sector_id, market_id, kind,
                         drift, sigma, beta, gamma, kappa, fundamental_sigma,
                         liquidity, lambda_impact, tau_ticks, max_impact,
                         fundamental_value, base_price, impact, quoted_price,
                         init_margin_pct, maint_margin_pct, float_shares,
                         index_member, short_knockout_pct, adv
                     ) VALUES (
-                        %s, %s, %s, 'STOCK',
+                        %s, %s, %s, %s, 'STOCK',
                         %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s,
                         %s, %s, 0, %s,
@@ -627,6 +643,7 @@ async def add_instrument(
                         ticker,
                         name.strip(),
                         sector_id,
+                        market_id,
                         p["drift"],
                         p["sigma"],
                         p["beta"],

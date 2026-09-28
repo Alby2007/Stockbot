@@ -262,11 +262,11 @@ async def test_mm_fill_that_breaches_limit_stays_open(conn: AsyncConnection) -> 
         await cur.execute(
             "UPDATE config SET value = 0.0000001 WHERE key = 'spread.tick_min'"
         )
+        # Venue session shape and tick grid live on the markets row
+        # post-0053 (tick_size overrides spread.tick_min).
         await cur.execute(
-            "UPDATE config SET value = 1000000000 WHERE key = 'session.open_ticks'"
-        )
-        await cur.execute(
-            "UPDATE config SET value = 0 WHERE key = 'session.closed_ticks'"
+            "UPDATE markets SET open_ticks = 1000000000, closed_ticks = 0, "
+            "tick_size = 0.0000001"
         )
     spread_cfg = await spread_config(conn)
     base = float(inst["base_price"])

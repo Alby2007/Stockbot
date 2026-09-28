@@ -131,6 +131,20 @@ sqrt(closed_ticks * `session.overnight_var_frac`) (default 0.125 ->
 var_dt=60, ~an hour of trading), while clock-time terms (base drift,
 mean reversion, impact decay) keep the full closed_ticks. Without the
 split ~85% of instruments pinned the 4.5% breaker every reopen.
+Regional markets (0053, R1 done): venues live in `markets`
+(open/closed/offset ticks, tick_size, auction_ticks,
+overnight_var_ticks = the ABSOLUTE gap horizon, 60 for US so R4's longer
+close keeps var calibrated by writing 60 again, NOT rescaling the frac).
+`instruments.market_id` FKs each listing to a venue; candles carry
+`session_state` per row (authoritative for chart filters -- market_ticks'
+is the global/any-open summary). Session reads go through
+`market_cfg(market, global_cfg)` which overlays venue values onto the
+`session.*`-shaped cfg dict and derives `overnight_var_frac` back from
+the tick horizon; `instrument_session_cfg` does the whole lookup for
+fill paths. `assert_market_open(conn, instrument_id)` is venue-scoped --
+call it AFTER resolving the instrument. Tests flip session shape by
+UPDATEing the `markets` row (NOT `session.*` config, which only survives
+as fallback defaults for missing venues).
 Mean reversion uses the exact OU decay `log_dev*(1-exp(-kappa*dt))`
 (not linear `kappa*log_dev*dt`) -- at dt=480 the linear pull is ~9x the
 deviation and overshoots FV into a halt; the decay form converges onto
@@ -140,9 +154,7 @@ FV so the reopen's reversion move is bounded by the deviation itself.
 `place_order`, and both bounded-short endpoints with `MarketClosedError`
 -- imported lazily there because `market.data -> trading.errors ->
 trading.__init__ -> trading.service -> margin -> market.data` is a real
-import cycle. Tests flip `session.*` config (open=2, closed=4) to cycle
-phases in a handful of ticks; the phase offset shifts where the cycle
-lands relative to tick 0. Sim-harness gotcha: `ticks_per_day` (1440) ==
+import cycle. Sim-harness gotcha: `ticks_per_day` (1440) ==
 one session cycle, so agents must act right after the day's FIRST tick
 (the session-open gap tick, cycle_pos 0) — acting after the last tick
 lands in the closed phase and every trade/quote is silently swallowed
@@ -1185,7 +1197,14 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   `(σ²/2κ)(1-e^{-2κT})` + `fundamental_sigma²·T`, blended from the EWMA
   vol back toward seed via `vol.rho` — NOT `σ_eff√T` (that formula
   overprices NORT 5-7x; `tests/test_options_pricing.py` pins the C1
-  table). `bs_price`/`bs_delta` are zero-rate Black with intrinsic at
+  table). Post-0033 the horizon is THREE clocks via
+  `session_variance_ticks` — stochastic accrual counts effective ticks
+  (`open + overnight_var_frac·closed`, matching the engine's `var_dt`),
+  OU mean-reversion decay keeps CALENDAR ticks (the gap step reverts
+  with full `dt=closed`), and the EWMA regime blend counts open ticks
+  (one update per step call). Counting calendar ticks wholesale priced
+  ~29% too much variance per 960/480 cycle — a hidden extra MM edge.
+  `bs_price`/`bs_delta` are zero-rate Black with intrinsic at
   T<=0. `apply_tick` calls `settle_expired_options` + `reprice_open_options`
   in BOTH branches — a contract expiring on a closed tick settles at the
   frozen pre-gap mark, and neither is gated on `options.enabled` (the
@@ -1208,5 +1227,16 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   not collateral. `delist_instrument` settles opens at the final mark's
   intrinsic (same MM clamp) and reports `options_settled`. Sell-back
   markdown 0.12 > markup 0.10 so buy→sell round trips always lose ~20%
-  — manipulation and wash hedges pay rent. Idempotent: settlement is a
+  — manipulation and wash hedges pay rent. League options increment
+  `season_entries.trades_count` on open AND sell (MIN_TRADES scoring
+  eligibility); `close_season` runs `settle_season_options` AFTER the
+  final equity snapshot (marks keep residual time value for scoring) but
+  BEFORE the SINK sweep — without it, post-close expiry settlements pay
+  intrinsic into an already-emptied league account and strand the cash.
+  `quote_option_premium` returns the UNFLOORED markup price: `buy_option`
+  rejects sub-`min_premium` contracts outright, so a floored quote would
+  name a fillable-looking price the buy refuses; `/options dollars:`
+  guards `quote <= 0` before dividing. `opened_tick` writes
+  `tick or 0` — never NULL on a pre-first-tick buy. Idempotent:
+  settlement is a
   status flip on locked rows, buys key on `interaction_id`.

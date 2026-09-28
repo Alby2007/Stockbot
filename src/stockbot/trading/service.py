@@ -47,9 +47,9 @@ from stockbot.market.data import (
     fee_config,
     flow_config,
     half_spread_for,
+    instrument_session_cfg,
     participation_cap,
     record_flow,
-    session_config,
     spread_config,
 )
 from stockbot.shop.service import BASE_SLOTS, get_slot_count
@@ -203,7 +203,7 @@ async def quote_trade(
             )
     spread_cfg = {
         **await spread_config(conn),
-        **await session_config(conn),
+        **await instrument_session_cfg(conn, int(instrument["id"])),
         **await flow_config(conn),
     }
     half_spread = half_spread_for(instrument, current_tick, spread_cfg)
@@ -705,7 +705,6 @@ async def execute_trade(
         if interaction_id is not None:
             await record_idempotency_key(conn, interaction_id)
         await assert_feature_enabled(conn, "trading.enabled", "trading")
-        await assert_market_open(conn)
 
         # Lock ordering: instrument before account.
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -726,6 +725,7 @@ async def execute_trade(
             instrument = await cur.fetchone()
         if instrument is None or not instrument["is_active"]:
             raise UnknownInstrumentError(ticker)
+        await assert_market_open(conn, int(instrument["id"]))
         current_tick = await current_tick_index(conn)
         # Two halt states gate exposure-increasing trades: the circuit
         # breaker (F5.3) and the Plan-C T1 halt ahead of a scheduled
@@ -811,7 +811,7 @@ async def execute_trade(
                 )
         spread_cfg = {
             **await spread_config(conn),
-            **await session_config(conn),
+            **await instrument_session_cfg(conn, int(instrument["id"])),
             **await flow_config(conn),
         }
         half_spread = half_spread_for(instrument, current_tick, spread_cfg)
