@@ -1098,6 +1098,20 @@ injection audit. Gotcha from the smoke run: soak commits real state --
 leftover enabled agents on the shared test DB made other tests see 32
 phantom agents, so disable/die-stamp them after a scratch-less run.
 
+**NPC P4 done** (`/admin npc-list|npc-enable|npc-disable|npc-spawn`):
+`agent_report` gives the census (per-agent equity, funded = ledger
+NPC_STAKE+STARTING_GRANT, P&L = equity - funded, open positions, age);
+`set_agent_enabled` toggles by label-or-user_id but refuses dead agents
+(died_at_tick is permadeath, not a state to toggle back); `npc-spawn`
+takes count<=10, stake override, and optional `quote_ticker` pinning.
+No auto-spawn/replenishment loop -- the soak (360 ticks, 32 agents)
+showed zero deaths and only ~0.03% supply drift, so population decay
+is too slow to need a cap loop yet; manual spawns are the bounded
+lever. Soak result for the record: money supply flat vs no-NPC
+baseline, Gini 0.005->0.008 as P&L diverged, LP resting depth persisted
+(~48 open orders between active ticks), all 4 shorters held real
+margin shorts, FAUCET-leg audit clean (NPC_STAKE + STARTING_GRANT only).
+
 **Public tape done** (`migrations/0055_feed.sql`, `src/stockbot/feed`,
 `src/stockbot/bot/feed.py`, `/feed-setup` `/feed-remove`): a per-guild
 market-drama channel. `feed_channels` binds one channel per guild;

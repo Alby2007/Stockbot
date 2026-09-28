@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from dataclasses import dataclass
+from datetime import datetime
 
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
@@ -255,3 +257,98 @@ async def mark_dead_agents(conn: AsyncConnection, tick_index: int) -> int:
                 )
                 dead += cur.rowcount
     return dead
+
+
+# --- Admin surface (P4) -------------------------------------------------
+# Read-only telemetry and the two controls the plan allows: per-agent
+# enable/disable and bounded manual spawns. Dead agents stay dead --
+# "replenishment" is a new spawn, never a revive.
+
+
+@dataclass(frozen=True)
+class AgentReport:
+    user_id: int
+    archetype: str
+    label: str
+    enabled: bool
+    died_at_tick: int | None
+    quote_ticker: str | None
+    created_at: datetime
+    equity_minor: int
+    funded_minor: int  # NPC_STAKE + STARTING_GRANT credited to this account
+    open_positions: int
+
+    @property
+    def pnl_minor(self) -> int:
+        return self.equity_minor - self.funded_minor
+
+
+async def agent_report(conn: AsyncConnection) -> list[AgentReport]:
+    """Census + per-agent P&L for `/admin npc-list`. Net worth comes from
+    the same user-scoped path the runner's death check uses; funded is
+    the ledger's own record of spawn money (STARTING_GRANT + NPC_STAKE),
+    so P&L is equity minus exactly what ops put in."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT n.user_id, n.archetype, n.label, n.enabled,
+                   n.died_at_tick, n.quote_ticker, n.created_at,
+                   a.id AS account_id,
+                   (SELECT COUNT(*) FROM positions p
+                     WHERE p.user_id = n.user_id AND p.quantity <> 0)
+                       AS open_positions
+            FROM npc_agents n
+            JOIN accounts a ON a.user_id = n.user_id AND a.kind = 'USER'
+            ORDER BY n.user_id
+            """
+        )
+        rows = await cur.fetchall()
+    out: list[AgentReport] = []
+    for r in rows:
+        uid = int(r["user_id"])
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM ledger_entries "
+                "WHERE account_id = %s AND reason IN ('NPC_STAKE', 'STARTING_GRANT')",
+                (int(r["account_id"]),),
+            )
+            funded = int((await cur.fetchone() or (0,))[0])
+        out.append(
+            AgentReport(
+                user_id=uid,
+                archetype=str(r["archetype"]),
+                label=str(r["label"]),
+                enabled=bool(r["enabled"]),
+                died_at_tick=r["died_at_tick"],
+                quote_ticker=r["quote_ticker"],
+                created_at=r["created_at"],
+                equity_minor=await net_worth_minor(conn, uid),
+                funded_minor=funded,
+                open_positions=int(r["open_positions"]),
+            )
+        )
+    return out
+
+
+async def set_agent_enabled(conn: AsyncConnection, *, label: str, enabled: bool) -> NpcAgent | None:
+    """Flip one agent's enabled flag by label (or numeric user_id).
+    Dead agents can't be re-enabled -- died_at_tick is the permadeath
+    stamp, not a state to toggle back."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            UPDATE npc_agents SET enabled = %s
+            WHERE died_at_tick IS NULL AND (label = %s OR user_id::text = %s)
+            RETURNING user_id, archetype, label, quote_ticker
+            """,
+            (enabled, label, label),
+        )
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return NpcAgent(
+        user_id=int(row["user_id"]),
+        archetype=str(row["archetype"]),
+        label=str(row["label"]),
+        quote_ticker=row["quote_ticker"],
+    )

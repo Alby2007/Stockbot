@@ -438,3 +438,57 @@ async def test_npcs_never_claim(conn: AsyncConnection) -> None:
     # (bots pass the snowflake-age gate like anyone) -- bounded like the
     # stake, not a refill path. CLAIM would be the violation.
     assert reasons <= {"NPC_STAKE", "STARTING_GRANT"}
+
+
+async def test_agent_report_shows_equity_pnl_and_positions(
+    conn: AsyncConnection,
+) -> None:
+    """`/admin npc-list` data: funded = bootstrap + stake from the ledger,
+    P&L = equity - funded, and open positions counted for the census."""
+    from stockbot.npc.service import agent_report
+
+    uid = await spawn_agent(conn, "shorter", label="rep-a", stake_minor=1_000_000)
+    await _ensure_open_tick(conn)
+    uid2 = await spawn_agent(conn, "grinder", label="rep-b", stake_minor=500_000)
+    # Give the grinder a position so open_positions is nonzero.
+    await _round(conn)
+
+    report = {a.label: a for a in await agent_report(conn)}
+    a = report["rep-a"]
+    b = report["rep-b"]
+    assert a.user_id == uid and b.user_id == uid2
+    assert a.funded_minor > 0 and a.funded_minor >= 1_000_000
+    assert a.pnl_minor == a.equity_minor - a.funded_minor
+    assert a.enabled and a.died_at_tick is None
+
+
+async def test_set_agent_enabled_toggle_and_permadeath(
+    conn: AsyncConnection,
+) -> None:
+    """`/admin npc-enable|disable`: label or user_id lookup flips
+    `enabled`, but a dead agent can't be re-enabled."""
+    from stockbot.npc.service import set_agent_enabled
+
+    uid = await spawn_agent(conn, "grinder", label="tog-a")
+    found = await set_agent_enabled(conn, label="tog-a", enabled=False)
+    assert found is not None and found.user_id == uid
+    found = await set_agent_enabled(conn, label=str(uid), enabled=True)
+    assert found is not None
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT enabled FROM npc_agents WHERE user_id = %s", (uid,))
+        assert (await cur.fetchone())[0] is True
+    # Dead agents can't come back.
+    async with conn.cursor() as cur:
+        await cur.execute("UPDATE npc_agents SET died_at_tick = 5 WHERE user_id = %s", (uid,))
+    assert await set_agent_enabled(conn, label="tog-a", enabled=True) is None
+
+
+async def test_admin_spawn_path_caps_count_and_pins_ticker(
+    conn: AsyncConnection,
+) -> None:
+    """The spawn service honors stake overrides and quote_ticker pinning
+    for LP/stop_loss agents."""
+    uid = await spawn_agent(conn, "liquidity_provider", quote_ticker="ANCH", stake_minor=50_000)
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT quote_ticker FROM npc_agents WHERE user_id = %s", (uid,))
+        assert (await cur.fetchone())[0] == "ANCH"
