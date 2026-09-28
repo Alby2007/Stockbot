@@ -1178,3 +1178,35 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   counts are tuned by `quests.daily_count`/`weekly_count`. Kill-switch
   note for tests: apply_tick runs the rotation itself at tick 0, so
   quest tests zero `quests.*_count` config before driving real actions.
+- **Options** (0052, Phase O2): European cash-settled CALL/PUT rows in
+  `option_positions` — premium+markup flows user→MARKET_MAKER, fee→SINK,
+  intrinsic settles at `expiry_tick`. Pricing is model-consistent:
+  `options.pricing.total_variance` = OU stationary variance
+  `(σ²/2κ)(1-e^{-2κT})` + `fundamental_sigma²·T`, blended from the EWMA
+  vol back toward seed via `vol.rho` — NOT `σ_eff√T` (that formula
+  overprices NORT 5-7x; `tests/test_options_pricing.py` pins the C1
+  table). `bs_price`/`bs_delta` are zero-rate Black with intrinsic at
+  T<=0. `apply_tick` calls `settle_expired_options` + `reprice_open_options`
+  in BOTH branches — a contract expiring on a closed tick settles at the
+  frozen pre-gap mark, and neither is gated on `options.enabled` (the
+  kill switch blocks new buys only; sells and settlements always run).
+  MM insolvency never aborts a tick: intrinsic is paid in full even when
+  MARKET_MAKER is negative — it's a SYSTEM account, so the payout runs
+  deeper negative like dividends/the ADL backstop, no balance clamp.
+  OI cap: total open quantity
+  per instrument must stay under `options.max_oi_frac` × liquidity —
+  enforced at buy time with the instrument row locked. Strikes are
+  freeform inside `options.strike_min_frac`/`strike_max_frac` × spot
+  (junk-strike spam guard); the UI only offers the
+  `EXPIRY_CHOICES_DAYS = (3,7,14,30)` constant. `hedge_frac` seeds 0 —
+  Phase O3 adds
+  the MM's delta flow back through `apply_trade_impact` with a per-user
+  OI sub-cap; do NOT enable it without that sub-cap or the impact is
+  unbounded. Long options count toward net worth (`_NET_WORTH_EXPR` adds
+  `mark_minor*quantity`, season_id NULL for main / matching for league &
+  sandbox) but are deliberately absent from `compute_health` equity —
+  not collateral. `delist_instrument` settles opens at the final mark's
+  intrinsic (same MM clamp) and reports `options_settled`. Sell-back
+  markdown 0.12 > markup 0.10 so buy→sell round trips always lose ~20%
+  — manipulation and wash hedges pay rent. Idempotent: settlement is a
+  status flip on locked rows, buys key on `interaction_id`.

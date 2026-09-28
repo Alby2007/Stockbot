@@ -49,6 +49,7 @@ from stockbot.bot.autocomplete import (
     admin_order_autocomplete,
     alert_autocomplete,
     equipped_item_autocomplete,
+    option_autocomplete,
     order_autocomplete,
     quest_reroll_autocomplete,
     sector_autocomplete,
@@ -104,6 +105,14 @@ from stockbot.market.data import (
     session_parts,
 )
 from stockbot.market.engine import TICKS_PER_DAY, ticks_until_close, ticks_until_open
+from stockbot.options.service import (
+    EXPIRY_CHOICES_DAYS,
+    buy_option,
+    list_open_options,
+    option_chain,
+    quote_option_premium,
+    sell_option,
+)
 from stockbot.orders.service import (
     cancel_order,
     list_open_orders,
@@ -2757,6 +2766,228 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
 
     tree.add_command(sandbox_group)
+
+    options_group = app_commands.Group(
+        name="options",
+        description="Cash-settled calls/puts vs the market maker",
+    )
+
+    async def _options_scope(
+        conn: AsyncConnection,
+        interaction: discord.Interaction,
+        league: bool,
+        sandbox: bool,
+    ) -> int | None | str:
+        """Three-way account resolution shared by /options subcommands:
+        sandbox > league > main. Returns the season_id to scope to, or a
+        user-facing error string (already-safe to send verbatim)."""
+        if sandbox:
+            entry = await get_sandbox_entry(conn, interaction.user.id)
+            if entry is None:
+                return "You don't have a sandbox running. `/sandbox open` first."
+            return entry[0]
+        if league:
+            entry = await get_active_entry(conn, interaction.user.id)
+            if entry is None:
+                return "You're not entered in an active season. `/league join` first."
+            return entry[0]
+        return None
+
+    @options_group.command(
+        name="chain", description="Premium grid for an instrument's options"
+    )
+    @app_commands.describe(ticker="Instrument ticker")
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
+    async def options_chain(interaction: discord.Interaction, ticker: str) -> None:
+        async with db.connection() as conn:
+            try:
+                chain = await option_chain(conn, ticker)
+            except TradingError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        spot = chain["spot"]
+        strikes = chain["strikes"]
+        days = EXPIRY_CHOICES_DAYS
+        header = f"{'K':>8} " + " ".join(
+            f"{f'{d}d prem':>8} {'Δ':>5}" for d in days
+        )
+        lines = [f"spot {format_price(spot)}", header]
+        for side in ("CALL", "PUT"):
+            lines.append(f"{side.lower()}s:")
+            for k in strikes:
+                row = f"{format_price(k):>8} "
+                for d in days:
+                    c = chain["cells"][side][(d, k)]
+                    row += f"{format_price(c['premium']):>8} {c['delta']:>5.2f} "
+                lines.append(row)
+        embed = discord.Embed(title=f"Options chain — {chain['ticker']}")
+        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        await interaction.response.send_message(embed=embed)
+
+    @options_group.command(
+        name="buy", description="Buy calls or puts from the market maker"
+    )
+    @app_commands.describe(
+        ticker="Instrument ticker",
+        side="call or put",
+        strike="Strike price in dollars",
+        expiry="Days to expiry",
+        quantity="Number of contracts",
+        dollars="Spend ~this many dollars of premium instead of a count",
+        league="Buy with your season league stake",
+        sandbox="Buy with your sandbox stake",
+    )
+    @app_commands.choices(
+        side=[
+            app_commands.Choice(name="call", value="CALL"),
+            app_commands.Choice(name="put", value="PUT"),
+        ]
+    )
+    @app_commands.choices(
+        expiry=[
+            app_commands.Choice(name=f"{d}d", value=d) for d in EXPIRY_CHOICES_DAYS
+        ]
+    )
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
+    async def options_buy(
+        interaction: discord.Interaction,
+        ticker: str,
+        side: str,
+        strike: app_commands.Range[float, 0.0001, 999_999_999_999.0],
+        expiry: int,
+        quantity: app_commands.Range[int, 1, 1_000_000] | None = None,
+        dollars: app_commands.Range[float, 0.01, 1_000_000_000.0] | None = None,
+        league: bool = False,
+        sandbox: bool = False,
+    ) -> None:
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            scope = await _options_scope(conn, interaction, league, sandbox)
+            if isinstance(scope, str):
+                await interaction.response.send_message(scope, ephemeral=True)
+                return
+            if (quantity is not None) == (dollars is not None):
+                await interaction.response.send_message(
+                    "Give exactly one of `quantity` or `dollars`.", ephemeral=True
+                )
+                return
+            qty = quantity
+            try:
+                if qty is None:
+                    assert dollars is not None
+                    premium_each = await quote_option_premium(
+                        conn, ticker, side, Decimal(str(strike)), expiry
+                    )
+                    qty = int(Decimal(str(dollars)) * 100) // premium_each
+                    if qty < 1:
+                        await interaction.response.send_message(
+                            f"One contract costs ~{format_money(premium_each)} — "
+                            f"`dollars:{dollars}` can't cover one.",
+                            ephemeral=True,
+                        )
+                        return
+                result = await buy_option(
+                    conn,
+                    user_id=interaction.user.id,
+                    ticker=ticker,
+                    side=side,
+                    strike=Decimal(str(strike)),
+                    expiry_days=expiry,
+                    quantity=qty,
+                    interaction_id=str(interaction.id),
+                    season_id=scope,
+                )
+            except (TradingError, MarginError, ValueError) as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        breakeven = (
+            float(result.strike) + result.premium_minor / 100
+            if result.side == "CALL"
+            else float(result.strike) - result.premium_minor / 100
+        )
+        await interaction.response.send_message(
+            f"Bought **{result.quantity:,}** {result.ticker} "
+            f"{result.side.lower()} **{format_price(result.strike)}** "
+            f"exp t{result.expiry_tick} — premium {format_price(result.premium_minor)}"
+            f"/sh × {result.quantity:,} = **{format_money(result.total_cost_minor)}** "
+            f"(fee {format_money(result.fee_minor)}). "
+            f"Δ {result.delta:+.2f} · breakeven {format_price(breakeven)}"
+            + _welcome_suffix(bootstrap)
+        )
+
+    @options_group.command(
+        name="positions", description="Your open option positions"
+    )
+    @app_commands.describe(
+        league="Show league-scoped options",
+        sandbox="Show sandbox-scoped options",
+    )
+    async def options_positions(
+        interaction: discord.Interaction,
+        league: bool = False,
+        sandbox: bool = False,
+    ) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            scope = await _options_scope(conn, interaction, league, sandbox)
+            if isinstance(scope, str):
+                await interaction.response.send_message(scope, ephemeral=True)
+                return
+            rows = await list_open_options(conn, interaction.user.id, scope)
+            tick = await current_tick(conn)
+        if not rows:
+            await interaction.response.send_message(
+                "No open options — `/options chain` shows the grid, "
+                "`/options buy` opens one.",
+                ephemeral=True,
+            )
+            return
+        lines = []
+        for r in rows:
+            days_left = max(0, int(r["expiry_tick"]) - tick) / TICKS_PER_DAY
+            pnl = (
+                (int(r["mark_minor"]) - int(r["premium_minor"]))
+                / int(r["premium_minor"])
+            )
+            lines.append(
+                f"#{r['id']:<4} {r['ticker']:<5} {r['side']:<4} "
+                f"K={format_price(r['strike']):>9} {days_left:>5.1f}d "
+                f"×{int(r['quantity']):>5}  "
+                f"{format_money(r['mark_minor'])}/sh ({format_pct(pnl)})"
+            )
+        embed = discord.Embed(
+            title=f"{interaction.user.display_name}'s options"
+        )
+        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        await interaction.response.send_message(embed=embed)
+
+    @options_group.command(
+        name="sell", description="Sell an open option back to the market maker"
+    )
+    @app_commands.describe(option="Open option position id")
+    @app_commands.autocomplete(option=option_autocomplete)
+    async def options_sell(
+        interaction: discord.Interaction, option: int
+    ) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            try:
+                result = await sell_option(
+                    conn, user_id=interaction.user.id, option_id=option
+                )
+            except (TradingError, MarginError, ValueError) as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        pnl = result.payout_minor - result.premium_paid_minor
+        await interaction.response.send_message(
+            f"Sold **{result.quantity:,}** {result.ticker} "
+            f"{result.side.lower()} #{result.option_id} for "
+            f"**{format_money(result.payout_minor)}** "
+            f"(paid {format_money(result.premium_paid_minor)}, "
+            f"{format_money(abs(pnl))} {'gain' if pnl >= 0 else 'loss'})."
+        )
+
+    tree.add_command(options_group)
 
     # default_permissions hides the whole group from the slash picker
     # for non-admins (N4.5); _is_admin stays as the runtime gate --

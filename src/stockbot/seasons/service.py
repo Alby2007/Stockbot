@@ -403,6 +403,15 @@ _SHORT_VALUE_SUBQUERY = """
     GROUP BY bs.season_id, bs.user_id
 """
 
+# Open options mark-to-model per (season, user); the same join serves
+# league equity and /sandbox status.
+_OPTION_VALUE_SUBQUERY = """
+    SELECT o.season_id, o.user_id, SUM(o.mark_minor * o.quantity) AS option_value_minor
+    FROM option_positions o
+    WHERE o.status = 'OPEN' AND o.season_id IS NOT NULL
+    GROUP BY o.season_id, o.user_id
+"""
+
 
 async def league_equity_minor(conn: AsyncConnection, season_id: int, user_id: int) -> int:
     """League account cash + mark value of season-scoped positions and shorts."""
@@ -411,6 +420,7 @@ async def league_equity_minor(conn: AsyncConnection, season_id: int, user_id: in
             f"""
             SELECT a.balance + COALESCE(pos.value_minor, 0)
                           + COALESCE(sh.short_value_minor, 0)
+                          + COALESCE(opt.option_value_minor, 0)
             FROM season_entries e
             JOIN accounts a ON a.id = e.account_id
             LEFT JOIN (
@@ -425,6 +435,8 @@ async def league_equity_minor(conn: AsyncConnection, season_id: int, user_id: in
             ) pos ON pos.user_id = e.user_id
             LEFT JOIN ({_SHORT_VALUE_SUBQUERY}) sh
                    ON sh.season_id = e.season_id AND sh.user_id = e.user_id
+            LEFT JOIN ({_OPTION_VALUE_SUBQUERY}) opt
+                   ON opt.season_id = e.season_id AND opt.user_id = e.user_id
             WHERE e.season_id = %s AND e.user_id = %s
             """,
             (season_id, season_id, user_id),
@@ -475,6 +487,7 @@ async def on_tick(
                 SELECT e.season_id, e.user_id, %s, %s,
                        a.balance + COALESCE(pos.value_minor, 0)
                              + COALESCE(sh.short_value_minor, 0)
+                             + COALESCE(opt.option_value_minor, 0)
                 FROM season_entries e
                 JOIN seasons s ON s.id = e.season_id
                 JOIN accounts a ON a.id = e.account_id
@@ -491,6 +504,8 @@ async def on_tick(
                 ) pos ON pos.season_id = e.season_id AND pos.user_id = e.user_id
                 LEFT JOIN ({_SHORT_VALUE_SUBQUERY}) sh
                        ON sh.season_id = e.season_id AND sh.user_id = e.user_id
+                LEFT JOIN ({_OPTION_VALUE_SUBQUERY}) opt
+                       ON opt.season_id = e.season_id AND opt.user_id = e.user_id
                 WHERE s.status = 'ACTIVE'
                   AND s.sandbox_user_id IS NULL
                   AND s.start_tick <= %s AND %s <= s.end_tick
@@ -520,7 +535,8 @@ async def standings(conn: AsyncConnection, season_id: int) -> list[Standing]:
             f"""
             SELECT e.user_id, e.trades_count, e.final_score, e.final_rank, e.prize_minor,
                    a.balance + COALESCE(pos.value_minor, 0)
-                         + COALESCE(sh.short_value_minor, 0) AS equity_minor
+                         + COALESCE(sh.short_value_minor, 0)
+                         + COALESCE(opt.option_value_minor, 0) AS equity_minor
             FROM season_entries e
             JOIN accounts a ON a.id = e.account_id
             LEFT JOIN (
@@ -536,10 +552,13 @@ async def standings(conn: AsyncConnection, season_id: int) -> list[Standing]:
             ) pos ON pos.user_id = e.user_id
             LEFT JOIN ({_SHORT_VALUE_SUBQUERY}) sh
                    ON sh.season_id = e.season_id AND sh.user_id = e.user_id
+            LEFT JOIN ({_OPTION_VALUE_SUBQUERY}) opt
+                   ON opt.season_id = e.season_id AND opt.user_id = e.user_id
             WHERE e.season_id = %s
             ORDER BY COALESCE(e.final_rank, 2147483647),
                      a.balance + COALESCE(pos.value_minor, 0)
-                           + COALESCE(sh.short_value_minor, 0) DESC
+                           + COALESCE(sh.short_value_minor, 0)
+                           + COALESCE(opt.option_value_minor, 0) DESC
             """,
             (season_id, season_id),
         )

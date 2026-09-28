@@ -21,6 +21,7 @@ from stockbot.observability import (
     run_periodic_audit,
     write_heartbeat,
 )
+from stockbot.options import service as options
 from stockbot.orders import service as orders
 from stockbot.quests import service as quests
 from stockbot.seasons import service as seasons
@@ -101,6 +102,13 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             await snapshot_net_worth_if_due(conn, tick_index)
             await evaluate_badges(conn, tick_index)
             await ipo.settle_due(conn, tick_index)
+            # Options settle on closed ticks too (C5): the mark is frozen
+            # at the last open print, so an overnight expiry settles "at
+            # the close" rather than after the gap. ticks_left is
+            # CALENDAR ticks -- the gap tick steps with dt=closed_ticks,
+            # so total variance per cycle is preserved.
+            opt_settled = await options.settle_expired_options(conn, tick_index)
+            await options.reprice_open_options(conn, tick_index)
             # Quest rotation can land on a closed tick, and alert/IPO
             # actions aren't session-gated -- sweep here too.
             await quests.on_tick(conn, tick_index)
@@ -116,8 +124,9 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             )
             log.info(
                 "tick=%d phase=CLOSED steps=0 events=0 crosses=0 mm_fills=0 "
-                "stops=0 kos=0 liqs=0 quests=%d ms=%.1f",
+                "stops=0 kos=0 liqs=0 opts=%d quests=%d ms=%.1f",
                 tick_index,
+                opt_settled,
                 quest_fires,
                 duration_ms,
             )
@@ -610,6 +619,14 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # stop contributing to equity.
         kos = await shorts.sweep_knockouts(conn, tick_index)
 
+        # Options: settle expiries at this tick's mark and reprice open
+        # marks to the new model values. Before match_orders so settlement
+        # uses the tick's own mark (same semantics as KOs); NOT gated on
+        # options.enabled -- the kill switch stops new exposure, never
+        # strands existing contracts.
+        opt_settled = await options.settle_expired_options(conn, tick_index)
+        await options.reprice_open_options(conn, tick_index)
+
         # Resting limit orders: fill any whose limit the new marks satisfy.
         # Before the margin sweep so a fill's impact and equity change land
         # in this tick's margin state, not next tick's. Skipped entirely when
@@ -711,7 +728,8 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
 
     log.info(
         "tick=%d phase=OPEN steps=%d events=%d crosses=%d mm_fills=%d "
-        "stops=%d kos=%d recalls=%d liqs=%d alerts=%d quests=%d auction=%d ms=%.1f",
+        "stops=%d kos=%d recalls=%d liqs=%d alerts=%d opts=%d quests=%d "
+        "auction=%d ms=%.1f",
         tick_index,
         len(results),
         stats.get("events_resolved", 0),
@@ -722,6 +740,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         recalls,
         liqs,
         alert_fires,
+        opt_settled,
         quest_fires,
         stats.get("auction_fills", 0),
         duration_ms,

@@ -13,6 +13,7 @@ Insert sites (all inside the event's own transaction):
     ipo/service.py        settle_due       -> IPO_SETTLED
     alerts/service.py     sweep_alerts     -> ALERT_TRIGGERED
     quests/service.py     sweep_completions -> QUEST_COMPLETED
+    options/service.py    settle_expired_options -> OPTION_SETTLED
 """
 
 from __future__ import annotations
@@ -184,6 +185,16 @@ def _fmt_quest_completed(items: list[dict[str, Any]]) -> str:
     return "Quest complete: " + "; ".join(parts)
 
 
+def _fmt_option_settled(items: list[dict[str, Any]]) -> str:
+    parts = [
+        f"{p['qty']:,} **{p['ticker']}** {p['side'].lower()} "
+        f"{format_price(p['strike'])} expired @ {format_price(p['settle_price'])}"
+        + (f" (+{format_money(p['payout'])})" if p["payout"] else "")
+        for p in items
+    ]
+    return "Option" + ("s" if len(items) > 1 else "") + " settled: " + "; ".join(parts)
+
+
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "LIQUIDATION": _fmt_liquidation,
     "MARGIN_CALL": _fmt_margin_call,
@@ -196,6 +207,7 @@ _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "IPO_SETTLED": _fmt_ipo_settled,
     "ALERT_TRIGGERED": _fmt_alert_triggered,
     "QUEST_COMPLETED": _fmt_quest_completed,
+    "OPTION_SETTLED": _fmt_option_settled,
 }
 
 

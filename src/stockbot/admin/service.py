@@ -176,6 +176,14 @@ CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "margin.warn_ratio": (0.0, 1e6),
     "order.max_fill_failures": (1, 1e6),
     "order.stop_cascade_max_iters": (1, 1e4),
+    "options.enabled": (0, 1),
+    "options.hedge_frac": (0.0, 4.0),
+    "options.max_oi_frac": (0.0, 10.0),
+    "options.min_premium_minor": (0.0, 1e6),
+    "options.premium_markup": (0.0, 10.0),
+    "options.sell_markdown": (0.0, 1.0),
+    "options.strike_max_frac": (1.0, 100.0),
+    "options.strike_min_frac": (0.01, 1.0),
     "orders.enabled": (0, 1),
     "quests.daily_count": (0, 10),
     "quests.enabled": (0, 1),
@@ -654,6 +662,7 @@ class DelistReport:
     positions_settled: int
     shorts_covered: int
     bounded_shorts_settled: int
+    options_settled: int
     orders_cancelled: int
     alerts_cancelled: int
     events_resolved: int
@@ -958,6 +967,56 @@ async def delist_instrument(conn: AsyncConnection, ticker: str) -> DelistReport:
                     (tick, mark, payout, int(bs["id"])),
                 )
 
+        # Open options settle at intrinsic against the final mark -- the
+        # same value settle_expired_options would pay at expiry. MM pays
+        # in full (SYSTEM accounts may go negative -- C3: no clamp on a
+        # contract the system promised to honour).
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT o.id, o.side, o.strike, o.quantity, a.id AS account_id
+                FROM option_positions o
+                JOIN accounts a ON a.user_id = o.user_id
+                  AND a.season_id IS NOT DISTINCT FROM o.season_id
+                  AND a.kind <> 'SYSTEM'
+                WHERE o.instrument_id = %s AND o.status = 'OPEN'
+                ORDER BY o.id
+                FOR UPDATE OF o
+                """,
+                (iid,),
+            )
+            open_opts = await cur.fetchall()
+        for opt in open_opts:
+            intrinsic = max(
+                Decimal("0"),
+                (mark - Decimal(opt["strike"]))
+                if opt["side"] == "CALL"
+                else (Decimal(opt["strike"]) - mark),
+            )
+            per_share_minor = int(
+                (intrinsic * 100).quantize(Decimal("1"), ROUND_HALF_UP)
+            )
+            payout = per_share_minor * int(opt["quantity"])
+            if payout > 0:
+                await post_transfer(
+                    conn,
+                    from_account_id=mm_id,
+                    to_account_id=int(opt["account_id"]),
+                    amount=payout,
+                    reason="OPTION_SETTLEMENT",
+                    memo=ticker,
+                )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE option_positions
+                    SET status = 'SETTLED', closed_tick = %s,
+                        settlement_minor = %s, mark_minor = %s
+                    WHERE id = %s
+                    """,
+                    (tick, per_share_minor, per_share_minor, int(opt["id"])),
+                )
+
         async with conn.cursor() as cur:
             await cur.execute(
                 """
@@ -980,6 +1039,7 @@ async def delist_instrument(conn: AsyncConnection, ticker: str) -> DelistReport:
         positions_settled=settled,
         shorts_covered=covered,
         bounded_shorts_settled=len(bshorts),
+        options_settled=len(open_opts),
         orders_cancelled=orders_cancelled,
         alerts_cancelled=alerts_cancelled,
         events_resolved=events_resolved,

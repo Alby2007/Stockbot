@@ -31,6 +31,7 @@ from stockbot.market.engine import TICKS_PER_DAY
 # column alias is wanted.
 _NET_WORTH_EXPR = """
     a.balance + COALESCE(pv.value_minor, 0) + COALESCE(bv.bshort_value, 0)
+        + COALESCE(ov.option_value, 0)
         - COALESCE(pv.accrued, 0) - COALESCE(pv.accrued_div, 0)
 """
 
@@ -51,6 +52,13 @@ _NET_WORTH_JOINS = """
         JOIN instruments i ON i.id = bs.instrument_id
         WHERE bs.user_id = a.user_id AND bs.season_id IS NULL AND bs.status = 'OPEN'
     ) bv ON TRUE
+    LEFT JOIN LATERAL (
+        -- Long options mark-to-model: net worth yes, margin equity no
+        -- (compute_health deliberately omits them -- C6).
+        SELECT SUM(o.mark_minor * o.quantity) AS option_value
+        FROM option_positions o
+        WHERE o.user_id = a.user_id AND o.season_id IS NULL AND o.status = 'OPEN'
+    ) ov ON TRUE
 """
 
 
