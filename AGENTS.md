@@ -1071,6 +1071,33 @@ expected-error catch); whale/yolo/shorter/LP/stop_loss land in P3.
 WORTH sits under `npc.death_balance_minor` with zero open positions --
 net worth, not cash, so a fully-invested agent isn't killed.
 
+**NPC P3 done** (`src/stockbot/npc/agents.py`, `soak.py`, migration
+`0058`): all six planned archetypes ported per-tick from the harness --
+whale/grinder/yolo share one buy-the-mark body differing only in
+balance fraction (5-20% / 5-15% / 50-95%); `shorter` covers held shorts
+at 0.5 else opens real-margin shorts at 30-80% of `compute_health`
+equity (spawn grants `margin_tier` free -- debiting the stake for it
+just moves bounded money internally); `liquidity_provider` prunes open
+quotes beyond 6 then posts a bid (and ask when holding) at
+`mark +- offset` where offset is floored at `half_spread_for(...) +
+npc.lp_min_spread` (0058 seeds 0.002, bounds-registered) so it can't be
+scalped inside the MM's own spread; `stop_loss` re-enters flat at 0.6
+then arms a 4-9% trailing SELL stop, reusing `quote_ticker` as its
+pinned name. `wash_trader`/`farmer` dropped per plan; NO archetype
+calls `claim_daily` -- stake-funded, P&L-sustained (the
+`test_npcs_never_claim` audit joins the debit leg to FAUCET to prove
+only NPC_STAKE + the universal one-time STARTING_GRANT reach bots).
+Actions return executed notional for the round budget; resting orders
+return 0 (depth isn't flow). `npc/soak.py` is the P3 exit harness --
+scratch-DB ONLY (`--database-url` is REQUIRED; pointing it at the suite
+DB was tried once and its committed agents/trades/config/regime drift
+poisoned a dozen unrelated tests):
+apply_tick + run_round per tick, reporting money supply, Gini,
+per-archetype alive/dead, resting-order depth, and a FAUCET-leg
+injection audit. Gotcha from the smoke run: soak commits real state --
+leftover enabled agents on the shared test DB made other tests see 32
+phantom agents, so disable/die-stamp them after a scratch-less run.
+
 **Public tape done** (`migrations/0055_feed.sql`, `src/stockbot/feed`,
 `src/stockbot/bot/feed.py`, `/feed-setup` `/feed-remove`): a per-guild
 market-drama channel. `feed_channels` binds one channel per guild;

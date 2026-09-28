@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from dataclasses import dataclass
 
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
@@ -27,13 +26,13 @@ from psycopg.rows import dict_row
 from stockbot.accounts.service import bootstrap_user
 from stockbot.ledger.errors import InsufficientFundsError
 from stockbot.ledger.service import (
-    get_balance,
     get_system_account_id,
     get_user_account_id,
     post_transfer,
 )
 from stockbot.margin.errors import MarginError
 from stockbot.market.data import open_market_ids
+from stockbot.npc.agents import ACTIONS, NpcAgent, RoundContext
 from stockbot.status.service import net_worth_minor
 from stockbot.trading.errors import TradingError
 
@@ -42,14 +41,6 @@ log = logging.getLogger("stockbot.npc")
 # user_ids far below any Discord snowflake (>= ~1.6e17) and below the
 # sim harness's 9e14 block so a leaked sim user can't collide either.
 NPC_USER_ID_BASE = 800_000_000_000_000
-
-
-@dataclass(frozen=True)
-class NpcAgent:
-    user_id: int
-    archetype: str
-    label: str
-    quote_ticker: str | None
 
 
 async def _config_float(conn: AsyncConnection, key: str, default: float) -> float:
@@ -152,70 +143,6 @@ async def load_agents(conn: AsyncConnection) -> list[NpcAgent]:
         ]
 
 
-async def _random_open_ticker(
-    conn: AsyncConnection, rng: random.Random, open_mids: set[int]
-) -> str | None:
-    """Venue-scoped pick (C10): a closed-venue ticker would only raise
-    MarketClosedError into the broad catch -- the same trap that once
-    made the harness silently place zero orders."""
-    if not open_mids:
-        return None
-    async with conn.cursor() as cur:
-        # ORDER BY: rng.choice() must be deterministic for a given seed.
-        await cur.execute(
-            """
-            SELECT ticker FROM instruments
-            WHERE is_active AND circuit_halted_until_tick IS NULL
-              AND market_id = ANY(%s)
-            ORDER BY ticker
-            """,
-            (sorted(open_mids),),
-        )
-        tickers = [row[0] for row in await cur.fetchall()]
-    return rng.choice(tickers) if tickers else None
-
-
-@dataclass
-class RoundContext:
-    conn: AsyncConnection
-    rng: random.Random
-    tick_index: int
-    open_mids: set[int]
-    budget_minor: int  # remaining npc.max_tick_notional this round
-    acted: int = 0
-    trades: int = 0
-
-
-async def _act_grinder(ctx: RoundContext, agent: NpcAgent) -> int:
-    """Slow accumulators: buy a fraction of balance on an open-venue
-    name. Ported per-tick from the harness's 0.3/day, 5-15% spend."""
-    ticker = await _random_open_ticker(ctx.conn, ctx.rng, ctx.open_mids)
-    if ticker is None:
-        return 0
-    account_id = await get_user_account_id(ctx.conn, agent.user_id)
-    balance = await get_balance(ctx.conn, account_id)
-    spend = int(balance * ctx.rng.uniform(0.05, 0.15))
-    if spend < 100:
-        return 0
-    from stockbot.trading.service import execute_trade  # lazy: avoids cycles
-
-    async with ctx.conn.cursor() as cur:
-        await cur.execute("SELECT quoted_price FROM instruments WHERE ticker = %s", (ticker,))
-        row = await cur.fetchone()
-    price_minor = int(float(row[0]) * 100) if row else 100
-    quantity = max(1, spend // max(price_minor, 1))
-    await execute_trade(
-        ctx.conn, user_id=agent.user_id, ticker=ticker, side="BUY", quantity=quantity
-    )
-    return min(spend, quantity * price_minor)
-
-
-# Archetype dispatch -- P2 ships grinder only; P3 ports the rest.
-_ACTIONS = {
-    "grinder": _act_grinder,
-}
-
-
 async def run_round(
     conn: AsyncConnection,
     master_seed: str,
@@ -249,6 +176,7 @@ async def run_round(
         open_mids = await open_market_ids(conn, tick_index)
         action_prob = await _config_float(conn, "npc.action_prob_per_tick", 0.002)
         budget_minor = int((await _config_float(conn, "npc.max_tick_notional", 25_000.0)) * 100)
+    acted = 0
     ctx = RoundContext(
         conn=conn,
         rng=random.Random(f"{master_seed}|npc-round|{tick_index}"),
@@ -266,7 +194,7 @@ async def run_round(
         delay = ctx.rng.uniform(0, interval_seconds * 0.75) if sleep else 0.0
         if delay > 0:
             await asyncio.sleep(delay)
-        action = _ACTIONS.get(agent.archetype)
+        action = ACTIONS.get(agent.archetype)
         if action is None:
             continue
         act_ctx = RoundContext(
@@ -285,12 +213,11 @@ async def run_round(
             log.debug("npc %s (%s) skipped: %s", agent.user_id, agent.archetype, exc)
             notional = 0
         if notional > 0:
-            ctx.acted += 1
-            ctx.trades += 1
+            acted += 1
             ctx.budget_minor -= notional
     async with conn.transaction():
         dead = await mark_dead_agents(conn, tick_index)
-    return {"acted": ctx.acted, "agents": len(agents), "dead": dead}
+    return {"acted": acted, "agents": len(agents), "dead": dead}
 
 
 async def mark_dead_agents(conn: AsyncConnection, tick_index: int) -> int:

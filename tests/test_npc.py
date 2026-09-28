@@ -234,10 +234,20 @@ async def test_spawn_agent_flag_stake_and_row(conn: AsyncConnection) -> None:
         row = await cur.fetchone()
         assert row[0] == "grinder" and row[1] is True and row[2] is None
         # The one-time NPC_STAKE grant, FAUCET -> agent, sums to zero.
-        await cur.execute("SELECT SUM(amount) FROM ledger_entries WHERE reason = 'NPC_STAKE'")
-        assert int((await cur.fetchone())[0]) == 0
-        await cur.execute("SELECT COUNT(*) FROM ledger_entries WHERE reason = 'NPC_STAKE'")
-        assert (await cur.fetchone())[0] == 2
+        # Scoped to this transfer: committed soak-run entries also exist.
+        await cur.execute(
+            """
+            SELECT SUM(e.amount), COUNT(*)
+            FROM ledger_entries e
+            WHERE e.reason = 'NPC_STAKE' AND e.transfer_id IN (
+                SELECT e2.transfer_id FROM ledger_entries e2
+                JOIN accounts a ON a.id = e2.account_id AND a.user_id = %s
+            )
+            """,
+            (uid,),
+        )
+        total, count = await cur.fetchone()
+        assert int(total) == 0 and int(count) == 2
     account_id = await get_user_account_id(conn, uid)
     # bootstrap_user's human starting grant applies too -- the NPC gets
     # grant + stake, both bounded one-time flows.
@@ -319,3 +329,112 @@ async def test_npc_enabled_kill_switch(conn: AsyncConnection) -> None:
     assert await npc_enabled(conn) is False
     await _set_config(conn, "npc.enabled", 1)
     assert await npc_enabled(conn) is True
+
+
+# ---- P3: archetype port ----
+
+
+async def _round(conn: AsyncConnection, seed: str = "p3", prob: float = 1) -> dict[str, int]:
+    tick = await _ensure_open_tick(conn)
+    await _set_config(conn, "npc.action_prob_per_tick", prob)
+    return await run_round(conn, seed, tick_index=tick, sleep=False)
+
+
+async def test_shorter_opens_a_margin_short(conn: AsyncConnection) -> None:
+    uid = await spawn_agent(conn, "shorter", stake_minor=1_000_000)
+    stats = await _round(conn)
+    assert stats["acted"] >= 0  # shorter may no-op on the cover fork
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT COALESCE(SUM(p.quantity), 0) FROM positions p WHERE p.user_id = %s",
+            (uid,),
+        )
+        qty = int((await cur.fetchone())[0])
+    # Fresh agent has no shorts to cover -- the open branch must fire.
+    assert qty < 0
+
+
+async def test_yolo_spends_most_of_balance(conn: AsyncConnection) -> None:
+    uid = await spawn_agent(conn, "yolo", stake_minor=1_000_000)
+    account_id = await get_user_account_id(conn, uid)
+    before = await get_balance(conn, account_id)
+    stats = await _round(conn)
+    assert stats["acted"] == 1
+    after = await get_balance(conn, account_id)
+    # 50-95% of cash went into stock.
+    assert after <= before * 0.6
+
+
+async def test_liquidity_provider_leaves_resting_quotes(conn: AsyncConnection) -> None:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT ticker FROM instruments WHERE is_active AND kind = 'STOCK' "
+            "AND market_id = 1 ORDER BY id LIMIT 1"
+        )
+        ticker = (await cur.fetchone())[0]
+    uid = await spawn_agent(conn, "liquidity_provider", quote_ticker=ticker, stake_minor=1_000_000)
+    await _round(conn)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT o.side, o.limit_price, i.quoted_price
+            FROM orders o JOIN instruments i ON i.id = o.instrument_id
+            WHERE o.user_id = %s AND o.status = 'OPEN'
+            """,
+            (uid,),
+        )
+        rows = await cur.fetchall()
+    # Bid below the mark -- resting depth persists between active ticks.
+    assert len(rows) >= 1
+    bid = next(r for r in rows if r[0] == "BUY")
+    assert float(bid[1]) < float(bid[2])
+
+
+async def test_stop_loss_arms_a_stop(conn: AsyncConnection) -> None:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT ticker FROM instruments WHERE is_active AND kind = 'STOCK' "
+            "AND market_id = 1 ORDER BY id LIMIT 1"
+        )
+        ticker = (await cur.fetchone())[0]
+    uid = await spawn_agent(conn, "stop_loss", quote_ticker=ticker, stake_minor=1_000_000)
+    # The re-entry fork is a 0.6 roll -- run several rounds so at least
+    # one lands the buy + stop-arm sequence.
+    for i in range(10):
+        await _round(conn, seed=f"stop-{i}")
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT COUNT(*) FROM orders WHERE user_id = %s "
+                "AND order_type <> 'LIMIT' AND status = 'OPEN'",
+                (uid,),
+            )
+            if int((await cur.fetchone())[0]) > 0:
+                return
+    pytest.fail("stop_loss never re-entered across 10 rounds")
+
+
+async def test_npcs_never_claim(conn: AsyncConnection) -> None:
+    """The bounded-injection invariant: positive ledger flows to bot
+    accounts are NPC_STAKE only -- no CLAIM refill path exists."""
+    await spawn_agent(conn, "grinder", stake_minor=1_000_000)
+    await spawn_agent(conn, "whale", stake_minor=1_000_000)
+    await _round(conn)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT e.reason FROM ledger_entries e
+            JOIN accounts a ON a.id = e.account_id
+            JOIN users u ON u.id = a.user_id AND u.is_bot
+            JOIN ledger_entries f
+              ON f.transfer_id = e.transfer_id AND f.amount < 0
+            JOIN accounts fa
+              ON fa.id = f.account_id AND fa.system_name = 'FAUCET'
+            WHERE e.amount > 0
+            GROUP BY e.reason
+            """
+        )
+        reasons = {r[0] for r in await cur.fetchall()}
+    # STARTING_GRANT is the same one-time bootstrap every account gets
+    # (bots pass the snowflake-age gate like anyone) -- bounded like the
+    # stake, not a refill path. CLAIM would be the violation.
+    assert reasons <= {"NPC_STAKE", "STARTING_GRANT"}

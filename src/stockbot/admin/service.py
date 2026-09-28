@@ -234,6 +234,7 @@ CONFIG_BOUNDS: dict[str, tuple[float, float]] = {
     "npc.action_prob_per_tick": (0.0, 1.0),
     "npc.death_balance_minor": (0.0, 1e15),
     "npc.enabled": (0, 1),
+    "npc.lp_min_spread": (0.0, 1.0),
     "npc.max_tick_notional": (0.0, 1e15),  # dollars -- aggregate flow cap
     "npc.spawn_budget_minor_per_day": (0.0, 1e15),
     "npc.stake_minor": (0.0, 1e15),
