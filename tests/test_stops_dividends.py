@@ -72,9 +72,7 @@ async def _illiquid_ticker(conn: AsyncConnection) -> str:
 
 async def _quoted(conn: AsyncConnection, ticker: str) -> Decimal:
     async with conn.cursor() as cur:
-        await cur.execute(
-            "SELECT quoted_price FROM instruments WHERE ticker = %s", (ticker,)
-        )
+        await cur.execute("SELECT quoted_price FROM instruments WHERE ticker = %s", (ticker,))
         row = await cur.fetchone()
         assert row is not None
         return Decimal(row[0])
@@ -255,14 +253,12 @@ async def test_stop_cascade_is_bounded(conn: AsyncConnection) -> None:
     """A stop fill's mark move triggers the next stop -- the cascade loop
     catches it, bounded by order.stop_cascade_max_iters."""
     async with conn.cursor() as cur:
-        await cur.execute(
-            "UPDATE config SET value = 1 WHERE key = 'order.stop_cascade_max_iters'"
-        )
+        await cur.execute("UPDATE config SET value = 1 WHERE key = 'order.stop_cascade_max_iters'")
         # The participation cap binds on effective liquidity now -- pin adv
-        # at the reference ratio (adv_mult = 1) so the full-cap sizing below
-        # still fits in one fill.
+        # at the reference ratio (adv_mult = 1) and clear committed
+        # vol-regime drift so the full-cap sizing below still fits in one fill.
         await cur.execute(
-            "UPDATE instruments SET adv = liquidity * 2.5e-8 "
+            "UPDATE instruments SET adv = liquidity * 2.5e-8, vol_state = 1.0 "
             "WHERE ticker = ("
             "    SELECT ticker FROM instruments "
             "    WHERE is_active AND kind != 'INDEX' "
@@ -305,9 +301,7 @@ async def test_stop_cascade_is_bounded(conn: AsyncConnection) -> None:
         side="SELL",
         quantity=10,
         limit_price=None,
-        stop_price=(mark * Decimal(str(1 - expected_drop * 0.5))).quantize(
-            Decimal("0.000001")
-        ),
+        stop_price=(mark * Decimal(str(1 - expected_drop * 0.5))).quantize(Decimal("0.000001")),
         allow_short=True,
     )
 
@@ -522,8 +516,7 @@ async def test_bounded_shorts_ignore_dividends(conn: AsyncConnection) -> None:
     assert await get_balance(conn, account_id) == cash_before
     async with conn.cursor() as cur:
         await cur.execute(
-            "SELECT COUNT(*) FROM ledger_entries WHERE reason = 'DIVIDEND' "
-            "AND account_id = %s",
+            "SELECT COUNT(*) FROM ledger_entries WHERE reason = 'DIVIDEND' AND account_id = %s",
             (account_id,),
         )
         (count,) = await cur.fetchone()
@@ -545,9 +538,7 @@ async def test_index_dividend_resolves_without_paying(conn: AsyncConnection) -> 
 
     assert await get_balance(conn, account_id) == cash_before
     async with conn.cursor() as cur:
-        await cur.execute(
-            "SELECT COUNT(*) FROM ledger_entries WHERE reason = 'DIVIDEND'"
-        )
+        await cur.execute("SELECT COUNT(*) FROM ledger_entries WHERE reason = 'DIVIDEND'")
         assert (await cur.fetchone())[0] == 0
         await cur.execute(
             "SELECT resolved FROM events e JOIN instruments i ON i.id = e.instrument_id "

@@ -37,9 +37,7 @@ async def _ticker_by_liquidity(conn: AsyncConnection, *, smallest: bool) -> tupl
 
 async def _quoted(conn: AsyncConnection, ticker: str) -> Decimal:
     async with conn.cursor() as cur:
-        await cur.execute(
-            "SELECT quoted_price FROM instruments WHERE ticker = %s", (ticker,)
-        )
+        await cur.execute("SELECT quoted_price FROM instruments WHERE ticker = %s", (ticker,))
         row = await cur.fetchone()
         assert row is not None
         return Decimal(row[0])
@@ -126,7 +124,11 @@ async def test_resting_order_works_over_multiple_ticks(conn: AsyncConnection) ->
     qty = int(cap_dollars * Decimal("2.5") / mark)
 
     order = await place_order(
-        conn, user_id=5002, ticker=ticker, side="BUY", quantity=qty,
+        conn,
+        user_id=5002,
+        ticker=ticker,
+        side="BUY",
+        quantity=qty,
         limit_price=(mark * Decimal("1.05")).quantize(Decimal("0.000001")),
     )
 
@@ -162,12 +164,20 @@ async def test_trade_through_epsilon_gates_mm_fills(conn: AsyncConnection) -> No
     mark = await _quoted(conn, ticker)
 
     touching = await place_order(
-        conn, user_id=5003, ticker=ticker, side="SELL", quantity=1,
+        conn,
+        user_id=5003,
+        ticker=ticker,
+        side="SELL",
+        quantity=1,
         # 0.5% below the mark -- marketable, but within the 1% epsilon.
         limit_price=(mark * Decimal("0.995")).quantize(Decimal("0.000001")),
     )
     crossed = await place_order(
-        conn, user_id=5003, ticker=ticker, side="SELL", quantity=1,
+        conn,
+        user_id=5003,
+        ticker=ticker,
+        side="SELL",
+        quantity=1,
         # 2% below the mark -- traded through by more than the epsilon.
         limit_price=(mark * Decimal("0.98")).quantize(Decimal("0.000001")),
     )
@@ -186,12 +196,14 @@ async def test_forced_close_bypasses_participation_cap(conn: AsyncConnection) ->
     await _grant_tier(conn, 5004, tier=3)
     ticker, liquidity = await _ticker_by_liquidity(conn, smallest=True)
     async with conn.cursor() as cur:
-        # adv at the reference ratio pins adv_mult at 1, so the effective
-        # liquidity the cap now binds on equals static liquidity -- the
-        # slices below keep their ~0.8x-cap sizing.
+        # adv at the reference ratio pins adv_mult at 1, and vol_state = 1
+        # clears committed vol-regime drift, so the effective liquidity the
+        # cap now binds on equals static liquidity -- the slices below keep
+        # their ~0.8x-cap sizing.
         await cur.execute(
             "UPDATE instruments SET init_margin_pct = 0.5, "
-            "maint_margin_pct = 0.3, adv = liquidity * 2.5e-8 "
+            "maint_margin_pct = 0.3, adv = liquidity * 2.5e-8, "
+            "vol_state = 1.0 "
             "WHERE ticker = %s RETURNING quoted_price",
             (ticker,),
         )

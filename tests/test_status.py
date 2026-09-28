@@ -29,8 +29,7 @@ TICKS_PER_DAY = 1440
 async def _first_ticker(conn: AsyncConnection) -> str:
     async with conn.cursor() as cur:
         await cur.execute(
-            "SELECT ticker FROM instruments WHERE is_active AND kind = 'STOCK'"
-            " ORDER BY id LIMIT 1"
+            "SELECT ticker FROM instruments WHERE is_active AND kind = 'STOCK' ORDER BY id LIMIT 1"
         )
         (ticker,) = await cur.fetchone()
     return ticker
@@ -39,13 +38,15 @@ async def _first_ticker(conn: AsyncConnection) -> str:
 async def _give_cash(conn: AsyncConnection, account_id: int, amount: int) -> None:
     faucet_id = await get_system_account_id(conn, "FAUCET")
     await post_transfer(
-        conn, from_account_id=faucet_id, to_account_id=account_id, amount=amount,
+        conn,
+        from_account_id=faucet_id,
+        to_account_id=account_id,
+        amount=amount,
         reason="TEST_TOPUP",
     )
 
 
 async def test_leaderboard_orders_by_net_worth_desc(conn: AsyncConnection) -> None:
-
     await bootstrap_user(conn, 8001)
     await bootstrap_user(conn, 8002)
     await bootstrap_user(conn, 8003)
@@ -68,8 +69,12 @@ async def test_leaderboard_excludes_league_and_system_accounts(
 
     await bootstrap_user(conn, 8010)
     season_id = await create_season(
-        conn, name="LB Season", start_tick=0, end_tick=10_000,
-        entry_fee_minor=100, stake_minor=9_999_999_999,
+        conn,
+        name="LB Season",
+        start_tick=0,
+        end_tick=10_000,
+        entry_fee_minor=100,
+        stake_minor=9_999_999_999,
     )
     await on_tick(conn, 0)
     await join_season(conn, 8010, season_id)
@@ -119,7 +124,6 @@ async def test_day_change_none_before_any_snapshot(conn: AsyncConnection) -> Non
 
 
 async def test_day_change_after_snapshot_and_price_move(conn: AsyncConnection) -> None:
-
     await bootstrap_user(conn, 8031)
     await _give_cash(conn, await get_user_account_id(conn, 8031), 10_000_000)
     ticker = await _first_ticker(conn)
@@ -136,13 +140,15 @@ async def test_day_change_after_snapshot_and_price_move(conn: AsyncConnection) -
     day2_equity = await net_worth_minor(conn, 8031)
     change = await day_change_pct(conn, 8031, day2_equity, tick_index=TICKS_PER_DAY * 2)
     assert change is not None
-    assert change == pytest.approx(day2_equity / day1_equity - 1)
+    # The snapshot column is BIGINT (SQL rounds .5 up) while
+    # net_worth_minor's int() truncates -- allow one minor unit of
+    # baseline rounding difference.
+    assert change == pytest.approx(day2_equity / day1_equity - 1, abs=2 / day1_equity)
 
 
 async def test_recent_trades_returns_newest_first_and_respects_limit(
     conn: AsyncConnection,
 ) -> None:
-
     await bootstrap_user(conn, 8040)
     await _give_cash(conn, await get_user_account_id(conn, 8040), 10_000_000)
     ticker = await _first_ticker(conn)
@@ -160,8 +166,12 @@ async def test_recent_trades_excludes_league_fills(conn: AsyncConnection) -> Non
 
     await bootstrap_user(conn, 8041)
     season_id = await create_season(
-        conn, name="Hist Season", start_tick=0, end_tick=10_000,
-        entry_fee_minor=100, stake_minor=100_000,
+        conn,
+        name="Hist Season",
+        start_tick=0,
+        end_tick=10_000,
+        entry_fee_minor=100,
+        stake_minor=100_000,
     )
     await on_tick(conn, 0)
     await join_season(conn, 8041, season_id)
@@ -174,7 +184,6 @@ async def test_recent_trades_excludes_league_fills(conn: AsyncConnection) -> Non
 
 
 async def test_compare_symmetric_under_user_swap(conn: AsyncConnection) -> None:
-
     await bootstrap_user(conn, 8050)
     await bootstrap_user(conn, 8051)
     await _give_cash(conn, await get_user_account_id(conn, 8050), 42_000)
@@ -216,9 +225,7 @@ async def test_profile_stats_reports_rank_and_trophies(conn: AsyncConnection) ->
     assert stats.quests_completed == 0
 
     async with conn.cursor() as cur:
-        await cur.execute(
-            "UPDATE users SET quests_completed = 7 WHERE id = 8060"
-        )
+        await cur.execute("UPDATE users SET quests_completed = 7 WHERE id = 8060")
     stats = await profile_stats(conn, 8060)
     assert stats is not None and stats.quests_completed == 7
 
@@ -242,21 +249,27 @@ async def test_profile_stats_season_equity_is_mtm_not_cash(
 
     await bootstrap_user(conn, 8070)
     season_id = await create_season(
-        conn, name="ProfileSeason", start_tick=0, end_tick=10_000,
-        entry_fee_minor=0, stake_minor=5_000_000,
+        conn,
+        name="ProfileSeason",
+        start_tick=0,
+        end_tick=10_000,
+        entry_fee_minor=0,
+        stake_minor=5_000_000,
     )
     await on_tick(conn, 0)  # activate
     await join_season(conn, 8070, season_id)
     await execute_trade(
-        conn, user_id=8070, ticker=await _first_ticker(conn),
-        side="BUY", quantity=10, season_id=season_id,
+        conn,
+        user_id=8070,
+        ticker=await _first_ticker(conn),
+        side="BUY",
+        quantity=10,
+        season_id=season_id,
     )
 
     stats = await profile_stats(conn, 8070)
     assert stats is not None
-    assert stats.active_season_equity_minor == await league_equity_minor(
-        conn, season_id, 8070
-    )
+    assert stats.active_season_equity_minor == await league_equity_minor(conn, season_id, 8070)
     # And it is decisively NOT the raw cash balance, which dropped by the
     # fill's notional.
     async with conn.cursor() as cur:

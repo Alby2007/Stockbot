@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from psycopg import AsyncConnection
+from psycopg.rows import dict_row
 
 from stockbot.market import engine
 from stockbot.market.tick import apply_tick
@@ -40,11 +41,10 @@ async def test_apply_tick_increments_tick_index_each_call(conn: AsyncConnection)
 async def test_apply_tick_is_deterministic_given_the_same_seed_and_starting_state(
     conn: AsyncConnection,
 ) -> None:
-    async with conn.cursor() as cur:
-        await cur.execute(
-            "SELECT id, base_price, fundamental_value FROM instruments ORDER BY id LIMIT 1"
-        )
-        instrument_id, base_price_before, fundamental_before = await cur.fetchone()
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute("SELECT * FROM instruments ORDER BY id LIMIT 1")
+        before = await cur.fetchone()
+    instrument_id = int(before["id"])
 
     await apply_tick(conn, "deterministic-seed")
 
@@ -53,22 +53,20 @@ async def test_apply_tick_is_deterministic_given_the_same_seed_and_starting_stat
         (quoted_after_first_run,) = await cur.fetchone()
 
     # Reset that instrument back to its pre-tick state and the tick ledger,
-    # then replay the same tick index with the same seed. vol_state/sigma_eff
-    # are engine inputs now too -- the reset must restore them or the replay
-    # steps with the regime-scaled sigma the first run left behind.
+    # then replay the same tick index with the same seed. Whole-row restore:
+    # every engine input (vol_state, sigma_eff, drift_state, flow_skew, adv,
+    # halt timers, ...) is a step parameter -- a partial column list leaves
+    # run-1 outputs behind as run-2 inputs.
     async with conn.cursor() as cur:
+        cols = [k for k in before if k != "id"]
         await cur.execute(
-            """
-            UPDATE instruments
-            SET base_price = %s, fundamental_value = %s, impact = 0, quoted_price = %s,
-                vol_state = 1.0, sigma_eff = NULL, drift_state = 0
-            WHERE id = %s
-            """,
-            (base_price_before, fundamental_before, base_price_before, instrument_id),
+            "UPDATE instruments SET " + ", ".join(f"{k} = %s" for k in cols) + " WHERE id = %s",
+            (*[before[k] for k in cols], instrument_id),
         )
         await cur.execute("DELETE FROM candles")
         await cur.execute("DELETE FROM market_ticks")
         await cur.execute("DELETE FROM events")
+        await cur.execute("DELETE FROM pending_flow")
 
     await apply_tick(conn, "deterministic-seed")
 
@@ -137,18 +135,14 @@ async def test_circuit_breaker_freezes_exactly_circuit_halt_ticks(conn: AsyncCon
         await cur.execute(
             "UPDATE instruments SET drift = 0, sigma = 0.0001 WHERE id = %s", (instrument_id,)
         )
-        await cur.execute(
-            "SELECT base_price FROM instruments WHERE id = %s", (instrument_id,)
-        )
+        await cur.execute("SELECT base_price FROM instruments WHERE id = %s", (instrument_id,))
         (base_at_halt,) = await cur.fetchone()
 
     frozen = 0
     for _ in range(engine.CIRCUIT_HALT_TICKS + 2):
         await apply_tick(conn, "halt-length-seed")
         async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT base_price FROM instruments WHERE id = %s", (instrument_id,)
-            )
+            await cur.execute("SELECT base_price FROM instruments WHERE id = %s", (instrument_id,))
             (price,) = await cur.fetchone()
         if price == base_at_halt:
             frozen += 1
