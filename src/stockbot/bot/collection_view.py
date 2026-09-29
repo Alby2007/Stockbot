@@ -75,12 +75,14 @@ def _group_lines(rows: list[dict[str, Any]]) -> list[str]:
         header = by_sector[sid][0].get("sector_name") if sid is not None else None
         lines.append(f"**— {header or 'Index'} —**")
         for r in by_sector[sid]:
-            copies = f" ×{r['copies']}" if r["copies"] > 1 else ""
+            # copies counts lifetime pulls, including burned duplicates;
+            # a held row is always a single copy.
+            copies = f" (pulled ×{r['copies']})" if r["copies"] > 1 else ""
             lines.append(f"{frame_glyph(r['best_frame'])} {r['name']}{copies}")
     if lore:
         lines.append("**— Lore —**")
         for r in lore:
-            copies = f" ×{r['copies']}" if r["copies"] > 1 else ""
+            copies = f" (pulled ×{r['copies']})" if r["copies"] > 1 else ""
             lines.append(f"{frame_glyph(r['best_frame'])} {r['name']}{copies}")
     if comm:
         lines.append("**— Commemoratives —**")

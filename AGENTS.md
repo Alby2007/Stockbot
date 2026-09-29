@@ -1154,23 +1154,39 @@ frame tier from `pack.rate_*` weights, then draws uniformly from the
 tier pool — instrument tiers share the 82-card pool and the tier IS the
 frame stamped; lore tiers draw the EPIC/LEGENDARY lore pools.
 `pull_seed` = HMAC(master|packs, uid|pull_seq) mirrors `tick_seed`, and
-every `card_pulls` row records pull_seq + pity_count_before so any pull
-replays byte-for-byte (the test does exactly this). Pity: `pity_count`
+every `card_pulls` row records pull_seq + pity_count_before + a
+`pull_cfg` JSONB snapshot of the exact inputs `resolve_pull` consumed
+(weights, ordered pools, pity_threshold, per-pull floor) — a verifier
+replays any pull from (master_seed, row) alone, immune to later
+pack.rate_* retunes and set expansions (0061; NULL pull_cfg = predates
+snapshotting). card_pulls retention is forever by design — it IS the
+fairness record. Pity: `pity_count`
 >= `pack.pity_threshold` clamps the tier to >=GOLD then resets on rare+;
 `pack_premium`'s `metadata.floor="GOLD"` clamps only the LAST card of
-the pack. `open_pack` is one transaction: record_idempotency_key ->
+the pack (recorded as pull_cfg.floor on that row). `open_pack` is one
+transaction: record_idempotency_key ->
 `use_consumable` -> FOR UPDATE on users (pack_pulls/pity/shards) and
 each user_cards row -> classify (NEW inserts, higher frame UPGRADES in
 place, equal-or-lower DUPLICATE burns to `pack.shards_*` value on
 `users.shards` — off-ledger vanity material, one source one sink).
-EPIC/LEGENDARY pulls emit `CARD_PULL` feed events (achievement class,
+`pack.rate_*` must sum > 0 — enforced in `load_pack_config` (PackError
+before any consumption), `resolve_pull` (ValueError), and `set_config`
+(post-update sum check rolls the tune back). EPIC/LEGENDARY pulls emit
+`CARD_PULL` feed events (achievement class,
 mention kept — bots never open packs). The `/open` reveal commits the
 transaction BEFORE animating (C10 — a 4s staged edit never pins a
 pooled conn, and a mid-reveal restart still leaves cards owned).
 Shards: `craft_card` buys a missing instrument card at STANDARD,
 `upgrade_frame` steps held instrument frames toward PLATINUM at
 `pack.craft_*` costs; lore/commemoratives can't be crafted (the chase
-stays chase). `users.featured_card` pins a held card — shows in
+stays chase). `craft_card` claims the (user_id, card_key) row with
+INSERT ON CONFLICT DO NOTHING RETURNING *before* burning — a racing
+double-craft waits on the speculative insert then loses with a clean
+PackError, never a raw IntegrityError. `shard_events` (0061) journals
+every users.shards mutation as signed deltas (DUPLICATE_BURN awards link
+by pull_seq; CRAFT/FRAME_UPGRADE spends carry card_key) — the invariant
+`users.shards = SUM(shard_events.delta)` is checkable, with backfilled
+awards + LEGACY_ADJUST rows reconciling pre-migration balances. `users.featured_card` pins a held card — shows in
 `profile_stats.featured_card`/`/profile` and appends after title flair
 in `equipped_flair_map` (title AND card when both set). The binder is
 stateless `cards:pg:{owner}:{page}` cids on the shop_view pattern with

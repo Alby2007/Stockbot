@@ -284,6 +284,16 @@ async def set_config(conn: AsyncConnection, key: str, value: float) -> None:
         await cur.execute("UPDATE config SET value = %s WHERE key = %s", (value, key))
         if cur.rowcount == 0:
             raise ValueError(f"config key {key!r} has no row; was the DB migrated?")
+        if key.startswith("pack.rate_"):
+            # Cross-key invariant: a zero total would mint LEGENDARY on
+            # every pull (the tier loop never breaks). Check the sum
+            # post-update inside the tx so the offending write rolls back.
+            await cur.execute(
+                "SELECT COALESCE(SUM(value), 0) FROM config WHERE key LIKE 'pack.rate_%'"
+            )
+            row = await cur.fetchone()
+            if row is not None and float(row[0]) <= 0:
+                raise ValueError("pack.rate_* weights must sum to > 0")
 
 
 async def admin_adjust(

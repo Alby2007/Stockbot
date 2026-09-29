@@ -68,7 +68,8 @@ ALTER TABLE users
 
 INSERT INTO card_sets (key, name, in_pack_pool) VALUES
     ('base', 'Base Set', TRUE),
-    ('commemoratives', 'Commemoratives', FALSE);
+    ('commemoratives', 'Commemoratives', FALSE)
+ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- Base Set: every instrument listed at launch (C1 freeze).
@@ -168,7 +169,8 @@ JOIN (VALUES
     ('SLAT',  'Roofing slate for three generations of weather.'),
     ('CLAY',  'Turns riverbed clay into ceramics and ceramics into margins.'),
     ('ASX40', 'The east half of the world in a single ticker.')
-) AS f(ticker, flavor) ON f.ticker = i.ticker;
+) AS f(ticker, flavor) ON f.ticker = i.ticker
+ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- Lore cards: the market's characters. EPIC/LEGENDARY pack tiers only.
@@ -188,7 +190,8 @@ INSERT INTO cards (key, set_key, kind, instrument_id, name, flavor, sector_id, r
     ('lore_lp',            'base', 'LORE', NULL, 'The Liquidity Provider', 'Rests orders on both sides forever, earning the spread one patient tick at a time.', NULL, 'EPIC',      '{}'),
     ('lore_stopmonk',      'base', 'LORE', NULL, 'The Stop-Loss Monk',     'Trails every position by exactly enough to leave before regret arrives. Meditates on drawdown.', NULL, 'EPIC',      '{}'),
     ('lore_oracle',        'base', 'LORE', NULL, 'The Oracle',             'Schedules the earnings, lands the news, and never once says what the number will be.', NULL, 'LEGENDARY', '{}'),
-    ('lore_committee',     'base', 'LORE', NULL, 'The Index Committee',    'Decides which forty names get to be "the market" this season. Membership is the whole moat.', NULL, 'LEGENDARY', '{}');
+    ('lore_committee',     'base', 'LORE', NULL, 'The Index Committee',    'Decides which forty names get to be "the market" this season. Membership is the whole moat.', NULL, 'LEGENDARY', '{}')
+ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- Commemoratives (C8): minted by events, never in the pack pool.
@@ -196,7 +199,8 @@ INSERT INTO cards (key, set_key, kind, instrument_id, name, flavor, sector_id, r
 -- ---------------------------------------------------------------------------
 INSERT INTO cards (key, set_key, kind, instrument_id, name, flavor, sector_id, rarity, metadata) VALUES
     ('comm_ipo_subscriber',  'commemoratives', 'COMMEMORATIVE', NULL, 'First Offering',    'Subscribed before the bell on the exchange''s first IPO wave.', NULL, NULL, '{}'),
-    ('comm_halt_survivor',   'commemoratives', 'COMMEMORATIVE', NULL, 'Halt Survivor',     'Held a position through a circuit-breaker halt and lived to screenshot it.', NULL, NULL, '{}');
+    ('comm_halt_survivor',   'commemoratives', 'COMMEMORATIVE', NULL, 'Halt Survivor',     'Held a position through a circuit-breaker halt and lived to screenshot it.', NULL, NULL, '{}')
+ON CONFLICT DO NOTHING;
 
 -- Backfill: every past IPO subscriber earns the First Offering card.
 INSERT INTO user_cards (user_id, card_key, best_frame)
@@ -221,7 +225,8 @@ ON CONFLICT DO NOTHING;
 -- Pack pricing + pull math config (tunable via /admin tune).
 INSERT INTO shop_items (key, name, description, kind, price_minor, metadata) VALUES
     ('pack_basic',   'Card pack',         'Three cards from the Base Set: instruments at STANDARD-PLATINUM frames, lore at EPIC+.',                         'CONSUMABLE', 800,  '{"cards":3}'),
-    ('pack_premium', 'Premium card pack', 'Three cards; the third is guaranteed GOLD frame or better.',                                                     'CONSUMABLE', 2000, '{"cards":3,"floor":"GOLD"}');
+    ('pack_premium', 'Premium card pack', 'Three cards; the third is guaranteed GOLD frame or better.',                                                     'CONSUMABLE', 2000, '{"cards":3,"floor":"GOLD"}')
+ON CONFLICT DO NOTHING;
 
 INSERT INTO config (key, value) VALUES
     ('pack.rate_standard',  55),
@@ -240,4 +245,5 @@ INSERT INTO config (key, value) VALUES
     ('pack.craft_standard',   60),
     ('pack.craft_silver',     100),
     ('pack.craft_gold',       200),
-    ('pack.craft_platinum',   350);
+    ('pack.craft_platinum',   350)
+ON CONFLICT DO NOTHING;

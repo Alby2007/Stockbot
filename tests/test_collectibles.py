@@ -191,30 +191,89 @@ async def test_open_pack_consumes_and_records(conn: AsyncConnection) -> None:
 
 
 async def test_open_pack_replayable_from_rows(conn: AsyncConnection) -> None:
-    """card_pulls rows carry enough to re-derive every outcome (C2)."""
+    """card_pulls rows self-contain every resolve_pull input via
+    pull_cfg (C2): a verifier needs only (master_seed, row)."""
     await bootstrap_user(conn, _USER)
     await _grant_pack(conn, _USER, "pack_basic")
     outcomes = await open_pack(
         conn, _USER, "pack_basic", interaction_id="itx-2", master_seed=_SEED
     )
-    pools = await load_pools(conn)
-    cfg = await load_pack_config(conn)
     async with conn.cursor() as cur:
         await cur.execute(
-            "SELECT pull_seq, pity_count_before, tier, card_key, outcome, shards_awarded "
-            "FROM card_pulls WHERE user_id = %s ORDER BY pull_seq",
+            "SELECT pull_seq, pity_count_before, tier, card_key, outcome, "
+            "shards_awarded, pull_cfg FROM card_pulls "
+            "WHERE user_id = %s ORDER BY pull_seq",
             (_USER,),
         )
         rows = await cur.fetchall()
     assert len(rows) == 3
     for row, out in zip(rows, outcomes, strict=True):
+        cfg = row[6]
+        assert cfg is not None and cfg["floor"] is None
         seed = pull_seed(_SEED, _USER, int(row[0]))
         tier, card_key = resolve_pull(
-            seed, int(row[1]), cfg.tier_weights, pools, pity_threshold=cfg.pity_threshold
+            seed,
+            int(row[1]),
+            cfg["weights"],
+            cfg["pools"],
+            cfg["floor"],
+            pity_threshold=cfg["pity_threshold"],
         )
         assert (tier, card_key) == (row[2], row[3])
         assert row[4] == out.outcome
         assert int(row[5]) == out.shards
+
+
+async def test_pull_cfg_survives_retune_and_pool_growth(
+    conn: AsyncConnection,
+) -> None:
+    """K-review #1: replay must not depend on live config/pools. Retune
+    every weight, raise pity, and grow a pool mid-order AFTER the pull --
+    the snapshotted rows still re-derive, and the premium floor flag is
+    recorded per pull (no pack-shape inference needed)."""
+    await bootstrap_user(conn, _USER)
+    await _grant_pack(conn, _USER, "pack_premium")
+    await open_pack(
+        conn, _USER, "pack_premium", interaction_id="itx-cfg", master_seed=_SEED
+    )
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = 0 WHERE key LIKE 'pack.rate_%'"
+        )
+        await cur.execute(
+            "UPDATE config SET value = 1 WHERE key = 'pack.rate_legendary'"
+        )
+        await cur.execute(
+            "UPDATE config SET value = 999 WHERE key = 'pack.pity_threshold'"
+        )
+        await cur.execute(
+            "INSERT INTO cards (key, set_key, kind, name, flavor, rarity) "
+            "VALUES ('lore_aaa_probe', 'base', 'LORE', 'Probe', 'x', 'EPIC') "
+            "ON CONFLICT DO NOTHING"
+        )
+        await cur.execute(
+            "SELECT pull_seq, pity_count_before, tier, card_key, pull_cfg "
+            "FROM card_pulls WHERE user_id = %s ORDER BY pull_seq",
+            (_USER,),
+        )
+        rows = await cur.fetchall()
+    pools = await load_pools(conn)
+    assert "lore_aaa_probe" in pools["EPIC"]  # live pool did change
+    assert len(rows) == 3
+    # The floor lands on the LAST pull only -- and is on the row itself.
+    assert [r[4]["floor"] for r in rows] == [None, None, "GOLD"]
+    for pull_seq, pity_before, tier, card_key, cfg in rows:
+        seed = pull_seed(_SEED, _USER, int(pull_seq))
+        got = resolve_pull(
+            seed,
+            int(pity_before),
+            cfg["weights"],
+            cfg["pools"],
+            cfg["floor"],
+            pity_threshold=cfg["pity_threshold"],
+        )
+        assert got == (tier, card_key)
 
 
 async def test_open_pack_duplicate_interaction(conn: AsyncConnection) -> None:
@@ -498,11 +557,14 @@ async def test_completion_badges(conn: AsyncConnection) -> None:
     await bootstrap_user(conn, _USER)
     pools = await load_pools(conn)
     # All 82 instruments at STANDARD + all 15 lore -> base_set and
-    # lore_set grant; gold_set does not (frames too low).
+    # lore_set grant; gold_set does not (frames too low). Lore cards
+    # hold their rarity as the frame (EPIC/LEGENDARY), never STANDARD.
     for key in pools["INSTRUMENT"]:
         await _hold_card(conn, _USER, key, "STANDARD")
-    for key in pools["EPIC"] + pools["LEGENDARY"]:
-        await _hold_card(conn, _USER, key, "STANDARD")
+    for key in pools["EPIC"]:
+        await _hold_card(conn, _USER, key, "EPIC")
+    for key in pools["LEGENDARY"]:
+        await _hold_card(conn, _USER, key, "LEGENDARY")
 
     n = await evaluate_badges(conn, tick_index=1440, interval_ticks=1)
     assert n >= 2
@@ -517,9 +579,12 @@ async def test_completion_badges(conn: AsyncConnection) -> None:
     assert "badge_gold_set" not in got
 
     # Raise all instrument frames to GOLD -> gilded badge lands.
+    # (Instrument rows only -- lore frames are fixed at their rarity.)
     async with conn.cursor() as cur:
         await cur.execute(
-            "UPDATE user_cards SET best_frame = 'GOLD' WHERE user_id = %s",
+            "UPDATE user_cards uc SET best_frame = 'GOLD' "
+            "FROM cards c WHERE uc.card_key = c.key "
+            "AND uc.user_id = %s AND c.kind = 'INSTRUMENT'",
             (_USER,),
         )
     await evaluate_badges(conn, tick_index=1440, interval_ticks=1)
@@ -532,3 +597,204 @@ async def test_completion_badges(conn: AsyncConnection) -> None:
 
     # Off-day tick grants nothing new; re-running the same day is idempotent.
     assert await evaluate_badges(conn, tick_index=2880, interval_ticks=1440) == 0
+
+
+# ---------------------------------------------------------------------------
+# K-review followups: shard ledger, zero-rate guard, rollback, craft race
+# ---------------------------------------------------------------------------
+
+
+async def test_shard_events_reconstruct_balance(conn: AsyncConnection) -> None:
+    """users.shards == SUM(shard_events.delta): pull awards, craft
+    spends, and frame-upgrade spends all land in the journal."""
+    await bootstrap_user(conn, _USER)
+    pools = await load_pools(conn)
+    # Hold every pool card at max frame so all three pulls burn to
+    # shards regardless of which tier the seed rolls.
+    for key in pools["INSTRUMENT"]:
+        await _hold_card(conn, _USER, key, "PLATINUM")
+    for key in pools["EPIC"]:
+        await _hold_card(conn, _USER, key, "EPIC")
+    for key in pools["LEGENDARY"]:
+        await _hold_card(conn, _USER, key, "LEGENDARY")
+    await _set_shards(conn, _USER, 1000)  # unjournaled base for the spends
+    await _grant_pack(conn, _USER, "pack_basic")
+    await open_pack(
+        conn, _USER, "pack_basic", interaction_id="itx-sh", master_seed=_SEED
+    )
+    # Free one card, then spend shards both ways.
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "DELETE FROM user_cards WHERE user_id = %s AND card_key = 'card_nort'",
+            (_USER,),
+        )
+    _, craft_cost = await craft_card(conn, _USER, "card_nort")
+    _, _, upgrade_cost = await upgrade_frame(conn, _USER, "card_nort")
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT reason, delta, pull_seq FROM shard_events WHERE user_id = %s",
+            (_USER,),
+        )
+        events = [(r[0], int(r[1]), r[2]) for r in await cur.fetchall()]
+        await cur.execute(
+            "SELECT COALESCE(SUM(delta), 0) FROM shard_events WHERE user_id = %s",
+            (_USER,),
+        )
+        net = int((await cur.fetchone())[0])
+        await cur.execute("SELECT shards FROM users WHERE id = %s", (_USER,))
+        balance = int((await cur.fetchone())[0])
+    assert balance == 1000 + net  # base + journaled awards/spends
+    assert ("CRAFT", -craft_cost, None) in events
+    assert ("FRAME_UPGRADE", -upgrade_cost, None) in events
+    awards = [e for e in events if e[0] == "DUPLICATE_BURN"]
+    assert awards and all(d > 0 and seq is not None for _, d, seq in awards)
+
+
+async def test_zero_rate_config_refused(conn: AsyncConnection) -> None:
+    """All-zero pack.rate_* must not reach the pull loop -- and the
+    failed open consumes nothing."""
+    await bootstrap_user(conn, _USER)
+    await _grant_pack(conn, _USER, "pack_basic")
+    async with conn.cursor() as cur:
+        await cur.execute("UPDATE config SET value = 0 WHERE key LIKE 'pack.rate_%'")
+    with pytest.raises(PackError, match="sum to zero"):
+        await load_pack_config(conn)
+    with pytest.raises(PackError):
+        await open_pack(
+            conn, _USER, "pack_basic", interaction_id="itx-zero", master_seed=_SEED
+        )
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT quantity FROM entitlements WHERE user_id = %s AND item_key = 'pack_basic'",
+            (_USER,),
+        )
+        assert (await cur.fetchone())[0] == 1
+
+
+def test_resolve_pull_zero_weights_raises() -> None:
+    weights = {k: 0.0 for k in _weights()}
+    with pytest.raises(ValueError, match="must be > 0"):
+        resolve_pull(1, 0, weights, _pools())
+
+
+async def test_tune_refuses_zero_rate_total(conn: AsyncConnection) -> None:
+    """The last write that would zero the rate total is refused and
+    rolled back, so sequential admin tunes can't reach the bad state."""
+    from stockbot.admin.service import set_config
+
+    for k in ("standard", "silver", "gold", "platinum", "epic"):
+        await set_config(conn, f"pack.rate_{k}", 0.0)
+    with pytest.raises(ValueError, match="sum to > 0"):
+        await set_config(conn, "pack.rate_legendary", 0.0)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT value FROM config WHERE key = 'pack.rate_legendary'"
+        )
+        assert float((await cur.fetchone())[0]) == 0.6
+
+
+async def test_mid_pack_failure_rolls_back(conn: AsyncConnection, monkeypatch) -> None:
+    """A resolve_pull failure on card 2 restores the entitlement and
+    leaves no pull, card, counter, or shard trace behind."""
+    import stockbot.collectibles.service as svc
+
+    await bootstrap_user(conn, _USER)
+    await _grant_pack(conn, _USER, "pack_basic")
+    calls = 0
+    real = svc.resolve_pull
+
+    def boom(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("simulated pull failure")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(svc, "resolve_pull", boom)
+    with pytest.raises(ValueError, match="simulated pull failure"):
+        await open_pack(
+            conn, _USER, "pack_basic", interaction_id="itx-boom", master_seed=_SEED
+        )
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT quantity FROM entitlements WHERE user_id = %s AND item_key = 'pack_basic'",
+            (_USER,),
+        )
+        assert (await cur.fetchone())[0] == 1  # entitlement restored
+        await cur.execute(
+            "SELECT pack_pulls, pity_count, shards FROM users WHERE id = %s",
+            (_USER,),
+        )
+        assert tuple(int(v) for v in await cur.fetchone()) == (0, 0, 0)
+        await cur.execute(
+            "SELECT count(*) FROM card_pulls WHERE user_id = %s", (_USER,)
+        )
+        assert (await cur.fetchone())[0] == 0
+        await cur.execute(
+            "SELECT count(*) FROM user_cards WHERE user_id = %s", (_USER,)
+        )
+        assert (await cur.fetchone())[0] == 0
+        await cur.execute(
+            "SELECT count(*) FROM shard_events WHERE user_id = %s", (_USER,)
+        )
+        assert (await cur.fetchone())[0] == 0
+
+
+async def test_pull_seq_monotonic_across_packs(conn: AsyncConnection) -> None:
+    await bootstrap_user(conn, _USER)
+    await _grant_pack(conn, _USER, "pack_basic", n=2)
+    o1 = await open_pack(
+        conn, _USER, "pack_basic", interaction_id="itx-p1", master_seed=_SEED
+    )
+    o2 = await open_pack(
+        conn, _USER, "pack_basic", interaction_id="itx-p2", master_seed=_SEED
+    )
+    assert [o.pull_seq for o in o1] == [1, 2, 3]
+    assert [o.pull_seq for o in o2] == [4, 5, 6]
+
+
+async def test_concurrent_craft_loses_cleanly() -> None:
+    """K-review #4: a racing craft must lose with PackError, not a bare
+    IntegrityError. Conn A holds an uncommitted insert of the target
+    card; conn B runs the real craft_card -- its ON CONFLICT claim waits
+    on A's speculative insert, then loses cleanly when A commits."""
+    import asyncio
+
+    from stockbot.config import get_settings
+
+    url = get_settings().test_database_url
+    race_user = 987_654_401  # committed rows must not leak into fixture tests
+    holder = await AsyncConnection.connect(url, autocommit=False)
+    try:
+        await bootstrap_user(holder, race_user)
+        async with holder.cursor() as cur:
+            await cur.execute(
+                "UPDATE users SET shards = 500 WHERE id = %s", (race_user,)
+            )
+            await cur.execute(
+                "DELETE FROM user_cards WHERE user_id = %s AND card_key = 'card_sout'",
+                (race_user,),
+            )
+            await cur.execute(
+                "INSERT INTO user_cards (user_id, card_key, best_frame) "
+                "VALUES (%s, 'card_sout', 'STANDARD')",
+                (race_user,),
+            )
+            # implicit transaction stays open: the insert is uncommitted
+        crafter = await AsyncConnection.connect(url, autocommit=True)
+        try:
+            task = asyncio.create_task(craft_card(crafter, race_user, "card_sout"))
+            await asyncio.sleep(0.3)  # let B reach the blocked claim
+            await holder.commit()
+            with pytest.raises(PackError, match="already hold"):
+                await task
+            async with crafter.cursor() as cur:
+                await cur.execute(
+                    "SELECT shards FROM users WHERE id = %s", (race_user,)
+                )
+                assert int((await cur.fetchone())[0]) == 500  # no burn
+        finally:
+            await crafter.close()
+    finally:
+        await holder.close()

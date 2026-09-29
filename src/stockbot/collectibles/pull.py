@@ -2,8 +2,9 @@
 
 `pull_seed` mirrors `market.engine.tick_seed`: HMAC-SHA256 with domain
 separation, so "user X's Nth pull" is a pure function of recorded inputs
-(user_id, pull_seq, pity state, config weights, frozen set pools) and any
-verifier can re-derive the same outcome from `card_pulls` rows.
+(user_id, pull_seq, pity state, and the per-pull `pull_cfg` snapshot of
+weights/pools/floor stored on the `card_pulls` row) and any verifier can
+re-derive the same outcome from `card_pulls` rows alone.
 
 Tier-first resolution (C5): roll a tier from config weights, then draw
 uniformly from that tier's pool. Instrument tiers (STANDARD..PLATINUM)
@@ -92,6 +93,10 @@ def resolve_pull(
     # config typo surfaces as KeyError here, not a silent skew.
     u = rng.random()
     total = sum(tier_weights[t] for t in TIERS)
+    if total <= 0:
+        # All-zero weights would silently mint TIERS[-1] (LEGENDARY) on
+        # every pull; refuse instead.
+        raise ValueError(f"pack tier weights sum to {total}; must be > 0")
     roll = u * total
     tier = TIERS[-1]
     for t in TIERS:

@@ -7,12 +7,20 @@ non-convertible vanity material. One source (duplicate burns), one sink
 path ever posts a transfer.
 
 Pull auditability (C2): every draw writes a `card_pulls` row carrying
-pull_seq + pity_count_before, so `resolve_pull` can be replayed
-byte-for-byte from recorded inputs.
+pull_seq + pity_count_before + a `pull_cfg` snapshot of the weights,
+pools, pity threshold, and per-pull floor it consumed, so
+`resolve_pull` replays byte-for-byte from recorded inputs alone --
+retunes and set expansions can't invalidate history.
+
+Shard auditability: every mutation of `users.shards` writes a signed
+`shard_events` row (awards = +delta 'DUPLICATE_BURN', spends = -delta
+'CRAFT'/'FRAME_UPGRADE'), making `users.shards = SUM(shard_events.delta)`
+a checkable invariant.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -82,8 +90,13 @@ async def load_pack_config(conn: AsyncConnection) -> PackConfig:
     async with conn.cursor() as cur:
         await cur.execute("SELECT value FROM config WHERE key = 'pack.pity_threshold'")
         row = await cur.fetchone()
+    tier_weights = {k.upper(): v for k, v in rates.items()}
+    if sum(tier_weights.values()) <= 0:
+        # An all-zero rate set silently mints LEGENDARY on every pull;
+        # refuse the config rather than the pull.
+        raise PackError("pack.rate_* weights sum to zero — fix via /admin tune")
     return PackConfig(
-        tier_weights={k.upper(): v for k, v in rates.items()},
+        tier_weights=tier_weights,
         shard_values={k: int(v) for k, v in shards.items()},
         craft_costs={k: int(v) for k, v in crafts.items()},
         pity_threshold=int(row[0]) if row else 20,
@@ -145,8 +158,8 @@ async def get_card(conn: AsyncConnection, key: str) -> CardRow | None:
 async def find_card(
     conn: AsyncConnection, name_or_key: str
 ) -> CardRow | None:
-    """Resolve a card by key ('card_nort', 'lore_whale') or by ticker /
-    name fragment for /card autocomplete targets."""
+    """Resolve a card by key ('card_nort', 'lore_whale'), exact
+    case-insensitive name, or ticker for /card autocomplete targets."""
     q = name_or_key.lower()
     row = await get_card(conn, q)
     if row is not None:
@@ -270,6 +283,13 @@ async def open_pack(
 
     config = await load_pack_config(conn)
     pools = await load_pools(conn)
+    # Snapshot every input resolve_pull consumes; written verbatim to
+    # card_pulls.pull_cfg so each row self-contains its replay contract.
+    cfg_snapshot: dict[str, Any] = {
+        "weights": config.tier_weights,
+        "pools": pools,
+        "pity_threshold": config.pity_threshold,
+    }
 
     async with conn.transaction():
         await record_idempotency_key(conn, interaction_id)
@@ -339,9 +359,12 @@ async def open_pack(
                 card_key=card_key,
                 outcome=outcome,
                 shards=shards,
+                pull_cfg={**cfg_snapshot, "floor": card_floor},
             )
             if shards:
-                await _award_shards(conn, user_id, shards)
+                await _award_shards(
+                    conn, user_id, shards, card_key=card_key, pull_seq=pull_seq
+                )
 
             card = await get_card(conn, card_key)
             if tier in ("EPIC", "LEGENDARY"):
@@ -435,26 +458,68 @@ async def _insert_pull(
     card_key: str,
     outcome: str,
     shards: int,
+    pull_cfg: dict[str, Any],
 ) -> None:
     async with conn.cursor() as cur:
         await cur.execute(
             """
             INSERT INTO card_pulls
                 (user_id, pull_seq, pack_key, pity_count_before, tier,
-                 card_key, outcome, shards_awarded, tick_index)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                 card_key, outcome, shards_awarded, pull_cfg, tick_index)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                     (SELECT MAX(tick_index) FROM market_ticks))
             """,
-            (user_id, pull_seq, pack_key, pity_before, tier, card_key, outcome, shards),
+            (
+                user_id,
+                pull_seq,
+                pack_key,
+                pity_before,
+                tier,
+                card_key,
+                outcome,
+                shards,
+                json.dumps(pull_cfg),
+            ),
         )
 
 
-async def _award_shards(conn: AsyncConnection, user_id: int, amount: int) -> None:
+async def _shard_event(
+    conn: AsyncConnection,
+    user_id: int,
+    delta: int,
+    reason: str,
+    *,
+    card_key: str | None = None,
+    pull_seq: int | None = None,
+) -> None:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            INSERT INTO shard_events
+                (user_id, delta, reason, card_key, pull_seq, tick_index)
+            VALUES (%s, %s, %s, %s, %s,
+                    (SELECT MAX(tick_index) FROM market_ticks))
+            """,
+            (user_id, delta, reason, card_key, pull_seq),
+        )
+
+
+async def _award_shards(
+    conn: AsyncConnection,
+    user_id: int,
+    amount: int,
+    *,
+    card_key: str,
+    pull_seq: int,
+) -> None:
     async with conn.cursor() as cur:
         await cur.execute(
             "UPDATE users SET shards = shards + %s WHERE id = %s",
             (amount, user_id),
         )
+    await _shard_event(
+        conn, user_id, amount, "DUPLICATE_BURN", card_key=card_key, pull_seq=pull_seq
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -479,12 +544,23 @@ async def craft_card(
     cost = config.craft_costs.get("standard", 60)
 
     async with conn.transaction():
+        # Claim the card row first: ON CONFLICT waits on a concurrent
+        # in-flight insert of the same (user_id, card_key) and reports
+        # nothing to return once it commits, so a racing double-craft
+        # yields this PackError rather than a bare IntegrityError.
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT 1 FROM user_cards WHERE user_id = %s AND card_key = %s",
+                """
+                INSERT INTO user_cards
+                    (user_id, card_key, best_frame, first_acquired_tick)
+                VALUES (%s, %s, 'STANDARD',
+                        (SELECT MAX(tick_index) FROM market_ticks))
+                ON CONFLICT (user_id, card_key) DO NOTHING
+                RETURNING card_key
+                """,
                 (user_id, card_key),
             )
-            if await cur.fetchone() is not None:
+            if await cur.fetchone() is None:
                 raise PackError(f"You already hold **{card.name}**.")
             await cur.execute(
                 "UPDATE users SET shards = shards - %s WHERE id = %s AND shards >= %s",
@@ -494,7 +570,7 @@ async def craft_card(
                 raise PackError(
                     f"Not enough shards — crafting **{card.name}** costs {cost}."
                 )
-        await _insert_user_card(conn, user_id, card_key, "STANDARD")
+        await _shard_event(conn, user_id, -cost, "CRAFT", card_key=card_key)
     return card_key, cost
 
 
@@ -541,6 +617,9 @@ async def upgrade_frame(
                 """,
                 (new_frame, user_id, card_key),
             )
+        await _shard_event(
+            conn, user_id, -cost, "FRAME_UPGRADE", card_key=card_key
+        )
     return card_key, new_frame, cost
 
 
