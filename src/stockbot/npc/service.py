@@ -34,7 +34,7 @@ from stockbot.ledger.service import (
 )
 from stockbot.margin.errors import MarginError
 from stockbot.market.data import open_market_ids
-from stockbot.npc.agents import ACTIONS, NpcAgent, RoundContext
+from stockbot.npc.agents import ACTIONS, TICKS_PER_DAY, NpcAgent, RoundContext
 from stockbot.status.service import net_worth_minor
 from stockbot.trading.errors import TradingError
 
@@ -43,6 +43,11 @@ log = logging.getLogger("stockbot.npc")
 # user_ids far below any Discord snowflake (>= ~1.6e17) and below the
 # sim harness's 9e14 block so a leaked sim user can't collide either.
 NPC_USER_ID_BASE = 800_000_000_000_000
+
+# Bounds on the target_adv_share feedback multiplier: enough to chase
+# the target, not enough for a quiet tape to dump the whole population's
+# probability budget into one tick.
+_SHARE_MULT_LO, _SHARE_MULT_HI = 0.25, 4.0
 
 
 async def _config_float(conn: AsyncConnection, key: str, default: float) -> float:
@@ -71,7 +76,27 @@ async def spawn_agent(
     runner lock in production; concurrent manual spawns could race on
     the MAX and the second loses to the users PK (acceptable: spawns
     are rare and the loser just retries).
+
+    Raises ValueError for an unknown archetype or a quote_ticker that
+    isn't an active instrument -- without the checks the spawn produces
+    a funded, enabled, permanently inert agent (ACTIONS.get -> skip).
     """
+    if archetype not in ACTIONS:
+        raise ValueError(
+            f"unknown archetype {archetype!r} "
+            f"(known: {', '.join(sorted(ACTIONS))})"
+        )
+    if quote_ticker is not None:
+        quote_ticker = quote_ticker.upper()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM instruments WHERE ticker = %s AND is_active",
+                (quote_ticker,),
+            )
+            if await cur.fetchone() is None:
+                raise ValueError(
+                    f"unknown or inactive quote_ticker {quote_ticker!r}"
+                )
     stake = (
         stake_minor
         if stake_minor is not None
@@ -85,7 +110,9 @@ async def spawn_agent(
         row = await cur.fetchone()
         assert row is not None
         user_id = int(row[0])
-    await bootstrap_user(conn, user_id)
+    # No STARTING_GRANT: synthetic snowflakes trivially pass the age
+    # gate, and spawn (NPC_STAKE) is the ONLY faucet draw an agent gets.
+    await bootstrap_user(conn, user_id, starting_grant=False)
     async with conn.cursor() as cur:
         await cur.execute("UPDATE users SET is_bot = TRUE WHERE id = %s", (user_id,))
     account_id = await get_user_account_id(conn, user_id)
@@ -145,6 +172,29 @@ async def load_agents(conn: AsyncConnection) -> list[NpcAgent]:
         ]
 
 
+async def _npc_flow_share(
+    conn: AsyncConnection, tick_index: int, window_ticks: int
+) -> float | None:
+    """NPC share of executed notional over the trailing `window_ticks`.
+    Returns None when the window had no flow at all -- nothing to
+    modulate against."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT COALESCE(SUM(t.notional_minor)
+                            FILTER (WHERE u.is_bot), 0),
+                   COALESCE(SUM(t.notional_minor), 0)
+            FROM trades t JOIN users u ON u.id = t.user_id
+            WHERE t.tick_index > %s AND t.tick_index <= %s
+            """,
+            (tick_index - window_ticks, tick_index),
+        )
+        row = await cur.fetchone()
+    assert row is not None
+    bot_minor, total_minor = int(row[0]), int(row[1])
+    return bot_minor / total_minor if total_minor > 0 else None
+
+
 async def run_round(
     conn: AsyncConnection,
     master_seed: str,
@@ -178,6 +228,17 @@ async def run_round(
         open_mids = await open_market_ids(conn, tick_index)
         action_prob = await _config_float(conn, "npc.action_prob_per_tick", 0.002)
         budget_minor = int((await _config_float(conn, "npc.max_tick_notional", 25_000.0)) * 100)
+        # npc.target_adv_share is the feedback loop: scale the per-agent
+        # draw toward NPC flow being `target` of trailing-day notional.
+        # The multiplier is clamped so a quiet tape can't detonate the
+        # whole population's probability budget in one tick, and an
+        # empty window (total flow 0) leaves the base rate alone.
+        target_share = await _config_float(conn, "npc.target_adv_share", 0.0)
+        if target_share > 0:
+            share = await _npc_flow_share(conn, tick_index, TICKS_PER_DAY)
+            if share is not None:
+                mult = target_share / max(share, 0.01)
+                action_prob *= min(_SHARE_MULT_HI, max(_SHARE_MULT_LO, mult))
     acted = 0
     ctx = RoundContext(
         conn=conn,
@@ -186,46 +247,88 @@ async def run_round(
         open_mids=open_mids,
         budget_minor=budget_minor,
     )
-    for agent in agents:
-        # Per-agent decision RNG: reproducible given (seed, uid, tick).
-        agent_rng = random.Random(f"{master_seed}|npc|{agent.user_id}|{tick_index}")
-        if agent_rng.random() >= action_prob:
-            continue
-        if ctx.budget_minor <= 0:
-            break
-        delay = ctx.rng.uniform(0, interval_seconds * 0.75) if sleep else 0.0
-        if delay > 0:
-            await asyncio.sleep(delay)
-        action = ACTIONS.get(agent.archetype)
-        if action is None:
-            continue
-        act_ctx = RoundContext(
-            conn=conn,
-            rng=agent_rng,
-            tick_index=tick_index,
-            open_mids=open_mids,
-            budget_minor=ctx.budget_minor,
-        )
-        try:
-            async with conn.transaction():
-                notional = await action(act_ctx, agent)
-        except (InsufficientFundsError, TradingError, MarginError) as exc:
-            # Broke/blocked agents just don't act this round -- the death
-            # sweep decides whether they're done for good.
-            log.debug("npc %s (%s) skipped: %s", agent.user_id, agent.archetype, exc)
-            notional = 0
-        if notional > 0:
-            acted += 1
-            ctx.budget_minor -= notional
-    async with conn.transaction():
-        dead = await mark_dead_agents(conn, tick_index)
+    try:
+        for agent in agents:
+            # Per-agent decision RNG: reproducible given (seed, uid, tick).
+            agent_rng = random.Random(f"{master_seed}|npc|{agent.user_id}|{tick_index}")
+            if agent_rng.random() >= action_prob:
+                continue
+            if ctx.budget_minor <= 0:
+                break
+            delay = ctx.rng.uniform(0, interval_seconds * 0.75) if sleep else 0.0
+            if delay > 0:
+                await asyncio.sleep(delay)
+            action = ACTIONS.get(agent.archetype)
+            if action is None:
+                continue
+            act_ctx = RoundContext(
+                conn=conn,
+                rng=agent_rng,
+                tick_index=tick_index,
+                open_mids=open_mids,
+                budget_minor=ctx.budget_minor,
+            )
+            try:
+                async with conn.transaction():
+                    notional = await action(act_ctx, agent)
+            except (InsufficientFundsError, TradingError, MarginError) as exc:
+                # Broke/blocked agents just don't act this round -- the
+                # death sweep decides whether they're done for good.
+                log.debug("npc %s (%s) skipped: %s", agent.user_id, agent.archetype, exc)
+                notional = 0
+            except Exception:
+                # Unexpected errors are per-action too: the transaction
+                # rolled back, so the blast radius is this one action.
+                # Without this an agent that throws deterministically
+                # starves every successor AND skips the death sweep --
+                # the loop already consumed last_tick, so the round
+                # never retries.
+                log.warning(
+                    "npc %s (%s) action failed",
+                    agent.user_id,
+                    agent.archetype,
+                    exc_info=True,
+                )
+                notional = 0
+            if notional > 0:
+                acted += 1
+                ctx.budget_minor -= notional
+    finally:
+        # The sweep runs even if the loop unwinds: dead agents must be
+        # stamped this round, not whenever a future round succeeds.
+        async with conn.transaction():
+            dead = await mark_dead_agents(conn, tick_index)
     return {"acted": acted, "agents": len(agents), "dead": dead}
+
+
+async def _live_instrument_count(conn: AsyncConnection, user_id: int) -> int:
+    """Everything an agent still rides: positions, resting orders,
+    bounded shorts, open options. 'Dead' means flat -- an agent with
+    sub-floor cash but paper outstanding isn't done (a dead LP's stale
+    quotes would otherwise keep filling strangers for days)."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT (SELECT COUNT(*) FROM positions
+                     WHERE user_id = %s AND quantity <> 0)
+                 + (SELECT COUNT(*) FROM orders
+                     WHERE user_id = %s AND status = 'OPEN')
+                 + (SELECT COUNT(*) FROM bounded_shorts
+                     WHERE user_id = %s AND status = 'OPEN')
+                 + (SELECT COUNT(*) FROM option_positions
+                     WHERE user_id = %s AND status = 'OPEN')
+            """,
+            (user_id, user_id, user_id, user_id),
+        )
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
 
 
 async def mark_dead_agents(conn: AsyncConnection, tick_index: int) -> int:
     """Permadeath sweep: enabled agents whose NET WORTH (not cash -- a
     fully-invested agent isn't dead) sits below `npc.death_balance_minor`
-    with no open positions get `died_at_tick` stamped once, never cleared."""
+    with no live instrument exposure get `died_at_tick` stamped once,
+    never cleared."""
     floor = int(await _config_float(conn, "npc.death_balance_minor", 100.0))
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
@@ -238,15 +341,7 @@ async def mark_dead_agents(conn: AsyncConnection, tick_index: int) -> int:
         candidates = [int(r["user_id"]) for r in await cur.fetchall()]
     dead = 0
     for uid in candidates:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT COUNT(*) FROM positions WHERE user_id = %s AND quantity <> 0",
-                (uid,),
-            )
-            row = await cur.fetchone()
-            assert row is not None
-            has_positions = int(row[0]) > 0
-        if has_positions:
+        if await _live_instrument_count(conn, uid) > 0:
             continue
         if await net_worth_minor(conn, uid) < floor:
             async with conn.cursor() as cur:
@@ -275,8 +370,8 @@ class AgentReport:
     quote_ticker: str | None
     created_at: datetime
     equity_minor: int
-    funded_minor: int  # NPC_STAKE + STARTING_GRANT credited to this account
-    open_positions: int
+    funded_minor: int  # NPC_STAKE (+ STARTING_GRANT on legacy rows)
+    live_instruments: int  # positions + open orders + shorts + options
 
     @property
     def pnl_minor(self) -> int:
@@ -287,16 +382,15 @@ async def agent_report(conn: AsyncConnection) -> list[AgentReport]:
     """Census + per-agent P&L for `/admin npc-list`. Net worth comes from
     the same user-scoped path the runner's death check uses; funded is
     the ledger's own record of spawn money (STARTING_GRANT + NPC_STAKE),
-    so P&L is equity minus exactly what ops put in."""
+    so P&L is equity minus exactly what ops put in. `live_instruments`
+    counts all outstanding paper -- the same predicate the death sweep
+    uses, so the census can't show a 'flat' agent that isn't."""
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
             SELECT n.user_id, n.archetype, n.label, n.enabled,
                    n.died_at_tick, n.quote_ticker, n.created_at,
-                   a.id AS account_id,
-                   (SELECT COUNT(*) FROM positions p
-                     WHERE p.user_id = n.user_id AND p.quantity <> 0)
-                       AS open_positions
+                   a.id AS account_id
             FROM npc_agents n
             JOIN accounts a ON a.user_id = n.user_id AND a.kind = 'USER'
             ORDER BY n.user_id
@@ -324,7 +418,7 @@ async def agent_report(conn: AsyncConnection) -> list[AgentReport]:
                 created_at=r["created_at"],
                 equity_minor=await net_worth_minor(conn, uid),
                 funded_minor=funded,
-                open_positions=int(r["open_positions"]),
+                live_instruments=await _live_instrument_count(conn, uid),
             )
         )
     return out

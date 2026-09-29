@@ -83,9 +83,16 @@ async def create_user_account(conn: AsyncConnection, user_id: int) -> tuple[int,
     return int(row[0]), created
 
 
-async def bootstrap_user(conn: AsyncConnection, user_id: int) -> BootstrapResult:
+async def bootstrap_user(
+    conn: AsyncConnection, user_id: int, *, starting_grant: bool = True
+) -> BootstrapResult:
     """Create a user's account if needed; grant the starting balance once
     the Discord snowflake is old enough.
+
+    `starting_grant=False` (the NPC spawn path) stamps `grant_issued`
+    without posting -- the anti-farm age check is snowflake-only and
+    synthetic ids trivially satisfy it, so without the opt-out every
+    bot would draw the faucet grant on top of NPC_STAKE.
 
     Safe to call more than once: `grant_issued` is claimed under the
     FOR UPDATE row lock before posting, so two concurrent pending-user
@@ -122,7 +129,16 @@ async def bootstrap_user(conn: AsyncConnection, user_id: int) -> BootstrapResult
             min_age = DEFAULT_MIN_DISCORD_AGE_DAYS
             if not grant_issued:
                 min_age = await min_discord_age_days(conn)
-                if discord_age_days(user_id) >= min_age:
+                if not starting_grant:
+                    # Burn the entitlement: the account is funded by a
+                    # dedicated path (e.g. NPC_STAKE), and stamping
+                    # grant_issued here keeps a later user-path bootstrap
+                    # from drawing the grant anyway.
+                    await cur.execute(
+                        "UPDATE users SET grant_issued = TRUE WHERE id = %s",
+                        (user_id,),
+                    )
+                elif discord_age_days(user_id) >= min_age:
                     await cur.execute(
                         "UPDATE users SET grant_issued = TRUE WHERE id = %s",
                         (user_id,),

@@ -3395,7 +3395,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"{alive} alive, {len(agents) - alive} dead | "
             f"aggregate P&L {format_money(total_pnl)}",
             "```",
-            f"{'agent':<20}{'type':<18}{'state':<9}{'equity':>10}{'P&L':>10}{'pos':>5}{'age':>6}",
+            f"{'agent':<20}{'type':<18}{'state':<9}{'equity':>10}{'P&L':>10}{'inst':>5}{'age':>6}",
         ]
         now = discord.utils.utcnow()
         for a in agents:
@@ -3405,7 +3405,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             lines.append(
                 f"{a.label[:19]:<20}{a.archetype:<18}{state:<9}"
                 f"{format_money(a.equity_minor):>10}{format_money(a.pnl_minor):>10}"
-                f"{a.open_positions:>5}{age:>6}"
+                f"{a.live_instruments:>5}{age:>6}"
             )
         lines.append("```")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -3474,17 +3474,23 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             await interaction.response.send_message("Not authorized.", ephemeral=True)
             return
         stake_minor = int(Decimal(str(stake_dollars)) * 100) if stake_dollars is not None else None
-        async with db.connection() as conn:
-            async with conn.transaction():
-                spawned = [
-                    await spawn_agent(
-                        conn,
-                        archetype,
-                        quote_ticker=ticker.upper() if ticker else None,
-                        stake_minor=stake_minor,
-                    )
-                    for _ in range(count)
-                ]
+        try:
+            async with db.connection() as conn:
+                async with conn.transaction():
+                    spawned = [
+                        await spawn_agent(
+                            conn,
+                            archetype,
+                            quote_ticker=ticker.upper() if ticker else None,
+                            stake_minor=stake_minor,
+                        )
+                        for _ in range(count)
+                    ]
+        except ValueError as exc:
+            await interaction.response.send_message(
+                f"Spawn refused: {exc}", ephemeral=True
+            )
+            return
         await interaction.response.send_message(
             f"Spawned {len(spawned)} `{archetype}` agent(s)"
             + (f" pinned to `{ticker.upper()}`" if ticker else "")

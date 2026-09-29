@@ -249,9 +249,9 @@ async def test_spawn_agent_flag_stake_and_row(conn: AsyncConnection) -> None:
         total, count = await cur.fetchone()
         assert int(total) == 0 and int(count) == 2
     account_id = await get_user_account_id(conn, uid)
-    # bootstrap_user's human starting grant applies too -- the NPC gets
-    # grant + stake, both bounded one-time flows.
-    assert await get_balance(conn, account_id) >= 50_000
+    # No STARTING_GRANT for bots (synthetic snowflakes trivially pass
+    # the age gate) -- the balance is exactly the stake.
+    assert await get_balance(conn, account_id) == 50_000
 
 
 async def test_spawn_shorter_gets_margin_tier(conn: AsyncConnection) -> None:
@@ -304,8 +304,7 @@ async def test_mark_dead_agents_permadeath(conn: AsyncConnection) -> None:
     broke = await spawn_agent(conn, "grinder", stake_minor=1)
     rich = await spawn_agent(conn, "grinder", stake_minor=1_000_000)
     async with conn.cursor() as cur:
-        # Drain broke below npc.death_balance_minor (100) -- it still
-        # holds the bootstrap grant on top of the stake.
+        # Drain broke below npc.death_balance_minor (100).
         await cur.execute(
             "UPDATE accounts SET balance = 1 WHERE user_id = %s AND kind = 'USER'",
             (broke,),
@@ -492,3 +491,158 @@ async def test_admin_spawn_path_caps_count_and_pins_ticker(
     async with conn.cursor() as cur:
         await cur.execute("SELECT quote_ticker FROM npc_agents WHERE user_id = %s", (uid,))
         assert (await cur.fetchone())[0] == "ANCH"
+
+
+# ---- Review fixes: isolation, validation, death sweep, grant opt-out ----
+
+
+async def test_action_exception_doesnt_starve_cohort(conn: AsyncConnection) -> None:
+    """A deterministic crash in a low-id agent must not block later
+    agents or the death sweep -- the per-action tx bounds the blast."""
+    from stockbot.npc import agents as agents_mod
+
+    tick = await _ensure_open_tick(conn)
+    boom_uid = await spawn_agent(conn, "grinder", stake_minor=100_000)
+    ok_uid = await spawn_agent(conn, "grinder", stake_minor=1_000_000)
+    broke_uid = await spawn_agent(conn, "grinder", stake_minor=1)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE accounts SET balance = 1 WHERE user_id = %s AND kind = 'USER'",
+            (broke_uid,),
+        )
+    await _set_config(conn, "npc.action_prob_per_tick", 1)
+    await _set_config(conn, "npc.target_adv_share", 0)  # pin prob=1
+
+    original = agents_mod.ACTIONS["grinder"]
+
+    async def boom(ctx, agent):
+        if agent.user_id == boom_uid:
+            raise RuntimeError("synthetic explosion")
+        return await original(ctx, agent)
+
+    agents_mod.ACTIONS["grinder"] = boom
+    try:
+        stats = await run_round(conn, "test-seed", tick_index=tick, sleep=False)
+    finally:
+        agents_mod.ACTIONS["grinder"] = original
+
+    # The higher-id agent still acted despite the predecessor raising.
+    assert stats["acted"] >= 1
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT COUNT(*) FROM trades WHERE user_id = %s", (ok_uid,)
+        )
+        assert int((await cur.fetchone())[0]) >= 1
+    # ...and the death sweep ran: the broke agent is stamped even
+    # though the round began with an exception.
+    assert stats["dead"] == 1
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT died_at_tick FROM npc_agents WHERE user_id = %s",
+            (broke_uid,),
+        )
+        assert (await cur.fetchone())[0] == tick
+
+
+async def test_spawn_rejects_unknown_archetype_and_ticker(
+    conn: AsyncConnection,
+) -> None:
+    """Service-level validation: a bad archetype or a nonexistent
+    quote_ticker would create a funded, permanently inert agent."""
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT COUNT(*) FROM npc_agents")
+        before = int((await cur.fetchone())[0])
+    with pytest.raises(ValueError, match="unknown archetype"):
+        await spawn_agent(conn, "nope")
+    with pytest.raises(ValueError, match="unknown or inactive"):
+        await spawn_agent(conn, "grinder", quote_ticker="ZZZNOPE")
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT COUNT(*) FROM npc_agents")
+        assert int((await cur.fetchone())[0]) == before
+
+
+async def test_spawn_gets_no_starting_grant(conn: AsyncConnection) -> None:
+    """NPC accounts draw NPC_STAKE only -- the bootstrap grant is burned
+    (grant_issued stamped, no transfer) so a later user-path bootstrap
+    can't leak it either."""
+    uid = await spawn_agent(conn, "grinder", stake_minor=50_000)
+    account_id = await get_user_account_id(conn, uid)
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT grant_issued FROM users WHERE id = %s", (uid,))
+        assert (await cur.fetchone())[0] is True
+        await cur.execute(
+            "SELECT reason, SUM(amount) FROM ledger_entries "
+            "WHERE account_id = %s GROUP BY reason",
+            (account_id,),
+        )
+        rows = {str(r[0]): int(r[1]) for r in await cur.fetchall()}
+    assert rows == {"NPC_STAKE": 50_000}
+    # A repeat bootstrap can't post the grant retroactively.
+    await bootstrap_user(conn, uid)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT COUNT(*) FROM ledger_entries WHERE account_id = %s "
+            "AND reason = 'STARTING_GRANT'",
+            (account_id,),
+        )
+        assert int((await cur.fetchone())[0]) == 0
+
+
+async def test_mark_dead_counts_resting_orders(conn: AsyncConnection) -> None:
+    """'Dead' means flat: a broke agent with a resting order keeps its
+    live paper (a dead LP's stale quotes would keep filling strangers)."""
+    from decimal import Decimal
+
+    from stockbot.orders.service import place_order
+
+    await _ensure_open_tick(conn)
+    uid = await spawn_agent(conn, "grinder", stake_minor=100_000)
+    mark = Decimal("1000")
+    order = await place_order(
+        conn,
+        user_id=uid,
+        ticker="ANCH",
+        side="BUY",
+        quantity=1,
+        limit_price=mark,
+    )
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE accounts SET balance = 1 WHERE user_id = %s AND kind = 'USER'",
+            (uid,),
+        )
+    # Net worth is below the floor but the open order is live exposure.
+    assert await mark_dead_agents(conn, tick_index=7) == 0
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE orders SET status = 'CANCELLED' WHERE id = %s",
+            (order.order_id,),
+        )
+    assert await mark_dead_agents(conn, tick_index=8) == 1
+
+
+async def test_npc_flow_share_measures_bot_notional(conn: AsyncConnection) -> None:
+    """target_adv_share feedback reads the bot/human split of trailing
+    notional; an empty window returns None (no modulation)."""
+    from stockbot.npc.service import _npc_flow_share
+
+    tick = await _ensure_open_tick(conn)
+    await bootstrap_user(conn, 9601)
+    bot_uid = await spawn_agent(conn, "grinder", stake_minor=10_000)
+    iid = None
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT id FROM instruments WHERE ticker = 'ANCH'")
+        (iid,) = await cur.fetchone()
+        # 3:1 human:bot notional in-window -> share 0.25.
+        for uid_, notional in ((9601, 300_000), (bot_uid, 100_000)):
+            await cur.execute(
+                "INSERT INTO trades (user_id, instrument_id, side, quantity, "
+                "fill_price, notional_minor, fee_minor, cash_transfer_id, "
+                "tick_index) "
+                "VALUES (%s, %s, 'BUY', 1, 1, %s, 0, gen_random_uuid(), %s)",
+                (uid_, iid, notional, tick),
+            )
+    share = await _npc_flow_share(conn, tick, window_ticks=1440)
+    assert share == pytest.approx(0.25)
+    # A window ahead of all flow has nothing to modulate against.
+    assert await _npc_flow_share(conn, tick + 5000, window_ticks=1440) is None

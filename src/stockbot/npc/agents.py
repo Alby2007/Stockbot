@@ -212,8 +212,11 @@ async def _act_liquidity_provider(ctx: RoundContext, agent: NpcAgent) -> int:
     ticker = agent.quote_ticker or await _random_open_ticker(conn, ctx.rng, ctx.open_mids)
     if ticker is None:
         return 0
-    # Prune accumulated quotes the way the harness does: keep the newest
-    # few so the book doesn't fill with the agent's own stale paper.
+    # Prune order-count growth the way the harness does: list is
+    # ORDER BY id (oldest first), so [6:] cancels the NEWEST -- the six
+    # oldest stay resting. Stale paper is deliberate exposure here: far
+    # quotes still cross fresh flow as marks drift, and the 2-day expiry
+    # bounds how long they linger.
     open_orders = await list_open_orders(conn, agent.user_id)
     for open_order in open_orders[6:]:
         await cancel_order(conn, user_id=agent.user_id, order_id=int(open_order["id"]))

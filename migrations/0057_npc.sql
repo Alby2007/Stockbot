@@ -28,8 +28,9 @@ INSERT INTO config (key, value) VALUES
     -- whole population acting legally can still become the market --
     -- this is the only aggregate bound (P1-C5).
     ('npc.max_tick_notional', 25000),
-    -- Target share of daily volume NPCs should represent; the runner
-    -- modulates action probability toward it.
+    -- Target share of trailing-day notional NPCs should represent; the
+    -- runner multiplies action_prob by target/actual each round, clamped
+    -- to [0.25x, 4x]. 0 disables the feedback (base rate only).
     ('npc.target_adv_share', 0.30),
     -- Per-agent probability of acting on any given tick (~1-5 actions/day
     -- at 1440-tick days for the default).
