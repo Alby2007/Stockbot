@@ -359,6 +359,38 @@ async def owned_card_autocomplete(
     ][:MAX_CHOICES]
 
 
+async def their_card_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """The `user:` option's held cards -- /trade want: targets. Falls
+    back to the full catalog if the counterparty isn't resolved yet."""
+    other = getattr(interaction.namespace, "user", None)
+    # Namespace values for USER options may be a resolved member, a raw
+    # snowflake int, or a string depending on what Discord resolved --
+    # coerce whatever shows up.
+    other_id = getattr(other, "id", other)
+    try:
+        other_id = int(other_id)
+    except (TypeError, ValueError):
+        return await card_autocomplete(interaction, current)
+    async with db.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT c.key, c.name, u.best_frame FROM user_cards u
+            JOIN cards c ON c.key = u.card_key
+            WHERE u.user_id = %s ORDER BY c.key
+            """,
+            (other_id,),
+        )
+        rows = [(str(r[0]), str(r[1]), str(r[2])) for r in await cur.fetchall()]
+    q = current.strip().lower()
+    return [
+        app_commands.Choice(name=f"{name} ({frame})", value=key)
+        for key, name, frame in rows
+        if not q or q in name.lower() or key.startswith(q)
+    ][:MAX_CHOICES]
+
+
 async def pack_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice[str]]:

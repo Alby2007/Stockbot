@@ -195,6 +195,28 @@ def _fmt_option_settled(items: list[dict[str, Any]]) -> str:
     return "Option" + ("s" if len(items) > 1 else "") + " settled: " + "; ".join(parts)
 
 
+def _fmt_moment_earned(items: list[dict[str, Any]]) -> str:
+    names = ", ".join(f"**{p['name']}**" for p in items)
+    noun = "Moment" if len(items) == 1 else "Moments"
+    return f"{noun} witnessed: {names} — you were holding when it happened. See `/collection`."
+
+
+def _fmt_trade_offer(items: list[dict[str, Any]]) -> str:
+    parts = [f"**offer #{p['trade_id']}** from <@{p['from']}>" for p in items]
+    noun = "offer" if len(items) == 1 else "offers"
+    return f"Trade {noun}: " + "; ".join(parts) + " — `/trade list` to answer."
+
+
+def _fmt_trade_result(items: list[dict[str, Any]]) -> str:
+    parts = []
+    for p in items:
+        if p.get("accepted"):
+            parts.append(f"**#{p['trade_id']}** accepted — cards swapped")
+        else:
+            parts.append(f"**#{p['trade_id']}** {p.get('result', 'resolved')}")
+    return "Trade" + ("s" if len(items) > 1 else "") + ": " + "; ".join(parts)
+
+
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "LIQUIDATION": _fmt_liquidation,
     "MARGIN_CALL": _fmt_margin_call,
@@ -208,6 +230,9 @@ _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "ALERT_TRIGGERED": _fmt_alert_triggered,
     "QUEST_COMPLETED": _fmt_quest_completed,
     "OPTION_SETTLED": _fmt_option_settled,
+    "MOMENT_EARNED": _fmt_moment_earned,
+    "TRADE_OFFER": _fmt_trade_offer,
+    "TRADE_RESULT": _fmt_trade_result,
 }
 
 

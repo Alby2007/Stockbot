@@ -67,6 +67,18 @@ def pull_seed(master_seed: str, user_id: int, pull_seq: int) -> int:
     return int.from_bytes(mac[:8], "big") & 0x7FFFFFFFFFFFFFFF
 
 
+def part_seed(master_seed: str, user_id: int, pull_seq: int) -> int:
+    """Seed for a pack's bonus part roll. The `|packparts` domain keeps
+    it independent of card pulls sharing the same pull_seq, so the part
+    roll can't perturb (or be perturbed by) the card-draw stream."""
+    mac = hmac.new(
+        f"{master_seed}|packparts".encode(),
+        f"{user_id}|{pull_seq}".encode(),
+        hashlib.sha256,
+    ).digest()
+    return int.from_bytes(mac[:8], "big") & 0x7FFFFFFFFFFFFFFF
+
+
 def _clamp_tier(tier: str, floor: str | None) -> str:
     if floor is not None and FRAME_RANK[tier] < FRAME_RANK[floor]:
         return floor

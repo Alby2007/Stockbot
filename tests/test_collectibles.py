@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 from psycopg import AsyncConnection
+from psycopg.rows import dict_row
 
 from stockbot.accounts.service import bootstrap_user
 from stockbot.bot.collection_view import build_page, parse_cid
@@ -14,12 +15,15 @@ from stockbot.bot.feed import _fmt_card_pull
 from stockbot.collectibles.pull import (
     FRAME_RANK,
     classify,
+    part_seed,
     pull_seed,
     resolve_pull,
 )
 from stockbot.collectibles.service import (
     PackError,
+    assemble_card,
     collection_stats,
+    collector_leaderboard,
     craft_card,
     find_card,
     get_card,
@@ -27,6 +31,7 @@ from stockbot.collectibles.service import (
     list_collection,
     load_pack_config,
     load_pools,
+    on_day,
     open_pack,
     set_featured_card,
     upgrade_frame,
@@ -798,3 +803,353 @@ async def test_concurrent_craft_loses_cleanly() -> None:
             await crafter.close()
     finally:
         await holder.close()
+
+
+# ---------------------------------------------------------------------------
+# Provenance: mint serials + print stamps (depth A)
+# ---------------------------------------------------------------------------
+
+
+async def _set_pull_tick(conn: AsyncConnection, tick: int = 90_000) -> None:
+    """open_pack stamps at MAX(market_ticks.tick_index)."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO market_ticks (tick_index, market_factor, sector_factors)"
+            " VALUES (%s, 0, '{}')",
+            (tick,),
+        )
+
+
+async def _force_tier(conn: AsyncConnection, tier: str) -> None:
+    """Pin every card pull to one frame tier."""
+    async with conn.cursor() as cur:
+        await cur.execute("UPDATE config SET value = 0 WHERE key LIKE 'pack.rate_%'")
+        await cur.execute(
+            "UPDATE config SET value = 1 WHERE key = %s",
+            (f"pack.rate_{tier.lower()}",),
+        )
+
+
+async def _probe_pool(conn: AsyncConnection) -> str:
+    """Restrict the pack pool to a single instrument card so the pull
+    target is deterministic. Returns the probe card key."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO card_sets (key, name, in_pack_pool)"
+            " VALUES ('probe', 'Probe Set', TRUE) ON CONFLICT DO NOTHING"
+        )
+        await cur.execute(
+            "UPDATE card_sets SET in_pack_pool = FALSE WHERE key <> 'probe'"
+        )
+        await cur.execute(
+            "INSERT INTO cards (key, set_key, kind, instrument_id, name, flavor)"
+            " SELECT 'card_probe', 'probe', 'INSTRUMENT', id, 'Probe Co', 'x'"
+            " FROM instruments ORDER BY id LIMIT 1"
+            " ON CONFLICT (key) DO NOTHING"
+        )
+    return "card_probe"
+
+
+async def test_pulls_mint_serials(conn: AsyncConnection) -> None:
+    await bootstrap_user(conn, _USER)
+    await _grant_pack(conn, _USER, "pack_basic")
+    outcomes = await open_pack(
+        conn, _USER, "pack_basic", interaction_id="pv-1", master_seed=_SEED
+    )
+    assert len(outcomes) == 3
+    async with conn.cursor() as cur:
+        for o in outcomes:
+            assert o.serial >= 1
+            await cur.execute(
+                "SELECT minted_count FROM cards WHERE key = %s", (o.card_key,)
+            )
+            assert int((await cur.fetchone())[0]) >= o.serial
+            if o.outcome == "NEW":
+                await cur.execute(
+                    "SELECT best_serial FROM user_cards"
+                    " WHERE user_id = %s AND card_key = %s",
+                    (_USER, o.card_key),
+                )
+                assert int((await cur.fetchone())[0]) == o.serial
+
+
+async def test_serials_increment_per_card_across_users(conn: AsyncConnection) -> None:
+    """One mint per card: serials continue across users and packs."""
+    key = await _probe_pool(conn)
+    await _force_tier(conn, "STANDARD")
+    other = 6202
+    await bootstrap_user(conn, _USER)
+    await bootstrap_user(conn, other)
+    await _grant_pack(conn, _USER, "pack_basic")
+    await _grant_pack(conn, other, "pack_basic")
+    out1 = await open_pack(
+        conn, _USER, "pack_basic", interaction_id="pv-2", master_seed=_SEED
+    )
+    out2 = await open_pack(
+        conn, other, "pack_basic", interaction_id="pv-3", master_seed=_SEED
+    )
+    assert [o.card_key for o in out1] == [key] * 3
+    assert [o.serial for o in out1] == [1, 2, 3]
+    assert [o.serial for o in out2] == [4, 5, 6]
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT copies FROM user_cards WHERE user_id = %s AND card_key = %s",
+            (_USER, key),
+        )
+        assert int((await cur.fetchone())[0]) == 3  # NEW + 2 burns
+
+
+async def test_upgrade_pull_replaces_serial(conn: AsyncConnection) -> None:
+    """The displayed serial follows the pull that set the held frame."""
+    key = await _probe_pool(conn)
+    await bootstrap_user(conn, _USER)
+    await _hold_card(conn, _USER, key, "STANDARD")  # hand-seeded, no serial
+    await _force_tier(conn, "SILVER")
+    await _grant_pack(conn, _USER, "pack_basic")
+    out = await open_pack(
+        conn, _USER, "pack_basic", interaction_id="pv-4", master_seed=_SEED
+    )
+    assert out[0].outcome == "UPGRADE"
+    assert out[1].outcome == "DUPLICATE"  # same frame now
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT best_frame, best_serial, copies FROM user_cards"
+            " WHERE user_id = %s AND card_key = %s",
+            (_USER, key),
+        )
+        frame, serial, copies = await cur.fetchone()
+    assert frame == "SILVER"
+    assert int(serial) == out[0].serial
+    assert int(copies) == 4  # the seeded copy + all 3 pulls
+
+
+async def test_pity_break_stamp(conn: AsyncConnection) -> None:
+    await _set_pull_tick(conn)
+    await bootstrap_user(conn, _USER)
+    await _grant_pack(conn, _USER, "pack_basic")
+    async with conn.cursor() as cur:
+        await cur.execute("UPDATE users SET pity_count = 20 WHERE id = %s", (_USER,))
+    out = await open_pack(
+        conn, _USER, "pack_basic", interaction_id="pv-5", master_seed=_SEED
+    )
+    first = min(out, key=lambda o: o.pull_seq)
+    assert "PITY_BREAK" in first.stamps
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT stamps FROM card_pulls WHERE user_id = %s AND pull_seq = %s",
+            (_USER, first.pull_seq),
+        )
+        assert "PITY_BREAK" in list((await cur.fetchone())[0])
+
+
+async def test_market_context_stamps(conn: AsyncConnection) -> None:
+    """Halt + all-time-high + closed venue + moon candle stamp together."""
+    # Tick 1400 sits inside BOTH venues' closed windows (US: t%1440>=960;
+    # AS: (t-720)%1440 >= 600) -- a clean OFF_HOURS without touching the
+    # markets CHECK on open_ticks.
+    await _set_pull_tick(conn, 1400)
+    await bootstrap_user(conn, _USER)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE instruments SET circuit_halted_until_tick = 999_999_999,"
+            " high_water_price = quoted_price"
+        )
+        await cur.execute(
+            "INSERT INTO candles (instrument_id, tick_index, open, high, low, close)"
+            " SELECT id, 1400, 10, 12, 10, 12 FROM instruments"
+        )
+    await _force_tier(conn, "STANDARD")
+    await _grant_pack(conn, _USER, "pack_basic")
+    out = await open_pack(
+        conn, _USER, "pack_basic", interaction_id="pv-6", master_seed=_SEED
+    )
+    for o in out:
+        assert {"HALT_PRINT", "PEAK_PRINT", "OFF_HOURS", "MOON"} <= set(o.stamps)
+
+
+async def test_low_serial_broadcasts(conn: AsyncConnection) -> None:
+    """Serials <= stamps.low_serial_feed hit the tape even at STANDARD."""
+    await _probe_pool(conn)
+    await _force_tier(conn, "STANDARD")
+    await bootstrap_user(conn, _USER)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO feed_channels (guild_id, channel_id) VALUES (1, 99)"
+        )
+    await _grant_pack(conn, _USER, "pack_basic")
+    await open_pack(conn, _USER, "pack_basic", interaction_id="pv-7", master_seed=_SEED)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT count(*) FROM feed_items WHERE kind = 'CARD_PULL'"
+        )
+        assert int((await cur.fetchone())[0]) == 3  # serials 1,2,3 all qualify
+
+
+# ---------------------------------------------------------------------------
+# Collector demand surfaces (depth C)
+# ---------------------------------------------------------------------------
+
+
+async def test_collector_leaderboard_scores(conn: AsyncConnection) -> None:
+    """Score = frame weight + kind bonus + serial bonus; lore outranks."""
+    other = 6203
+    await bootstrap_user(conn, _USER)
+    await bootstrap_user(conn, other)
+    # _USER: one GOLD instrument + one EPIC lore at mint #1
+    await _hold_card(conn, _USER, "card_nort", "GOLD")
+    await _hold_card(conn, _USER, "lore_market_maker", "EPIC")
+    await _hold_card(conn, other, "card_sout", "STANDARD")
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE user_cards SET best_serial = 1"
+            " WHERE user_id = %s AND card_key = 'lore_market_maker'",
+            (_USER,),
+        )
+    board = await collector_leaderboard(conn, limit=100)
+    # Committed residue from the race tests can sit on the board too --
+    # assert the RELATIVE order, not absolute positions.
+    mine = next(r for r in board if int(r["user_id"]) == _USER)
+    theirs = next(r for r in board if int(r["user_id"]) == other)
+    assert board.index(mine) < board.index(theirs)
+    assert mine["top_name"] is not None
+    assert int(mine["score"]) > int(theirs["score"])
+
+
+async def test_daily_top_pull_broadcast(conn: AsyncConnection) -> None:
+    """The day boundary posts the day's best pull to bound channels."""
+    await bootstrap_user(conn, _USER)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "INSERT INTO feed_channels (guild_id, channel_id) VALUES (1, 99)"
+        )
+        await cur.execute(
+            "INSERT INTO card_pulls (user_id, pull_seq, pack_key,"
+            " pity_count_before, tier, card_key, outcome, serial, tick_index)"
+            " VALUES (%s, 1, 'pack_basic', 0, 'STANDARD', 'card_nort', 'NEW',"
+            " 1, 1400), (%s, 2, 'pack_basic', 0, 'LEGENDARY', 'lore_market_maker', 'NEW',"
+            " 7, 1439)",
+            (_USER, _USER),
+        )
+    await on_day(conn, 1440)
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT kind, payload FROM feed_items WHERE kind = 'TOP_PULL'"
+        )
+        rows = await cur.fetchall()
+    assert len(rows) == 1
+    assert rows[0]["payload"]["tier"] == "LEGENDARY"
+    assert rows[0]["payload"]["serial"] == 7
+
+
+async def test_on_day_noop_mid_day(conn: AsyncConnection) -> None:
+    await bootstrap_user(conn, _USER)
+    await on_day(conn, 700)  # not a boundary: nothing happens, no rows
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT count(*) FROM feed_items")
+        assert int((await cur.fetchone())[0]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Parts and assembled pieces (depth D)
+# ---------------------------------------------------------------------------
+
+
+async def test_part_roll_replays_and_mints(conn: AsyncConnection) -> None:
+    """The bonus part pull replays from its own domain-separated seed."""
+    import random as _random
+
+    from stockbot.collectibles.service import load_part_pool
+
+    await bootstrap_user(conn, _USER)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = 1 WHERE key = 'pack.part_chance'"
+        )
+    await _grant_pack(conn, _USER, "pack_basic")
+    out = await open_pack(
+        conn, _USER, "pack_basic", interaction_id="pt-1", master_seed=_SEED
+    )
+    cards = [o for o in out if o.tier != "PART"]
+    parts = [o for o in out if o.tier == "PART"]
+    assert len(cards) == 3 and len(parts) == 1
+    part = parts[0]
+    assert part.outcome == "NEW"
+    pool = await load_part_pool(conn)
+    rng = _random.Random(part_seed(_SEED, _USER, part.pull_seq))
+    assert rng.random() < 1.0  # the hit roll consumed first
+    assert pool[rng.randrange(len(pool))] == part.card_key
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT pack_pulls FROM users WHERE id = %s", (_USER,))
+        assert int((await cur.fetchone())[0]) == 4  # part roll took a seq
+
+
+async def test_part_roll_miss_costs_no_seq(conn: AsyncConnection) -> None:
+    await bootstrap_user(conn, _USER)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = 0 WHERE key = 'pack.part_chance'"
+        )
+    await _grant_pack(conn, _USER, "pack_basic")
+    out = await open_pack(
+        conn, _USER, "pack_basic", interaction_id="pt-2", master_seed=_SEED
+    )
+    assert len(out) == 3
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT pack_pulls FROM users WHERE id = %s", (_USER,))
+        assert int((await cur.fetchone())[0]) == 3
+
+
+async def test_assemble_consumes_parts(conn: AsyncConnection) -> None:
+    await bootstrap_user(conn, _USER)
+    for part in ("cover", "risk", "terms", "sig", "seal"):
+        await _hold_card(conn, _USER, f"part_charter_{part}")
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE user_cards SET copies = 3 WHERE user_id = %s"
+            " AND card_key = 'part_charter_cover'",
+            (_USER,),
+        )
+    key, serial = await assemble_card(conn, _USER, "asm_charter")
+    assert key == "asm_charter"
+    assert serial == 1
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT copies FROM user_cards WHERE user_id = %s"
+            " AND card_key = 'part_charter_cover'",
+            (_USER,),
+        )
+        assert int((await cur.fetchone())[0]) == 2  # qty 1 consumed
+        await cur.execute(
+            "SELECT count(*) FROM user_cards WHERE user_id = %s"
+            " AND card_key LIKE 'part_charter_%%'",
+            (_USER,),
+        )
+        assert int((await cur.fetchone())[0]) == 1  # only the extra copies left
+        await cur.execute(
+            "SELECT best_frame FROM user_cards WHERE user_id = %s"
+            " AND card_key = 'asm_charter'",
+            (_USER,),
+        )
+        assert (await cur.fetchone())[0] == "STANDARD"
+
+
+async def test_assemble_missing_part(conn: AsyncConnection) -> None:
+    await bootstrap_user(conn, _USER)
+    await _hold_card(conn, _USER, "part_charter_cover")
+    with pytest.raises(PackError, match="Missing parts"):
+        await assemble_card(conn, _USER, "asm_charter")
+
+
+async def test_assemble_rejects_non_assembled(conn: AsyncConnection) -> None:
+    await bootstrap_user(conn, _USER)
+    with pytest.raises(PackError):
+        await assemble_card(conn, _USER, "card_nort")
+
+
+async def test_craft_rejects_parts_and_assembled(conn: AsyncConnection) -> None:
+    await bootstrap_user(conn, _USER)
+    await _set_shards(conn, _USER, 500)
+    with pytest.raises(PackError):
+        await craft_card(conn, _USER, "asm_charter")
+    with pytest.raises(PackError):
+        await craft_card(conn, _USER, "part_charter_cover")

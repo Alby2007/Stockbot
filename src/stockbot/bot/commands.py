@@ -58,6 +58,7 @@ from stockbot.bot.autocomplete import (
     sector_autocomplete,
     shop_item_autocomplete,
     short_autocomplete,
+    their_card_autocomplete,
     ticker_autocomplete,
     tunable_param_autocomplete,
 )
@@ -70,6 +71,10 @@ from stockbot.bot.chart_view import (
     save_chart_prefs,
 )
 from stockbot.bot.charts import render_candle_chart
+from stockbot.bot.collection_view import (
+    STAMP_LABEL,
+    stamp_glyphs,
+)
 from stockbot.bot.collection_view import (
     build_page as build_collection_page,
 )
@@ -91,6 +96,7 @@ from stockbot.bot.shop_view import (
     is_purchasable,
     load_shop_state,
 )
+from stockbot.bot.trade_view import render_trade, trade_view
 from stockbot.claims.errors import (
     AccountTooYoungError,
     AlreadyClaimedTodayError,
@@ -100,15 +106,26 @@ from stockbot.claims.service import claim_daily
 from stockbot.collectibles.pull import FRAME_RANK
 from stockbot.collectibles.service import (
     PullOutcome,
+    assemble_card,
     collection_stats,
+    collector_leaderboard,
     craft_card,
     find_card,
     list_collection,
+    recipe_for,
     set_featured_card,
     upgrade_frame,
 )
 from stockbot.collectibles.service import (
     open_pack as open_card_pack,
+)
+from stockbot.collectibles.trades import (
+    cancel as trades_cancel,
+)
+from stockbot.collectibles.trades import (
+    create_offer,
+    get_trade,
+    list_trades,
 )
 from stockbot.compliance.wash_trade import scan_for_wash_trades
 from stockbot.config import get_settings
@@ -266,14 +283,19 @@ def _frame_glyph_for(card: Any) -> str:
 
 
 def _pull_embed(outcome: PullOutcome, index: int, total: int) -> discord.Embed:
-    """One staged-reveal card: frame glyph + name + outcome, duplicates
-    carrying their shard award (C6 -- a visible 'rare' dupe must never
-    read as a bare loss)."""
+    """One staged-reveal card: frame glyph + name + mint serial + print
+    stamps + outcome, duplicates carrying their shard award (C6 -- a
+    visible 'rare' dupe must never read as a bare loss)."""
     dup = f" — duplicate, +{outcome.shards} shards" if outcome.outcome == "DUPLICATE" else ""
     upgrade = " — upgraded frame!" if outcome.outcome == "UPGRADE" else ""
+    stamp_names = ", ".join(
+        STAMP_LABEL.get(s, s) for s in outcome.stamps
+    )
     embed = discord.Embed(
-        title=f"{_frame_glyph(outcome.tier)} {outcome.tier}",
-        description=f"**{outcome.name}**{dup}{upgrade}",
+        title="🧩 Bonus part" if outcome.tier == "PART"
+              else f"{_frame_glyph(outcome.tier)} {outcome.tier}",
+        description=f"**{outcome.name}** #{outcome.serial}{dup}{upgrade}"
+        + (f"\n*{stamp_names}*" if stamp_names else ""),
     )
     embed.set_footer(text=f"Card {index}/{total}")
     return embed
@@ -2436,8 +2458,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 return
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT best_frame, copies FROM user_cards "
-                    "WHERE user_id = %s AND card_key = %s",
+                    "SELECT uc.best_frame, uc.copies, uc.best_serial,"
+                    " COALESCE(bp.stamps, '{}') AS best_stamps"
+                    " FROM user_cards uc"
+                    " LEFT JOIN card_pulls bp"
+                    "  ON bp.user_id = uc.user_id"
+                    " AND bp.card_key = uc.card_key"
+                    " AND bp.serial = uc.best_serial"
+                    " WHERE uc.user_id = %s AND uc.card_key = %s",
                     (interaction.user.id, c.key),
                 )
                 held = await cur.fetchone()
@@ -2451,13 +2479,38 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
         embed.add_field(name="Card", value=kind_label)
         if held:
-            embed.add_field(
-                name="Yours",
-                value=f"{_frame_glyph(str(held[0]))} {held[0]}"
-                + (f" ×{held[1]}" if int(held[1]) > 1 else ""),
-            )
+            yours = f"{_frame_glyph(str(held[0]))} {held[0]}"
+            if held[2] is not None:
+                yours += f" · mint #{held[2]}"
+            if int(held[1]) > 1:
+                yours += f" ×{held[1]}"
+            stamp_names = [STAMP_LABEL.get(s, s) for s in held[3] or []]
+            if stamp_names:
+                yours += "\n*" + "; ".join(stamp_names) + "*"
+            embed.add_field(name="Yours", value=yours)
         else:
             embed.add_field(name="Yours", value="Not collected")
+        if c.kind == "ASSEMBLED":
+            async with db.connection() as conn:
+                recipe = await recipe_for(conn, c.key)
+                prog: dict[str, int] = {}
+                if recipe:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT card_key, copies FROM user_cards"
+                            " WHERE user_id = %s AND card_key = ANY(%s)",
+                            (interaction.user.id, [r["part_key"] for r in recipe]),
+                        )
+                        prog = {str(r[0]): int(r[1]) for r in await cur.fetchall()}
+            if recipe:
+                embed.add_field(
+                    name="Recipe",
+                    value="\n".join(
+                        f"{min(prog.get(r['part_key'], 0), r['qty'])}/{r['qty']} {r['name']}"
+                        for r in recipe
+                    ),
+                    inline=False,
+                )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @tree.command(name="collection", description="Browse a card binder")
@@ -2474,6 +2527,38 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             target.display_name, stats, rows, target.id, 0
         )
         await interaction.response.send_message(embed=embed, view=view)
+
+    @tree.command(name="collectors", description="Top collectors by card score")
+    async def collectors(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            rows = await collector_leaderboard(conn, limit=15)
+            mine = await collector_leaderboard(
+                conn, limit=None, user_id=interaction.user.id
+            )
+        lines = []
+        for idx, r in enumerate(rows, start=1):
+            top = (
+                f" · {r['top_frame']} {r['top_name']}"
+                + (f" #{r['top_serial']}" if r.get("top_serial") else "")
+                if r.get("top_name")
+                else ""
+            )
+            lines.append(
+                f"{idx:>3}. <@{r['user_id']}> — **{int(r['score'])}** "
+                f"({int(r['cards'])} cards){top}"
+            )
+        embed = discord.Embed(
+            title="Collector leaderboard",
+            description="\n".join(lines)
+            if lines
+            else "No cards yet — `/open` a pack to start a binder.",
+        )
+        if mine:
+            embed.set_footer(
+                text=f"You: {int(mine[0]['score'])} pts · {int(mine[0]['cards'])} cards"
+            )
+        await interaction.response.send_message(embed=embed)
 
     @tree.command(name="open", description="Open a card pack with a staged reveal")
     @app_commands.describe(pack="Which pack to open")
@@ -2503,8 +2588,12 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
             return
 
-        # Best lands last -- ascending pulled-tier order for the reveal.
-        reveals = sorted(outcomes, key=lambda o: FRAME_RANK.get(o.tier, 0))
+        # Bonus parts open first (the wrapper), then best lands last --
+        # ascending pulled-tier order for the card reveals.
+        reveals = sorted(
+            outcomes,
+            key=lambda o: (o.tier != "PART", FRAME_RANK.get(o.tier, 0)),
+        )
         if reveals:
             # First card on the deferred response; the rest edit in.
             embed = _pull_embed(reveals[0], 1, len(reveals))
@@ -2514,16 +2603,22 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 embed = _pull_embed(outcome, idx, len(reveals))
                 await interaction.edit_original_response(embed=embed)
         summary = "\n".join(
-            f"{_frame_glyph(o.tier)} **{o.name}** — {o.outcome.lower()}"
+            f"{_frame_glyph(o.tier)} **{o.name}** #{o.serial} — {o.outcome.lower()}"
             + (f" (+{o.shards} shards)" if o.shards else "")
+            + stamp_glyphs(o.stamps)
             for o in reveals
         )
         await asyncio.sleep(0.6)
         await interaction.edit_original_response(
-            embed=discord.Embed(title=f"Pack opened — {len(reveals)} cards", description=summary)
+            embed=discord.Embed(
+                title=f"Pack opened — {len(reveals)} cards", description=summary
+            )
         )
 
-    @tree.command(name="craft", description="Craft a missing card or upgrade a frame with shards")
+    @tree.command(
+        name="craft",
+        description="Craft a missing card, upgrade a frame, or assemble parts",
+    )
     @app_commands.describe(card="Card to craft (missing) or frame-upgrade (held)")
     @app_commands.autocomplete(card=card_autocomplete)
     async def craft(interaction: discord.Interaction, card: str) -> None:
@@ -2542,7 +2637,12 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 )
                 held = await cur.fetchone() is not None
             try:
-                if held:
+                if c.kind == "ASSEMBLED":
+                    _k, serial = await assemble_card(
+                        conn, interaction.user.id, c.key
+                    )
+                    message = f"Assembled **{c.name}** — mint #{serial}."
+                elif held:
                     _k, frame, cost = await upgrade_frame(conn, interaction.user.id, c.key)
                     message = (
                         f"Upgraded **{c.name}** to {_frame_glyph(frame)} {frame} "
@@ -2584,6 +2684,122 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
         else:
             await interaction.response.send_message("Featured card cleared.")
+
+    trade_group = app_commands.Group(
+        name="trade", description="Trade cards and shards with other players"
+    )
+
+    @trade_group.command(name="offer", description="Offer a card/shard swap to another player")
+    @app_commands.describe(
+        user="Who you're offering to",
+        give="Card you give (optional if you give shards)",
+        want="Card you want from them (optional if you ask shards)",
+        give_shards="Shards you add to your side",
+        want_shards="Shards you ask from their side",
+    )
+    @app_commands.autocomplete(give=owned_card_autocomplete, want=their_card_autocomplete)
+    async def trade_offer(
+        interaction: discord.Interaction,
+        user: discord.User,
+        give: str | None = None,
+        want: str | None = None,
+        give_shards: int = 0,
+        want_shards: int = 0,
+    ) -> None:
+        if give_shards < 0 or want_shards < 0:
+            await interaction.response.send_message(
+                "Shard amounts can't be negative.", ephemeral=True
+            )
+            return
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            async with conn.cursor() as cur:
+                # No bootstrap for the counterparty: offering to someone
+                # who never played shouldn't mint them an account.
+                await cur.execute("SELECT 1 FROM users WHERE id = %s", (user.id,))
+                if await cur.fetchone() is None:
+                    await interaction.response.send_message(
+                        f"<@{user.id}> hasn't started yet — they need `/start` first.",
+                        ephemeral=True,
+                    )
+                    return
+            give_c = await find_card(conn, give) if give else None
+            want_c = await find_card(conn, want) if want else None
+            if give and give_c is None:
+                await interaction.response.send_message(
+                    f"No card named **{give}**.", ephemeral=True
+                )
+                return
+            if want and want_c is None:
+                await interaction.response.send_message(
+                    f"No card named **{want}**.", ephemeral=True
+                )
+                return
+            give_cards = [give_c.key] if give_c else []
+            want_cards = [want_c.key] if want_c else []
+            tick = await current_tick_index(conn)
+            try:
+                trade_id = await create_offer(
+                    conn,
+                    interaction.user.id,
+                    user.id,
+                    give_cards,
+                    want_cards,
+                    give_shards,
+                    want_shards,
+                    tick,
+                )
+            except ShopError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+            trade = await get_trade(conn, trade_id)
+            assert trade is not None
+            embed = await render_trade(conn, trade)
+        await interaction.response.send_message(
+            embed=embed, view=trade_view(trade_id)
+        )
+
+    @trade_group.command(name="list", description="Your open trade offers")
+    async def trade_list(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            offers = await list_trades(conn, interaction.user.id)
+        if not offers:
+            await interaction.response.send_message(
+                "No open offers — `/trade offer` to start one.", ephemeral=True
+            )
+            return
+        lines = []
+        for t in offers:
+            direction = "→" if t.proposer == interaction.user.id else "←"
+            other = t.counterparty if t.proposer == interaction.user.id else t.proposer
+            side = (
+                f"{', '.join(t.give_cards)}"
+                + (f" +{t.give_shards}sh" if t.give_shards else "")
+            ) or "nothing"
+            gets = (
+                f"{', '.join(t.want_cards)}"
+                + (f" +{t.want_shards}sh" if t.want_shards else "")
+            ) or "nothing"
+            lines.append(f"`#{t.id}` {direction} <@{other}> — {side} ⇄ {gets}")
+        await interaction.response.send_message(
+            embed=discord.Embed(title="Open trades", description="\n".join(lines)),
+            ephemeral=True,
+        )
+
+    @trade_group.command(name="cancel", description="Cancel an open offer you made")
+    @app_commands.describe(trade_id="Offer id from /trade list")
+    async def trade_cancel(interaction: discord.Interaction, trade_id: int) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            try:
+                await trades_cancel(conn, trade_id, interaction.user.id)
+            except ShopError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(
+            f"Offer `#{trade_id}` cancelled.", ephemeral=True
+        )
 
     ipo_group = app_commands.Group(
         name="ipo", description="IPO subscriptions — commit cash before listing day"

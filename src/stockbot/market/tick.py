@@ -12,6 +12,8 @@ from psycopg import AsyncConnection, sql
 from psycopg.rows import dict_row
 
 from stockbot.alerts import service as alerts
+from stockbot.collectibles import moments
+from stockbot.collectibles import service as collect_svc
 from stockbot.ipo import service as ipo
 from stockbot.maintenance import run_maintenance_if_due
 from stockbot.margin import service as margin
@@ -223,6 +225,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             # actions aren't session-gated -- sweep here too.
             await quests.on_tick(conn, tick_index)
             quest_fires = await quests.sweep_completions(conn, tick_index)
+            await collect_svc.on_day(conn, tick_index)
             duration_ms = (time.perf_counter() - started) * 1000
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -252,13 +255,14 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             # No accounts are touched here, so this is just instruments-by-id.
             await cur.execute(
                 """
-                SELECT i.id, i.ticker, i.kind, s.key AS sector_key, i.drift, i.sigma,
+                SELECT i.id, i.ticker, i.name, i.kind, s.key AS sector_key, i.drift, i.sigma,
                        i.beta, i.gamma,
                        i.kappa, i.fundamental_sigma, i.tau_ticks, i.base_price,
                        i.fundamental_value, i.impact, i.circuit_halted_until_tick,
                        i.float_shares, i.index_divisor, i.dividend_drift_offset,
                        i.index_member, i.market_id,
-                       i.vol_state, i.sigma_eff, i.drift_state, i.flow_skew
+                       i.vol_state, i.sigma_eff, i.drift_state, i.flow_skew,
+                       i.high_water_price
                 FROM instruments i
                 JOIN sectors s ON s.id = i.sector_id
                 WHERE i.is_active
@@ -653,6 +657,11 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
                             fundamental_value = v.fundamental_value::numeric,
                             impact = v.impact::numeric,
                             quoted_price = v.quoted_price::numeric,
+                            -- ATH tracker for card PEAK stamps + RECORD
+                            -- moments: GREATEST makes the write idempotent
+                            -- under any intra-tick ordering.
+                            high_water_price = GREATEST(
+                                i.high_water_price, v.quoted_price::numeric),
                             circuit_halted_until_tick = v.circuit_halted_until_tick::bigint,
                             last_halt_end_tick = COALESCE(
                                 v.new_halt_end::bigint, i.last_halt_end_tick),
@@ -869,10 +878,22 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         await snapshot_net_worth_if_due(conn, tick_index)
         await evaluate_badges(conn, tick_index)
         await ipo.settle_due(conn, tick_index)
+        # Moments mint commemoratives from this tick's own numbers --
+        # detection reads results/opens/rows_by_id already in memory,
+        # no extra queries unless something remarkable happened.
+        moment_mints = await moments.sweep_moments(
+            conn,
+            tick_index,
+            results=results,
+            opens=opens,
+            flow_breached=flow_breached,
+            rows_by_id=rows_by_id,
+        )
         # Quest rotation at day boundaries, then the completion sweep
         # LAST so all of this tick's fills/KOs/covers count.
         await quests.on_tick(conn, tick_index)
         quest_fires = await quests.sweep_completions(conn, tick_index)
+        await collect_svc.on_day(conn, tick_index)
 
         duration_ms = (time.perf_counter() - started) * 1000
         async with conn.cursor() as cur:
@@ -903,7 +924,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
     log.info(
         "tick=%d phase=OPEN steps=%d events=%d crosses=%d mm_fills=%d "
         "stops=%d kos=%d recalls=%d liqs=%d alerts=%d opts=%d quests=%d "
-        "auction=%d ms=%.1f",
+        "moments=%d auction=%d ms=%.1f",
         tick_index,
         len(results),
         stats.get("events_resolved", 0),
@@ -916,6 +937,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         alert_fires,
         opt_settled,
         quest_fires,
+        moment_mints,
         stats.get("auction_fills", 0),
         duration_ms,
     )

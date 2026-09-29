@@ -25,6 +25,12 @@ from stockbot.bot.feed import poll_once as feed_poll_once
 from stockbot.bot.leaderboard import sync_leaderboard_boards
 from stockbot.bot.notify import DeliveryForbidden, poll_once
 from stockbot.bot.shop_view import SHOP_CID_PREFIX, handle_shop_component
+from stockbot.bot.trade_view import (
+    CID_PREFIX as TRADE_CID_PREFIX,
+)
+from stockbot.bot.trade_view import (
+    handle_trade_component,
+)
 from stockbot.config import get_settings
 from stockbot.logging import setup_logging
 from stockbot.observability import write_heartbeat
@@ -262,6 +268,24 @@ class StockBotClient(discord.Client):
                     else:
                         await interaction.response.send_message(
                             "Couldn't turn that page — run /collection again.",
+                            ephemeral=True,
+                        )
+                except discord.HTTPException:
+                    pass
+        elif str(data.get("custom_id", "")).startswith(TRADE_CID_PREFIX):
+            try:
+                await handle_trade_component(interaction)
+            except Exception:
+                log.exception("trade component interaction failed")
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(
+                            "Couldn't answer that trade — run /trade list.",
+                            ephemeral=True,
+                        )
+                    else:
+                        await interaction.response.send_message(
+                            "Couldn't answer that trade — run /trade list.",
                             ephemeral=True,
                         )
                 except discord.HTTPException:

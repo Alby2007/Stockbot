@@ -169,11 +169,42 @@ def _fmt_market_news(items: list[dict[str, Any]]) -> str:
 
 def _fmt_card_pull(items: list[dict[str, Any]]) -> str:
     # Achievement class (like JACKPOT): the mention stays -- NPCs can't
-    # reach packs, so attribution is safe.
+    # reach packs, so attribution is safe. Serial shown when the pull
+    # was broadcast for being a low mint (#1-#10 chase prints).
     parts = [
-        f"{_mention(p['subject'])} pulled {p['tier']} {p['name']}" for p in items
+        f"{_mention(p['subject'])} pulled {p['tier']} {p['name']}"
+        + (f" #{p['serial']}" if p.get("serial") else "")
+        for p in items
     ]
     return "🃏 " + "; ".join(parts)
+
+
+def _fmt_trade_completed(items: list[dict[str, Any]]) -> str:
+    parts = []
+    for p in items:
+        gave = ", ".join(p.get("give") or []) or "shards"
+        want = ", ".join(p.get("want") or []) or "shards"
+        parts.append(f"{_mention(p['subject'])} ⇄ <@{p['other']}>: {gave} for {want}")
+    return "🔄 " + "; ".join(parts)
+
+
+def _fmt_top_pull(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    serial = f" #{p['serial']}" if p.get("serial") else ""
+    return (
+        f"🏆 pull of the day: {_mention(p['subject'])} — "
+        f"{p['tier']} **{p['name']}**{serial}"
+    )
+
+
+def _fmt_moment_minted(items: list[dict[str, Any]]) -> str:
+    # Market history, not an achievement: no subject mention, just the
+    # minted moment and how many holders witnessed it.
+    parts = [
+        f"**{p['name']}** minted — {p.get('awarded', 0)} witnesses"
+        for p in items
+    ]
+    return "📸 " + "; ".join(parts)
 
 
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
@@ -188,6 +219,9 @@ _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "NEWS_LANDED": _fmt_market_news,
     "EARNINGS": _fmt_market_news,
     "CARD_PULL": _fmt_card_pull,
+    "MOMENT_MINTED": _fmt_moment_minted,
+    "TOP_PULL": _fmt_top_pull,
+    "TRADE_COMPLETED": _fmt_trade_completed,
 }
 
 

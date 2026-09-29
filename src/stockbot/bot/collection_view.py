@@ -34,7 +34,47 @@ FRAME_GLYPH = {
     "PLATINUM": "💠",
     "EPIC": "🟣",
     "LEGENDARY": "🌟",
+    "PART": "🧩",
 }
+
+# Print-context stamps: one glyph per provenance mark.
+STAMP_GLYPH = {
+    "HALT_PRINT": "🧊",
+    "PEAK_PRINT": "🏔",
+    "DAY_ONE": "🌅",
+    "OFF_HOURS": "🌙",
+    "MOON": "🚀",
+    "CRATER": "☄",
+    "PITY_BREAK": "🎲",
+}
+
+STAMP_LABEL = {
+    "HALT_PRINT": "printed during a halt",
+    "PEAK_PRINT": "printed at the all-time high",
+    "DAY_ONE": "printed on listing day",
+    "OFF_HOURS": "printed after hours",
+    "MOON": "printed on a moon tick",
+    "CRATER": "printed on a crash tick",
+    "PITY_BREAK": "broke the pity streak",
+}
+
+
+def stamp_glyphs(stamps: list[str] | tuple[str, ...] | None) -> str:
+    """Compact ' 🧊🚀' suffix for a pull's stamp list."""
+    if not stamps:
+        return ""
+    return "".join(STAMP_GLYPH.get(s, "") for s in stamps)
+
+
+def serial_tag(row: dict[str, Any]) -> str:
+    """' #7' suffix; 1st Ed. when the held copy predates set rotation."""
+    serial = row.get("best_serial")
+    if serial is None:
+        return ""
+    tag = f" #{serial}"
+    if row.get("first_edition"):
+        tag += " 1st Ed."
+    return tag
 
 
 
@@ -66,6 +106,8 @@ def _group_lines(rows: list[dict[str, Any]]) -> list[str]:
     instruments = [r for r in rows if r["kind"] == "INSTRUMENT"]
     lore = [r for r in rows if r["kind"] == "LORE"]
     comm = [r for r in rows if r["kind"] == "COMMEMORATIVE"]
+    parts = [r for r in rows if r["kind"] == "PART"]
+    assembled = [r for r in rows if r["kind"] == "ASSEMBLED"]
 
     lines: list[str] = []
     by_sector: dict[Any, list[dict[str, Any]]] = {}
@@ -78,16 +120,31 @@ def _group_lines(rows: list[dict[str, Any]]) -> list[str]:
             # copies counts lifetime pulls, including burned duplicates;
             # a held row is always a single copy.
             copies = f" (pulled ×{r['copies']})" if r["copies"] > 1 else ""
-            lines.append(f"{frame_glyph(r['best_frame'])} {r['name']}{copies}")
+            lines.append(
+                f"{frame_glyph(r['best_frame'])} {r['name']}"
+                f"{serial_tag(r)}{stamp_glyphs(r.get('best_stamps'))}{copies}"
+            )
     if lore:
         lines.append("**— Lore —**")
         for r in lore:
             copies = f" (pulled ×{r['copies']})" if r["copies"] > 1 else ""
-            lines.append(f"{frame_glyph(r['best_frame'])} {r['name']}{copies}")
+            lines.append(
+                f"{frame_glyph(r['best_frame'])} {r['name']}"
+                f"{serial_tag(r)}{stamp_glyphs(r.get('best_stamps'))}{copies}"
+            )
     if comm:
         lines.append("**— Commemoratives —**")
         for r in comm:
-            lines.append(f"🏅 {r['name']}")
+            lines.append(f"🏅 {r['name']}{serial_tag(r)}")
+    if assembled:
+        lines.append("**— Assembled —**")
+        for r in assembled:
+            lines.append(f"🏗 {r['name']}{serial_tag(r)}")
+    if parts:
+        lines.append("**— Parts —**")
+        for r in parts:
+            # PART copies are the held stack (consumed on assemble).
+            lines.append(f"🧩 {r['name']} ×{r['copies']}")
     return lines
 
 
@@ -117,6 +174,7 @@ def build_page(
         + (f" · {frame_bits}" if frame_bits else "")
         + f" · Lore **{lore_held}/{lore_total}**"
         + f" · **{stats.get('shards', 0)}** shards"
+        + f" · score **{stats.get('score', 0)}**"
     )
 
     embed = discord.Embed(

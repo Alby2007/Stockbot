@@ -1195,6 +1195,50 @@ get_user/fetch_user fallback, NOT guild.get_member (no privileged
 members intent). Both pack items are plain CONSUMABLE shop rows — they
 land in `/shop` → Consumables and stack normally.
 
+**Collectibles depth A–E done** (migrations `0062`–`0066`,
+`collectibles/{moments,trades}.py`, `bot/trade_view.py`): (A)
+provenance — every pull mints a per-card `serial` via
+`cards.minted_count` + `FOR UPDATE`-equivalent `UPDATE ... RETURNING`
+(serializes concurrent minters); `user_cards.best_serial` is the serial
+of the pull that set the held frame (shard-crafted frames keep the
+origin serial). Print-context `stamps` on each pull row derive from the
+pull tick: HALT_PRINT (`circuit_halted_until_tick` >= pull tick),
+PEAK_PRINT (quoted >= `instruments.high_water_price` — a GREATEST
+tracker inside apply_tick's instruments UPDATE; ATH backfilled from
+candle highs so forward-only), DAY_ONE (settled IPO within 1440t),
+OFF_HOURS (venue phase CLOSED), MOON/CRATER (|tick move| >= 12%),
+PITY_BREAK. Serials <= `stamps.low_serial_feed` broadcast CARD_PULL
+even at low tiers. `card_sets.rotated_tick` is the 1st-Ed hook.
+(B) moments — `sweep_moments` runs inside the open-tick pipeline
+reading only in-memory state (results/opens/flow_breached/rows_by_id —
+zero hot-path queries); MOVER (|close/open-1| >= 12%), MASS_HALT (>=5
+fresh circuit+flow halts), RECORD (close >= 2x pre-tick high_water)
+mint COMMEMORATIVE cards into the 'moments' set (never in pack pools)
+and grant them to main-economy witnesses (`season_id IS NULL`,
+quantity <> 0) via `grant_commemorative` + MOMENT_EARNED DMs;
+`moment_card_seq` names them; `moments_dedup` unique index +
+ON CONFLICT make mints idempotent, `moment.max_per_tick`=3 caps chaos
+ticks. (C) demand — `collector_leaderboard` scores frame weight +
+kind bonus (lore/commemorative/assembled) + serial bonus (mint #1,
+low prints); `/collectors` renders it; `on_day` (day boundary in both
+tick branches) posts TOP_PULL to the feed and expires stale
+card_trades (regclass-probed so 0064 works pre-0066). (D) parts —
+each pack gets ONE bonus part roll on the domain-separated
+`part_seed` (HMAC over `master|parts`) so pull_cfg replay is
+byte-identical; a hit consumes the next pull_seq, a miss doesn't.
+PART cards stack via `copies`; `card_recipes` define ASSEMBLED
+pieces (`/craft` routes them to `assemble_card`, which deletes spent
+stacks BEFORE decrementing — the copies>0 CHECK is per-statement);
+ASSEMBLED mint serials too. (E) trades — non-custodial offers in
+`card_trades` (`/trade offer|list|cancel`, `trade:{action}:{id}` cids
+on the trade_view pattern); accept re-verifies BOTH binders under FOR
+UPDATE (stale offers auto-void, nothing is escrowed), merges rows
+(best frame wins, lowest serial survives, copies sum), moves shard
+legs as signed 'TRADE' `shard_events` pairs (the SUM invariant
+holds), unpins featured cards, and emits TRADE_OFFER/TRADE_RESULT DMs
++ a TRADE_COMPLETED feed line. No cash leg exists — nothing converts
+back to currency.
+
 **Public tape done** (`migrations/0055_feed.sql`, `src/stockbot/feed`,
 `src/stockbot/bot/feed.py`, `/feed-setup` `/feed-remove`): a per-guild
 market-drama channel. `feed_channels` binds one channel per guild;
