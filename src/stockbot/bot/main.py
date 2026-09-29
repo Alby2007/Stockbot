@@ -35,7 +35,7 @@ log = logging.getLogger("stockbot.bot")
 HEARTBEAT_INTERVAL_SECONDS = 30
 NOTIFY_POLL_INTERVAL_SECONDS = 5
 FEED_POLL_INTERVAL_SECONDS = 30
-LEADERBOARD_INTERVAL_SECONDS = 60
+LEADERBOARD_INTERVAL_SECONDS = 15
 
 
 class StockBotTree(discord.app_commands.CommandTree["StockBotClient"]):
@@ -288,9 +288,10 @@ class StockBotClient(discord.Client):
         log.info("no writable channel for welcome in guild %s", guild.id)
 
     async def _leaderboard_loop(self) -> None:
-        """Refresh bound leaderboard boards every minute. Net-worth
-        freshness at 60s is fine -- not gated on market ticks (overnight
-        the board is flat and unchanged embeds skip the REST edit)."""
+        """Refresh bound leaderboard boards every 15s. Equity can move
+        off-tick (trades, claims, ledger transfers), so the poll is
+        faster than the 60s tick cadence -- unchanged embeds still skip
+        the REST edit via the digest gate in sync_leaderboard_boards."""
         while True:
             try:
                 await sync_leaderboard_boards(self)
