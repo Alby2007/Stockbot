@@ -27,8 +27,9 @@ deterministic seeded RNG that replays tick-for-tick
   `/theme`, `/profile`, `/leaderboard`, `/sandbox`
 - **Collectibles** — provably-fair card packs (`/open`), binder
   (`/collection` `/card`), shard crafting (`/craft`), `/feature`
-- **Shop** — interactive `/shop` browser; consumables, margin tiers,
-  cosmetics
+- **Shop** — interactive `/shop` browser with a deterministic daily deal;
+  consumables, margin tiers, cosmetics, `/gift`, `/purchases`,
+  `/commission` custom listings
 - **NPC traders** — six archetypes on bounded stakes with permadeath,
   invisible to human surfaces
 - **Admin** — `/admin` suite: tune, ledger audit, health, wash trades,

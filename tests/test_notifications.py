@@ -293,3 +293,51 @@ async def test_sent_rows_are_not_repolled(conn: AsyncConnection) -> None:
     await poll_once(conn, deliver)
     await poll_once(conn, deliver)
     assert calls == 1
+
+
+async def test_entitlement_expiring_formats_relative_days(conn: AsyncConnection) -> None:
+    await bootstrap_user(conn, 9010)
+    await _insert(
+        conn, 9010, "ENTITLEMENT_EXPIRING",
+        {"tick_index": 5, "item_key": "analyst_tools",
+         "name": "Analyst tools", "days_left": 2},
+    )
+    await _insert(
+        conn, 9010, "ENTITLEMENT_EXPIRING",
+        {"tick_index": 5, "item_key": "pro_terminal",
+         "name": "Pro Terminal", "days_left": 1},
+    )
+
+    delivered: list[str] = []
+
+    async def deliver(user_id: int, message: str) -> None:
+        delivered.append(message)
+
+    stats = await poll_once(conn, deliver)
+
+    assert stats["sent"] == 2
+    assert len(delivered) == 1  # same user/kind/tick coalesces
+    msg = delivered[0]
+    assert "Expiring soon:" in msg
+    assert "**Analyst tools** (in 2d)" in msg
+    assert "**Pro Terminal** (tomorrow)" in msg
+    assert "/shop" in msg
+
+
+async def test_gift_received_mentions_sender(conn: AsyncConnection) -> None:
+    await bootstrap_user(conn, 9011)
+    await _insert(
+        conn, 9011, "GIFT_RECEIVED",
+        {"from": 4242, "item_key": "title_degen", "name": "Degen"},
+    )
+
+    delivered: list[str] = []
+
+    async def deliver(user_id: int, message: str) -> None:
+        delivered.append(message)
+
+    await poll_once(conn, deliver)
+
+    assert len(delivered) == 1
+    assert "<@4242> sent you **Degen**" in delivered[0]
+    assert "/equip" in delivered[0]

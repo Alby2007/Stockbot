@@ -28,6 +28,7 @@ commands require `ADMIN_USER_IDS`; everything else is player-facing.
 | `/profile` | Net worth, badges, featured card + title flair |
 | `/quests` `/reroll` | Daily quest progress; swap a quest with a token |
 | `/title` `/theme` `/equip` `/unequip` | Cosmetics from the shop |
+| `/gift` `/purchases` | Buy a catalog item for another player; recent shop ledger |
 | `/leaderboard` `/leaderboard-setup` | Standings + per-channel auto-posts |
 | `/sandbox {open,status,reset}` | Isolated practice season (`sandbox_access` shop unlock) |
 
@@ -60,6 +61,8 @@ item first.
 | `/card` | Card detail (search by key, name, or ticker) |
 | `/craft` | Shards → missing instrument card, or +1 frame on a held one |
 | `/feature` | Pin a held card on profile/leaderboard flair |
+| `/commission` | Spend a `listing_credit` to list a custom instrument |
+| `/trade {offer,accept,decline,list}` | Card/shard swaps between players |
 
 Pulls are provably fair — see [determinism.md](determinism.md).
 

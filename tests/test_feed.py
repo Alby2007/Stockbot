@@ -402,3 +402,32 @@ async def test_season_result_aggregate_row(conn: AsyncConnection) -> None:
         rows = await cur.fetchall()
     assert len(rows) == 1
     assert rows[0][0]["season_name"] == "Final Tape"
+
+
+async def test_gift_listing_and_deal_formatters(conn: AsyncConnection) -> None:
+    """The 0067 lifecycle kinds render human-readable tape lines."""
+    await _bind(conn, 1, 101)
+    await emit_feed(conn, "GIFT", {"from": 111, "to": 222, "name": "Degen"},
+                    user_id=111)
+    await emit_feed(conn, "LISTING", {"ticker": "ZZZ", "name": "Z Co"},
+                    user_id=333)
+    await emit_feed(
+        conn, "DEAL",
+        {"item_key": "theme_sunrise", "name": "Sunrise",
+         "price_minor": 300, "pct": 0.25},
+        tick_index=1440,
+    )
+
+    delivered: list[str] = []
+
+    async def deliver(channel_id: int, message: str) -> None:
+        delivered.append(message)
+
+    await poll_once(conn, deliver)
+
+    assert len(delivered) == 1
+    msg = delivered[0]
+    assert "<@111> sent Degen to <@222>" in msg
+    assert "ZZZ commissioned by <@333>" in msg
+    assert "Today's deal: Sunrise −25%" in msg
+    assert "/shop item:theme_sunrise" in msg

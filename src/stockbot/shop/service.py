@@ -6,12 +6,19 @@ money paid in is destroyed, per the design doc's sink table.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import logging
 from dataclasses import dataclass, fields
+from datetime import date
 from typing import Any
 
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
+from stockbot.config import get_settings
+from stockbot.feed import emit_feed
+from stockbot.ledger.errors import UnknownAccountError
 from stockbot.ledger.service import (
     get_system_account_id,
     get_user_account_id,
@@ -19,16 +26,20 @@ from stockbot.ledger.service import (
     record_idempotency_key,
 )
 from stockbot.margin import service as margin
+from stockbot.market.engine import TICKS_PER_DAY
 from stockbot.shop.errors import (
     AlreadyOwnedError,
     NotEquippableError,
     NotOwnedError,
+    ShopError,
     UnknownItemError,
 )
 
 BASE_SLOTS = 5
 SLOT_BASE_PRICE_MINOR = 500
 SLOT_PRICE_STEP_MINOR = 250
+
+log = logging.getLogger("stockbot.shop.service")
 
 # Phase 2: escalating margin-tier prices. Tier N unlocks shorts with a
 # gross-leverage cap of min(N+1, max_gross_leverage) x equity.
@@ -74,6 +85,62 @@ def slot_price(owned: int) -> int:
     """Escalating price for the next portfolio slot, given how many the user
     already owns beyond the free base allotment."""
     return SLOT_BASE_PRICE_MINOR + SLOT_PRICE_STEP_MINOR * owned
+
+
+def daily_deal(item_keys: list[str], day: date, seed: str) -> str | None:
+    """Deterministic daily deal pick: HMAC(seed, 'deal|{iso-date}')
+    indexes into the eligible (sorted) key list -- same day, same deal,
+    same pattern as claims._wheel_u. `item_keys` must be the SORTED
+    eligible catalog (price_minor NOT NULL) -- ordering IS the pick."""
+    if not item_keys:
+        return None
+    mac = hmac.new(
+        seed.encode(), f"deal|{day.isoformat()}".encode(), hashlib.sha256
+    ).digest()
+    return item_keys[int.from_bytes(mac[:8], "big") % len(item_keys)]
+
+
+async def _deal_keys(conn: AsyncConnection) -> list[str]:
+    """The eligible deal pool inside the caller's transaction: every
+    fixed-price purchasable row (slot/margin_tier have NULL price_minor
+    and are naturally excluded, as are grant-only badges)."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT key FROM shop_items WHERE price_minor IS NOT NULL ORDER BY key"
+        )
+        return [str(r[0]) for r in await cur.fetchall()]
+
+
+async def deal_today(
+    conn: AsyncConnection,
+) -> tuple[str, float] | None:
+    """(item_key, discount_pct) for today's deal, or None when the deal
+    is disabled / the pool is empty. "Today" is the server's UTC date."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT value FROM config WHERE key = 'shop.deal_enabled'"
+        )
+        row = await cur.fetchone()
+        if row is None or int(row[0]) == 0:
+            return None
+        await cur.execute(
+            "SELECT value FROM config WHERE key = 'shop.deal_discount_pct'"
+        )
+        pct = float((await cur.fetchone() or (0.25,))[0])
+        await cur.execute("SELECT now()::date")
+        day_row = await cur.fetchone()
+    assert day_row is not None
+    key = daily_deal(
+        await _deal_keys(conn), day_row[0], get_settings().master_seed
+    )
+    return (key, pct) if key is not None else None
+
+
+async def _config_float(conn: AsyncConnection, key: str, default: float) -> float:
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT value FROM config WHERE key = %s", (key,))
+        row = await cur.fetchone()
+    return float(row[0]) if row else default
 
 
 async def get_slot_count(conn: AsyncConnection, user_id: int) -> int:
@@ -264,13 +331,30 @@ async def buy_margin_tier(
 
 
 async def buy_item(
-    conn: AsyncConnection, user_id: int, item_key: str, *, interaction_id: str | None = None
+    conn: AsyncConnection,
+    user_id: int,
+    item_key: str,
+    *,
+    interaction_id: str | None = None,
+    gift_to: int | None = None,
 ) -> int:
-    """Buy (or renew) a shop item. Returns the price paid, minor units."""
-    if item_key == "slot":
-        return await buy_slot(conn, user_id, interaction_id=interaction_id)
-    if item_key == "margin_tier":
-        return await buy_margin_tier(conn, user_id, interaction_id=interaction_id)
+    """Buy (or renew) a shop item. Returns the price paid, minor units.
+
+    `gift_to` keeps the payer's account on the debit but writes the
+    entitlement to the recipient: their own ownership/stacking rules
+    apply, and nothing auto-equips (the recipient chooses via /equip).
+    slot/margin_tier stay personal -- computed-price progression items
+    can't be gifted."""
+    if gift_to is not None:
+        if item_key in ("slot", "margin_tier"):
+            raise ShopError("Portfolio slots and margin tiers can't be gifted.")
+        if gift_to == user_id:
+            raise ShopError("You can't gift yourself — just buy it.")
+    else:
+        if item_key == "slot":
+            return await buy_slot(conn, user_id, interaction_id=interaction_id)
+        if item_key == "margin_tier":
+            return await buy_margin_tier(conn, user_id, interaction_id=interaction_id)
 
     async with conn.transaction():
         if interaction_id is not None:
@@ -286,12 +370,33 @@ async def buy_item(
             # Grant-only catalog rows (badges, trophies) aren't purchasable.
             raise UnknownItemError(item_key)
 
+        owner_id = gift_to if gift_to is not None else user_id
+        if gift_to is not None:
+            async with conn.cursor() as cur:
+                # No bootstrap for the recipient (the /trade offer rule):
+                # gifting a never-played user shouldn't mint an account.
+                await cur.execute("SELECT 1 FROM users WHERE id = %s", (gift_to,))
+                if await cur.fetchone() is None:
+                    raise ShopError(
+                        f"<@{gift_to}> hasn't started yet — they need `/start` first."
+                    )
+
         account_id = await get_user_account_id(conn, user_id)
+        # Mutual gifts: lock both accounts in ascending id order so the
+        # deadlock detector never has to pick a loser mid-transfer.
+        lock_ids = [account_id]
+        if gift_to is not None:
+            try:
+                lock_ids.append(await get_user_account_id(conn, gift_to))
+            except UnknownAccountError:
+                pass  # users row exists but no account yet -- nothing to lock
+        for aid in sorted(lock_ids):
+            await _lock_user_account(conn, aid)
 
         async with conn.cursor() as cur:
             await cur.execute(
                 "SELECT 1 FROM entitlements WHERE user_id = %s AND item_key = %s FOR UPDATE",
-                (user_id, item_key),
+                (owner_id, item_key),
             )
             already_owned = await cur.fetchone() is not None
 
@@ -301,16 +406,22 @@ async def buy_item(
         if item["duration_days"] is None and already_owned and not stackable:
             raise AlreadyOwnedError(item_key)
 
-        sink_id = await get_system_account_id(conn, "SINK")
+        # The daily deal applies inside the transaction so the charged
+        # price can never disagree with the displayed one.
+        deal = await deal_today(conn)
         price = int(item["price_minor"])
+        if deal is not None and deal[0] == item_key:
+            price = round(price * (1 - deal[1]))
+
+        sink_id = await get_system_account_id(conn, "SINK")
         await margin.assert_spend_ok(conn, user_id, price)
         await post_transfer(
             conn,
             from_account_id=account_id,
             to_account_id=sink_id,
             amount=price,
-            reason="SHOP_ITEM",
-            memo=item_key,
+            reason="SHOP_GIFT" if gift_to is not None else "SHOP_ITEM",
+            memo=item_key if gift_to is None else f"{item_key} gift to {gift_to}",
         )
 
         if item["duration_days"] is not None:
@@ -321,9 +432,11 @@ async def buy_item(
                     VALUES (%s, %s, now() + make_interval(days => %s))
                     ON CONFLICT (user_id, item_key) DO UPDATE
                     SET expires_at = GREATEST(entitlements.expires_at, now())
-                                      + make_interval(days => %s)
+                                      + make_interval(days => %s),
+                        expiry_notice_at = NULL
                     """,
-                    (user_id, item_key, item["duration_days"], item["duration_days"]),
+                    (owner_id, item_key,
+                     item["duration_days"], item["duration_days"]),
                 )
         elif stackable:
             async with conn.cursor() as cur:
@@ -334,25 +447,45 @@ async def buy_item(
                     ON CONFLICT (user_id, item_key) DO UPDATE
                     SET quantity = entitlements.quantity + 1
                     """,
-                    (user_id, item_key),
+                    (owner_id, item_key),
                 )
         else:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO entitlements (user_id, item_key) VALUES (%s, %s)",
-                    (user_id, item_key),
+                    (owner_id, item_key),
                 )
 
         # Equippables "just work": buying one equips it immediately.
-        # /equip switches slots; /unequip clears them.
-        if item["kind"] == "TITLE":
+        # /equip switches slots; /unequip clears them. Gifts never
+        # auto-equip -- the recipient chooses what to wear.
+        if gift_to is None and item["kind"] == "TITLE":
             async with conn.cursor() as cur:
                 await cur.execute(
                     "UPDATE users SET equipped_title = %s WHERE id = %s",
                     (item_key, user_id),
                 )
-        elif is_theme_item(str(item["kind"]), item["metadata"]):
+        elif gift_to is None and is_theme_item(str(item["kind"]), item["metadata"]):
             await equip_theme(conn, user_id, item_key)
+
+        if gift_to is not None:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO notifications (user_id, kind, payload)
+                    VALUES (%s, 'GIFT_RECEIVED',
+                            jsonb_build_object('from', %s::bigint,
+                                               'item_key', %s::text,
+                                               'name', %s::text))
+                    """,
+                    (gift_to, user_id, item_key, str(item["name"])),
+                )
+            await emit_feed(
+                conn,
+                "GIFT",
+                {"from": user_id, "to": gift_to, "name": str(item["name"])},
+                user_id=user_id,
+            )
 
     return price
 
@@ -441,3 +574,76 @@ async def unequip(conn: AsyncConnection, user_id: int, slot: str) -> bool:
             else:
                 raise NotEquippableError(slot)
             return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle (0067): expiry warnings, the daily deal announcement, gifts
+# ---------------------------------------------------------------------------
+
+
+async def warn_expiring(conn: AsyncConnection, tick_index: int) -> int:
+    """One INSERT...SELECT: entitlements expiring within
+    `shop.expiry_warn_days` get an ENTITLEMENT_EXPIRING DM and their
+    `expiry_notice_at` dedup stamp (cleared on renewal so a renewed item
+    can warn again). Only still-live rows warn -- a lapsed entitlement
+    is shown as "renew" on its card, not pestered about.
+    Returns warnings issued."""
+    warn_days = await _config_float(conn, "shop.expiry_warn_days", 3)
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            WITH due AS (
+                UPDATE entitlements e
+                SET expiry_notice_at = now()
+                FROM shop_items s
+                WHERE s.key = e.item_key
+                  AND e.expires_at IS NOT NULL
+                  AND e.expires_at > now()
+                  AND e.expires_at < now() + make_interval(days => %s::int)
+                  AND e.expiry_notice_at IS NULL
+                RETURNING e.user_id, e.item_key, e.expires_at, s.name
+            )
+            INSERT INTO notifications (user_id, kind, payload)
+            SELECT user_id, 'ENTITLEMENT_EXPIRING',
+                   jsonb_build_object(
+                       'item_key', item_key, 'name', name,
+                       'expires_at', expires_at,
+                       'days_left', GREATEST(
+                           0, (EXTRACT(EPOCH FROM (expires_at - now()))
+                               / 86400)::int),
+                       'tick_index', %s)
+            FROM due
+            """,
+            (warn_days, tick_index),
+        )
+        return cur.rowcount
+
+
+async def on_day(conn: AsyncConnection, tick_index: int) -> None:
+    """Day-boundary shop jobs, self-gating like collectibles.on_day:
+    expiry warnings plus the DEAL tape post announcing today's deal.
+    Called from _post_tick so its own transaction can't poison a tick."""
+    if tick_index == 0 or tick_index % TICKS_PER_DAY != 0:
+        return
+    warned = await warn_expiring(conn, tick_index)
+    deal = await deal_today(conn)
+    if deal is not None:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT name, price_minor FROM shop_items WHERE key = %s",
+                (deal[0],),
+            )
+            row = await cur.fetchone()
+        if row is not None:
+            await emit_feed(
+                conn,
+                "DEAL",
+                {
+                    "item_key": deal[0],
+                    "name": str(row[0]),
+                    "price_minor": int(row[1]),
+                    "pct": deal[1],
+                },
+                tick_index=tick_index,
+            )
+    log.info("shop on_day tick=%d warnings=%d deal=%s", tick_index, warned, deal)

@@ -46,6 +46,7 @@ from stockbot.shop.service import (
     MARGIN_TIER_PRICES_MINOR,
     ShopItem,
     buy_item,
+    deal_today,
     equip_item,
     get_slot_count,
     is_stackable,
@@ -113,6 +114,8 @@ class ShopState:
     balance_minor: int
     equipped_title: str | None
     equipped_theme: str | None
+    deal_key: str | None = None  # today's discounted item (0067)
+    deal_pct: float = 0.0
 
     def owned(self, key: str) -> int:
         ent = self.entitlements.get(key)
@@ -158,6 +161,7 @@ async def load_shop_state(conn: AsyncConnection, user_id: int) -> ShopState:
         balance = await get_balance(conn, account_id)
     except UnknownAccountError:
         balance = 0
+    deal = await deal_today(conn)
     return ShopState(
         items=items,
         entitlements=live,
@@ -166,6 +170,8 @@ async def load_shop_state(conn: AsyncConnection, user_id: int) -> ShopState:
         balance_minor=balance,
         equipped_title=str(urow[0]) if urow and urow[0] else None,
         equipped_theme=str(trow[0]) if trow and trow[0] else None,
+        deal_key=deal[0] if deal else None,
+        deal_pct=deal[1] if deal else 0.0,
     )
 
 
@@ -186,6 +192,14 @@ def _price_minor(item: ShopItem, state: ShopState) -> int | None:
     return item.price_minor
 
 
+def _deal_price(item: ShopItem, state: ShopState, price: int) -> str:
+    """Strikethrough pricing when the item is today's deal."""
+    if state.deal_key == item.key and state.deal_pct > 0:
+        deal_price = round(price * (1 - state.deal_pct))
+        return f"~~{format_money(price)}~~ **{format_money(deal_price)}** DEAL"
+    return format_money(price)
+
+
 def _price_text(item: ShopItem, state: ShopState) -> str:
     """The card/select price line."""
     if item.key == "slot":
@@ -201,17 +215,18 @@ def _price_text(item: ShopItem, state: ShopState) -> str:
     if price is None:
         return ""
     owned = state.owned(item.key)
+    tag = _deal_price(item, state, price)
     if item.duration_days is not None:
         ent = state.entitlements.get(item.key)
         if ent is not None and ent.expires_at is not None:
             until = discord.utils.format_dt(ent.expires_at, "d")
-            return f"{format_money(price)} to renew · active until {until}"
+            return f"{tag} to renew · active until {until}"
         if item.key in state.expired_keys:
-            return f"{format_money(price)} to renew · expired"
-        return f"{format_money(price)} · renews every {item.duration_days}d"
+            return f"{tag} to renew · expired"
+        return f"{tag} · renews every {item.duration_days}d"
     if is_stackable(item.kind, item.key) and owned > 0:
-        return f"{format_money(price)} · you own ×{owned}"
-    return format_money(price)
+        return f"{tag} · you own ×{owned}"
+    return tag
 
 
 def _items_in(state: ShopState, slug: str) -> list[ShopItem]:
@@ -235,6 +250,19 @@ class _ShopButton(discord.ui.Button[discord.ui.View]):
 def build_shop_home(state: ShopState) -> tuple[discord.Embed, discord.ui.View]:
     embed = discord.Embed(title="Shop")
     embed.description = f"Balance: **{format_money(state.balance_minor)}**"
+    if state.deal_key is not None:
+        deal_item = find_shop_item(state, state.deal_key)
+        if deal_item is not None and deal_item.price_minor is not None:
+            pct = round(state.deal_pct * 100)
+            deal_price = round(deal_item.price_minor * (1 - state.deal_pct))
+            embed.add_field(
+                name="🎉 Today's deal",
+                value=(
+                    f"**{deal_item.name}** — ~~{format_money(deal_item.price_minor)}~~ "
+                    f"**{format_money(deal_price)}** (−{pct}%) · `/shop item:{state.deal_key}`"
+                ),
+                inline=False,
+            )
     options: list[discord.SelectOption] = []
     for slug, label, _kinds in CATEGORIES:
         items = _items_in(state, slug)

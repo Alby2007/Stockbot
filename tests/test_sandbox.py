@@ -24,11 +24,17 @@ SANDBOX_STAKE = 10_000  # $100.00
 async def test_buy_sandbox_access_grants_perk(conn: AsyncConnection) -> None:
     await bootstrap_user(conn, 9001)
     assert not await owns_item(conn, 9001, "sandbox_access")
+    async with conn.cursor() as cur:
+        # Pin the deal off: if today's pick is sandbox_access the debit
+        # would be discounted below list.
+        await cur.execute(
+            "UPDATE config SET value = '0' WHERE key = 'shop.deal_enabled'"
+        )
     await buy_item(conn, 9001, "sandbox_access")
     assert await owns_item(conn, 9001, "sandbox_access")
-    # PERK purchases are a sink: the $30 left the main account.
+    # PERK purchases are a sink: the $10 left the main account (0067 reprice).
     main = await get_user_account_id(conn, 9001)
-    assert await get_balance(conn, main) == STARTING_GRANT - 3000
+    assert await get_balance(conn, main) == STARTING_GRANT - 1000
 
 
 async def test_open_sandbox_grants_stake_without_fee(conn: AsyncConnection) -> None:

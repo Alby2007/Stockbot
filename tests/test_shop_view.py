@@ -10,6 +10,7 @@ from psycopg import AsyncConnection
 
 from stockbot.accounts.service import bootstrap_user
 from stockbot.admin.service import disable_user
+from stockbot.bot.format import format_money
 from stockbot.bot.shop_view import (
     _INFLIGHT,
     CATEGORIES,
@@ -154,11 +155,11 @@ async def test_categories_cover_catalog_within_select_cap(
 ) -> None:
     """Every purchasable item is reachable: home -> category -> item.
     No Select exceeds Discord's 25-option cap, and the union equals the
-    purchasable catalog (currently 25 -- pinned so catalog drift is loud;
-    includes the two card packs added in 0059)."""
+    purchasable catalog (currently 26 -- pinned so catalog drift is loud;
+    includes the two card packs added in 0059 and listing_credit in 0067)."""
     state = await load_shop_state(conn, _snowflake())
     purchasable = {i.key for i in state.items if is_purchasable(i)}
-    assert len(purchasable) == 25
+    assert len(purchasable) == 26
 
     reachable: set[str] = set()
     for slug, _label, _kinds in CATEGORIES:
@@ -478,3 +479,43 @@ async def test_handler_dedups_concurrent_dispatch() -> None:
         assert first.response.edited == []
     finally:
         _INFLIGHT.discard(4242)
+
+
+# ------------------------------------------------------------ daily deal
+
+
+async def test_home_embed_shows_todays_deal(conn: AsyncConnection) -> None:
+    state = await load_shop_state(conn, _snowflake())
+    assert state.deal_key is not None  # shop.deal_enabled defaults to 1
+    embed, _view = build_shop_home(state)
+    deal_field = next(f for f in embed.fields if "deal" in f.name.lower())
+    deal_item = find_shop_item(state, state.deal_key)
+    assert deal_item is not None
+    assert deal_item.name in deal_field.value
+    assert "~~" in deal_field.value  # strikethrough list price
+
+
+async def test_deal_item_card_shows_strikethrough_price(
+    conn: AsyncConnection,
+) -> None:
+    state = await load_shop_state(conn, _snowflake())
+    assert state.deal_key is not None
+    item = find_shop_item(state, state.deal_key)
+    assert item is not None and item.price_minor is not None
+    embed, _view = build_shop_card(state, item)
+    desc = embed.description or ""
+    deal_price = round(item.price_minor * (1 - state.deal_pct))
+    assert f"~~{format_money(item.price_minor)}~~" in desc
+    assert format_money(deal_price) in desc
+    assert "DEAL" in desc
+
+
+async def test_no_deal_field_when_disabled(conn: AsyncConnection) -> None:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE config SET value = '0' WHERE key = 'shop.deal_enabled'"
+        )
+    state = await load_shop_state(conn, _snowflake())
+    assert state.deal_key is None
+    embed, _view = build_shop_home(state)
+    assert all("deal" not in f.name.lower() for f in embed.fields)

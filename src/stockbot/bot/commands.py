@@ -129,9 +129,10 @@ from stockbot.collectibles.trades import (
 )
 from stockbot.compliance.wash_trade import scan_for_wash_trades
 from stockbot.config import get_settings
+from stockbot.feed import emit_feed
 from stockbot.ipo import service as ipo_svc
 from stockbot.ledger.errors import InsufficientFundsError
-from stockbot.ledger.service import get_balance
+from stockbot.ledger.service import get_balance, record_idempotency_key
 from stockbot.margin.errors import MarginError
 from stockbot.margin.service import (
     check_and_liquidate,
@@ -190,9 +191,11 @@ from stockbot.seasons.service import (
 )
 from stockbot.shop.errors import NotOwnedError, ShopError
 from stockbot.shop.service import (
+    buy_item,
     equip_item,
     get_user_entitlements,
     owns_item,
+    use_consumable,
 )
 from stockbot.shop.service import (
     unequip as unequip_item,
@@ -2684,6 +2687,132 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
         else:
             await interaction.response.send_message("Featured card cleared.")
+
+    @tree.command(name="gift", description="Buy a shop item for another player")
+    @app_commands.describe(user="Who receives it", item="What to buy for them")
+    @app_commands.autocomplete(item=shop_item_autocomplete)
+    async def gift(
+        interaction: discord.Interaction, user: discord.User, item: str
+    ) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            try:
+                paid = await buy_item(
+                    conn,
+                    interaction.user.id,
+                    item,
+                    interaction_id=str(interaction.id),
+                    gift_to=user.id,
+                )
+            except (ShopError, InsufficientFundsError) as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+            except DuplicateInteractionError:
+                await interaction.response.send_message(
+                    "That gift already went through.", ephemeral=True
+                )
+                return
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT name FROM shop_items WHERE key = %s", (item,)
+                )
+                row = await cur.fetchone()
+        name = str(row[0]) if row else item
+        await interaction.response.send_message(
+            f"🎁 Sent **{name}** to <@{user.id}> for {format_money(paid)}.",
+            ephemeral=True,
+        )
+
+    @tree.command(
+        name="commission",
+        description="Spend a listing credit to list a custom instrument",
+    )
+    @app_commands.describe(
+        ticker="1-10 chars, A-Z/0-9",
+        name="Company name",
+        sector="Sector key",
+        market="Venue code (default: first market)",
+        base_price="Opening price in dollars (default: 50)",
+    )
+    @app_commands.autocomplete(sector=sector_autocomplete)
+    async def commission(
+        interaction: discord.Interaction,
+        ticker: str,
+        name: str,
+        sector: str,
+        market: str | None = None,
+        base_price: float = 50.0,
+    ) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            try:
+                async with conn.transaction():
+                    # Consume and list in one tx: a bad ticker/sector or a
+                    # duplicate listing rolls the credit spend back too.
+                    await record_idempotency_key(conn, str(interaction.id))
+                    await use_consumable(conn, interaction.user.id, "listing_credit")
+                    try:
+                        await add_instrument(
+                            conn,
+                            ticker=ticker,
+                            name=name,
+                            sector_key=sector,
+                            base_price=base_price,
+                            market_code=market,
+                        )
+                    except ValueError as exc:
+                        raise ShopError(str(exc)) from exc
+                    await emit_feed(
+                        conn,
+                        "LISTING",
+                        {"ticker": ticker.strip().upper(), "name": name},
+                        user_id=interaction.user.id,
+                    )
+            except ShopError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+            except DuplicateInteractionError:
+                await interaction.response.send_message(
+                    "That commission already went through.", ephemeral=True
+                )
+                return
+        await interaction.response.send_message(
+            f"📈 **{ticker.strip().upper()}** ({name}) commissioned — it lists "
+            "on the next tick. Find it with `/stock`."
+        )
+
+    @tree.command(name="purchases", description="Your recent shop purchases")
+    async def purchases(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT l.reason, l.memo, -l.amount AS spent, l.created_at
+                    FROM ledger_entries l
+                    JOIN accounts a ON a.id = l.account_id
+                    WHERE a.user_id = %s AND l.amount < 0
+                      AND l.reason LIKE 'SHOP_%%'
+                    ORDER BY l.id DESC LIMIT 10
+                    """,
+                    (interaction.user.id,),
+                )
+                rows = await cur.fetchall()
+        if not rows:
+            await interaction.response.send_message(
+                "No purchases yet — `/shop` is the storefront.", ephemeral=True
+            )
+            return
+        lines = []
+        for reason, memo, spent, ts in rows:
+            label = str(memo or reason).split(" gift ")[0]
+            gifted = " 🎁" if reason == "SHOP_GIFT" else ""
+            lines.append(
+                f"`{discord.utils.format_dt(ts, 'd')}` **{label}**{gifted}"
+                f" — {format_money(int(spent))}"
+            )
+        embed = discord.Embed(title="Recent purchases", description="\n".join(lines))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     trade_group = app_commands.Group(
         name="trade", description="Trade cards and shards with other players"

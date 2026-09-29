@@ -217,6 +217,20 @@ def _fmt_trade_result(items: list[dict[str, Any]]) -> str:
     return "Trade" + ("s" if len(items) > 1 else "") + ": " + "; ".join(parts)
 
 
+def _fmt_entitlement_expiring(items: list[dict[str, Any]]) -> str:
+    parts = []
+    for p in items:
+        days = int(p.get("days_left", 0))
+        when = "today" if days == 0 else "tomorrow" if days == 1 else f"in {days}d"
+        parts.append(f"**{p['name']}** ({when})")
+    return "Expiring soon: " + ", ".join(parts) + " — renew in `/shop`."
+
+
+def _fmt_gift_received(items: list[dict[str, Any]]) -> str:
+    parts = [f"<@{p['from']}> sent you **{p['name']}**" for p in items]
+    return "🎁 " + "; ".join(parts) + " — `/equip` it from the shop."
+
+
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "LIQUIDATION": _fmt_liquidation,
     "MARGIN_CALL": _fmt_margin_call,
@@ -233,6 +247,8 @@ _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "MOMENT_EARNED": _fmt_moment_earned,
     "TRADE_OFFER": _fmt_trade_offer,
     "TRADE_RESULT": _fmt_trade_result,
+    "ENTITLEMENT_EXPIRING": _fmt_entitlement_expiring,
+    "GIFT_RECEIVED": _fmt_gift_received,
 }
 
 

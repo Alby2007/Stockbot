@@ -113,6 +113,18 @@ async def snapshot_net_worth_if_due(
         )
 
 
+async def badges_interval_ticks(conn: AsyncConnection) -> int:
+    """Badge sweep cadence (config `badges.interval_ticks`, default 60 =
+    hourly). The queries are all set-based INSERT...SELECT so hourly is
+    cheap -- the day-boundary default only remains for tests."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT value FROM config WHERE key = 'badges.interval_ticks'"
+        )
+        row = await cur.fetchone()
+    return int(row[0]) if row else 60
+
+
 async def evaluate_badges(
     conn: AsyncConnection, tick_index: int, *, interval_ticks: int = TICKS_PER_DAY
 ) -> int:

@@ -269,8 +269,8 @@ Shop UI: `/shop` (replaces `/shop list|buy`) is a stateless browser in
 `back`), a module `_INFLIGHT` dedup for the View-callback +
 `on_interaction` double dispatch, and an `elif` fallback branch in
 `StockBotClient.on_interaction` so clicks survive restarts. Navigation
-is category-first (23 purchasable items would fit one Select now, but
-the 25-option cap is permanent headroom only via categories):
+is category-first (26 purchasable items already exceed one Select, so
+the 25-option cap needs categories, not just headroom):
 capabilities/tools/consumables/cosmetics -> item Select -> detail card
 with Buy/Equip/Back. `is_purchasable` is the single storefront
 predicate (price_minor NOT NULL OR key in slot/margin_tier, the two
@@ -282,6 +282,23 @@ means owned-but-not-currently-equipped. All shop replies are ephemeral
 and use `response.edit_message` (no attachments, so the type-7 callback
 works — unlike chart PNGs); `respond_shop_action(conn, ...)` is the
 conn-injectable seam tests drive without the live pool.
+Shop lifecycle (0067): gifts route through `buy_item(gift_to=)` — payer
+debits, recipient's entitlement + ownership rules apply, slot/margin_tier
+stay personal, nothing auto-equips, both accounts lock in ascending id
+order (mutual-gift deadlock guard), recipient gets a GIFT_RECEIVED DM +
+GIFT feed row. `entitlements.expiry_notice_at` is the warn-once stamp:
+`warn_expiring` INSERT...SELECTs ENTITLEMENT_EXPIRING notifications for
+live rows inside `shop.expiry_warn_days`, renewal UPSERTs re-arm by
+NULLing it. The daily deal is `daily_deal(keys, day, seed)` —
+HMAC(seed, `deal|{iso-date}`) over the sorted fixed-price catalog —
+applied inside `buy_item`'s tx (`deal_today`) so charge and display can't
+diverge; `shop_view` renders `~~list~~ **deal** DEAL`. `on_day` (warnings
++ DEAL tape post) runs from `_post_tick` at `tick % TICKS_PER_DAY == 0`.
+`badges.interval_ticks` (default 60) replaces the day-boundary default on
+both `evaluate_badges` call sites. `listing_credit` is a $500 stackable
+CONSUMABLE `/commission` spends to call `admin.add_instrument` in the same
+tx — a bad listing rolls the consume back. `/purchases` reads
+ledger_entries `SHOP_%` debits. `sandbox_access` repriced $30 → $10.
 Shop themes (0046): `theme_*` COSMETIC metadata IS the render palette —
 `shop.service.palette_from_metadata` normalizes it over
 `charts._DEFAULT_PALETTE` keys {up, down, bg, grid, text, accent, spine,

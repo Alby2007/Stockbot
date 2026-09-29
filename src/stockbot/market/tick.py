@@ -27,8 +27,13 @@ from stockbot.options import service as options
 from stockbot.orders import service as orders
 from stockbot.quests import service as quests
 from stockbot.seasons import service as seasons
+from stockbot.shop import service as shop_svc
 from stockbot.shorts import service as shorts
-from stockbot.status.service import evaluate_badges, snapshot_net_worth_if_due
+from stockbot.status.service import (
+    badges_interval_ticks,
+    evaluate_badges,
+    snapshot_net_worth_if_due,
+)
 
 log = logging.getLogger("stockbot.market.tick")
 
@@ -212,7 +217,9 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             await margin.accrue_borrow_fees(conn)
             await seasons.on_tick(conn, tick_index)
             await snapshot_net_worth_if_due(conn, tick_index)
-            await evaluate_badges(conn, tick_index)
+            await evaluate_badges(
+                conn, tick_index, interval_ticks=await badges_interval_ticks(conn)
+            )
             await ipo.settle_due(conn, tick_index)
             # Options settle on closed ticks too (C5): the mark is frozen
             # at the last open print, so an overnight expiry settles "at
@@ -876,7 +883,9 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # N2: same day-boundary cadence, but for every main-portfolio USER
         # account -- feeds /compare and /profile's 24h change.
         await snapshot_net_worth_if_due(conn, tick_index)
-        await evaluate_badges(conn, tick_index)
+        await evaluate_badges(
+            conn, tick_index, interval_ticks=await badges_interval_ticks(conn)
+        )
         await ipo.settle_due(conn, tick_index)
         # Moments mint commemoratives from this tick's own numbers --
         # detection reads results/opens/rows_by_id already in memory,
@@ -962,6 +971,9 @@ async def _post_tick(conn: AsyncConnection, tick_index: int) -> None:
             # H3: same day-boundary cadence as the equity snapshots --
             # prunes idempotency_keys/notifications/command_stats.
             await run_maintenance_if_due(conn, tick_index)
+            # 0067: expiry warnings + the daily-deal tape post. Day-
+            # boundary gated inside on_day.
+            await shop_svc.on_day(conn, tick_index)
     except Exception:
         # The audit must never poison the tick loop -- a failed audit
         # *query* is itself the signal.

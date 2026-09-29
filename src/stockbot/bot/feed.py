@@ -207,6 +207,28 @@ def _fmt_moment_minted(items: list[dict[str, Any]]) -> str:
     return "📸 " + "; ".join(parts)
 
 
+def _fmt_gift(items: list[dict[str, Any]]) -> str:
+    parts = [
+        f"{_mention(p['from'])} sent {p['name']} to {_mention(p['to'])}"
+        for p in items
+    ]
+    return "🎁 " + "; ".join(parts)
+
+
+def _fmt_listing(items: list[dict[str, Any]]) -> str:
+    parts = [
+        f"{p['ticker']} commissioned by {_mention(p['subject'])}"
+        for p in items
+    ]
+    return "📈 " + "; ".join(parts)
+
+
+def _fmt_deal(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    pct = round(float(p["pct"]) * 100)
+    return f"🎉 Today's deal: {p['name']} −{pct}% — `/shop item:{p['item_key']}`"
+
+
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "LIQUIDATION": _fmt_liquidation,
     "SQUEEZE": _fmt_squeeze,
@@ -222,6 +244,9 @@ _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "MOMENT_MINTED": _fmt_moment_minted,
     "TOP_PULL": _fmt_top_pull,
     "TRADE_COMPLETED": _fmt_trade_completed,
+    "GIFT": _fmt_gift,
+    "LISTING": _fmt_listing,
+    "DEAL": _fmt_deal,
 }
 
 
