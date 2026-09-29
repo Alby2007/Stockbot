@@ -347,7 +347,7 @@ async def _handle(interaction: discord.Interaction) -> None:
             ):
                 await interaction.followup.send(
                     "The 2w and 1M spans need **Pro Terminal** — "
-                    "`/shop buy pro_terminal`.",
+                    "`/shop item:pro_terminal`.",
                     ephemeral=True,
                 )
                 return

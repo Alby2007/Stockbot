@@ -263,6 +263,25 @@ dir, so without it every container restart rebuilds the fontlist and
 the first render takes seconds. Candle/wick/volume widths drop to 0.6 above
 120 bars, else 0.8. `MARKET CLOSED` only suffixes the title when the
 tail is closed candles.
+Shop UI: `/shop` (replaces `/shop list|buy`) is a stateless browser in
+`bot/shop_view.py` mirroring the chart component pattern —
+`shop:{action}:{arg}` cids (`home`, `cat`, `pick`, `buy`, `equip`,
+`back`), a module `_INFLIGHT` dedup for the View-callback +
+`on_interaction` double dispatch, and an `elif` fallback branch in
+`StockBotClient.on_interaction` so clicks survive restarts. Navigation
+is category-first (23 purchasable items would fit one Select now, but
+the 25-option cap is permanent headroom only via categories):
+capabilities/tools/consumables/cosmetics -> item Select -> detail card
+with Buy/Equip/Back. `is_purchasable` is the single storefront
+predicate (price_minor NOT NULL OR key in slot/margin_tier, the two
+computed-price rows) — share it or badges leak in. Stacking is opt-in
+via `shop.service.NON_STACKABLE_ITEM_KEYS`/`is_stackable` (sandbox_access
+was silently stackable because every consumer only checks `owns_item`).
+`buy_item` auto-equips TITLE/theme on purchase, so an enabled "Equip"
+means owned-but-not-currently-equipped. All shop replies are ephemeral
+and use `response.edit_message` (no attachments, so the type-7 callback
+works — unlike chart PNGs); `respond_shop_action(conn, ...)` is the
+conn-injectable seam tests drive without the live pool.
 Shop themes (0046): `theme_*` COSMETIC metadata IS the render palette —
 `shop.service.palette_from_metadata` normalizes it over
 `charts._DEFAULT_PALETTE` keys {up, down, bg, grid, text, accent, spine,
@@ -1246,8 +1265,8 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
 - **Currency sinks** (0040-0042): `shop_items.kind` now spans
   SLOT/ANALYST_TOOL/COSMETIC/TROPHY/MARGIN_TIER/BADGE/ORDER_TYPE.
   Grant-only kinds (TROPHY, BADGE, price_minor NULL) are filtered from
-  `/shop list` and the buy autocomplete; `buy_item` rejects NULL-price
-  rows. Milestone badges grant in `evaluate_badges` (status/service.py) --
+  the `/shop` browser and the item autocomplete; `buy_item` rejects
+  NULL-price rows. Milestone badges grant in `evaluate_badges` (status/service.py) --
   a day-boundary batch pass alongside `snapshot_net_worth_if_due` in BOTH
   apply_tick branches; thresholds live in `shop_items.metadata`
   ({"metric","threshold_minor"|"threshold"}) and grants ride

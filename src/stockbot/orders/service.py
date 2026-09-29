@@ -113,7 +113,7 @@ async def _require_entitlement(
         )
         if await cur.fetchone() is None:
             raise TradingError(
-                f"`{item_key}` is a paid unlock — buy it in `/shop list` first."
+                f"`{item_key}` is a paid unlock — buy it via `/shop item:{item_key}`."
             )
 
 

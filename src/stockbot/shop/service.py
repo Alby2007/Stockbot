@@ -34,6 +34,20 @@ SLOT_PRICE_STEP_MINOR = 250
 # gross-leverage cap of min(N+1, max_gross_leverage) x equity.
 MARGIN_TIER_PRICES_MINOR = (50_000, 200_000, 500_000)
 
+# PERK/CONSUMABLE kinds stack by kind alone, which is the wrong default --
+# stacking must be opt-in. `sandbox_access` was caught stacking under the
+# kind-level rule: every consumer only checks `owns_item` (boolean), so a
+# repeat buy burned $30 for quantity 2 of a boolean. `alert_pack` reads
+# quantity directly so it stays stackable.
+NON_STACKABLE_ITEM_KEYS = frozenset({"sandbox_access"})
+
+
+def is_stackable(kind: str, key: str) -> bool:
+    """Whether a repeat purchase adds entitlement quantity rather than
+    being a duplicate-ownership rejection. Mirrors buy_item's rule --
+    keep them in sync or the storefront's "Owned" state lies."""
+    return kind in ("CONSUMABLE", "PERK") and key not in NON_STACKABLE_ITEM_KEYS
+
 
 @dataclass(frozen=True)
 class ShopItem:
@@ -281,9 +295,9 @@ async def buy_item(
             )
             already_owned = await cur.fetchone() is not None
 
-        # CONSUMABLE/PERK stack: a repeat buy is quantity + 1, not a
-        # duplicate-ownership rejection.
-        stackable = item["kind"] in ("CONSUMABLE", "PERK")
+        # CONSUMABLE/PERK stack per is_stackable(): a repeat buy is
+        # quantity + 1 only for items opted into stacking.
+        stackable = is_stackable(str(item["kind"]), item_key)
         if item["duration_days"] is None and already_owned and not stackable:
             raise AlreadyOwnedError(item_key)
 

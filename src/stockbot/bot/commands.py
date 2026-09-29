@@ -75,6 +75,13 @@ from stockbot.bot.leaderboard import (
     leaderboard_embed,
     post_leaderboard_board,
 )
+from stockbot.bot.shop_view import (
+    build_shop_card,
+    build_shop_home,
+    find_shop_item,
+    is_purchasable,
+    load_shop_state,
+)
 from stockbot.claims.errors import (
     AccountTooYoungError,
     AlreadyClaimedTodayError,
@@ -144,15 +151,9 @@ from stockbot.seasons.service import (
 )
 from stockbot.shop.errors import NotOwnedError, ShopError
 from stockbot.shop.service import (
-    BASE_SLOTS,
-    MARGIN_TIER_PRICES_MINOR,
-    buy_item,
     equip_item,
-    get_slot_count,
     get_user_entitlements,
-    list_items,
     owns_item,
-    slot_price,
 )
 from stockbot.shop.service import (
     unequip as unequip_item,
@@ -163,7 +164,7 @@ from stockbot.shorts.service import (
     open_bounded_short,
 )
 from stockbot.status import service as status_svc
-from stockbot.trading.errors import DuplicateInteractionError, TradingError
+from stockbot.trading.errors import TradingError
 from stockbot.trading.service import (
     execute_trade,
     max_affordable_shares,
@@ -770,7 +771,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 span = TIMEFRAME_SPANS.get(timeframe, 240)
             if span > MAX_SPAN and not pro:
                 await interaction.followup.send(
-                    "The 2w and 1M spans need **Pro Terminal** — `/shop buy pro_terminal`.",
+                    "The 2w and 1M spans need **Pro Terminal** — `/shop item:pro_terminal`.",
                     ephemeral=True,
                 )
                 return
@@ -1242,7 +1243,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 new = await reroll_quest(conn, interaction.user.id, instance_id)
             except NotOwnedError:
                 await interaction.response.send_message(
-                    "You don't own a quest reroll — `/shop buy quest_reroll`.",
+                    "You don't own a quest reroll — `/shop item:quest_reroll`.",
                     ephemeral=True,
                 )
                 return
@@ -2344,84 +2345,33 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
     tree.add_command(alert_group)
 
-    shop_group = app_commands.Group(
-        name="shop", description="Portfolio slots, analyst tools, and cosmetics"
+    @tree.command(
+        name="shop",
+        description="Browse and buy slots, tools, consumables, and cosmetics",
     )
-
-    @shop_group.command(name="list", description="List items available in the shop")
-    async def shop_list(interaction: discord.Interaction) -> None:
-        async with db.connection() as conn:
-            bootstrap = await bootstrap_user(conn, interaction.user.id)
-            items = await list_items(conn)
-            slot_count = await get_slot_count(conn, interaction.user.id)
-            owned = await get_user_entitlements(conn, interaction.user.id)
-
-        owned_keys = {row["item_key"]: row["quantity"] for row in owned}
-        lines = []
-        for item in items:
-            if item.key == "slot":
-                price = slot_price(slot_count - BASE_SLOTS)
-                lines.append(f"{item.key:<15} {format_money(price):>10}  (you have {slot_count})")
-                continue
-            if item.key == "margin_tier":
-                tier = owned_keys.get("margin_tier", 0)
-                if tier >= len(MARGIN_TIER_PRICES_MINOR):
-                    lines.append(f"{item.key:<15}  max tier ({tier}) owned")
-                else:
-                    price = MARGIN_TIER_PRICES_MINOR[tier]
-                    lines.append(
-                        f"{item.key:<15} {format_money(price):>10}  (tier {tier} -> {tier + 1})"
-                    )
-                continue
-            if item.price_minor is None:
-                # Grant-only catalog rows (trophies, badges) aren't for sale.
-                continue
-            if item.key in owned_keys and item.duration_days is None:
-                qty = owned_keys[item.key]
-                marker = f" (owned ×{qty})" if item.kind in ("CONSUMABLE", "PERK") else " (owned)"
-            else:
-                marker = ""
-            recurring = f" every {item.duration_days}d" if item.duration_days else ""
-            lines.append(f"{item.key:<15} {format_money(item.price_minor):>10}{recurring}{marker}")
-
-        embed = discord.Embed(title="Shop")
-        embed.description = "```\n" + "\n".join(lines) + "\n```"
-        embed.set_footer(text="/shop buy <item>")
-        await interaction.response.send_message(
-            content=_welcome_suffix(bootstrap) or None, embed=embed
-        )
-
-    @shop_group.command(name="buy", description="Buy an item from the shop")
-    @app_commands.describe(item="Item key, e.g. slot, analyst_tools, theme_sunrise")
+    @app_commands.describe(item="Jump straight to an item card, e.g. pro_terminal")
     @app_commands.autocomplete(item=shop_item_autocomplete)
-    async def shop_buy(interaction: discord.Interaction, item: str) -> None:
+    async def shop(interaction: discord.Interaction, item: str | None = None) -> None:
         async with db.connection() as conn:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
-            try:
-                price = await buy_item(
-                    conn,
-                    interaction.user.id,
-                    item.lower(),
-                    interaction_id=str(interaction.id),
-                )
-            except InsufficientFundsError:
-                await interaction.response.send_message(
-                    "Insufficient funds for that purchase.", ephemeral=True
-                )
-                return
-            except DuplicateInteractionError:
-                await interaction.response.send_message(
-                    "That purchase was already processed.", ephemeral=True
-                )
-                return
-            except (ShopError, MarginError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
-                return
+            state = await load_shop_state(conn, interaction.user.id)
+            if item is not None:
+                target = find_shop_item(state, item)
+                if target is None or not is_purchasable(target):
+                    await interaction.response.send_message(
+                        f"**{item}** isn't for sale — browse `/shop` instead.",
+                        ephemeral=True,
+                    )
+                    return
+                embed, view = build_shop_card(state, target)
+            else:
+                embed, view = build_shop_home(state)
         await interaction.response.send_message(
-            f"Purchased **{item.lower()}** for {format_money(price)}." + _welcome_suffix(bootstrap)
+            content=_welcome_suffix(bootstrap) or None,
+            embed=embed,
+            view=view,
+            ephemeral=True,
         )
-
-    tree.add_command(shop_group)
 
     ipo_group = app_commands.Group(
         name="ipo", description="IPO subscriptions — commit cash before listing day"
@@ -2628,7 +2578,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
             if not await owns_item(conn, interaction.user.id, "sandbox_access"):
                 await interaction.response.send_message(
-                    "Sandbox requires **Sandbox access** — `/shop buy item:sandbox_access`.",
+                    "Sandbox requires **Sandbox access** — `/shop item:sandbox_access`.",
                     ephemeral=True,
                 )
                 return
@@ -2701,7 +2651,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
             if not await owns_item(conn, interaction.user.id, "sandbox_access"):
                 await interaction.response.send_message(
-                    "Sandbox requires **Sandbox access** — `/shop buy item:sandbox_access`.",
+                    "Sandbox requires **Sandbox access** — `/shop item:sandbox_access`.",
                     ephemeral=True,
                 )
                 return

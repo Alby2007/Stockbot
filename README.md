@@ -12,8 +12,8 @@ The tick engine is live (factor model, impact decay, mean reversion,
 circuit breaker, deterministic replay) over 40 seeded instruments across 8
 sectors plus the SBX-40 index. Working end to end: `/balance`,
 `/portfolio`, `/buy`, `/sell`, `/market`, `/stock`, `/claim`, `/movers`,
-`/sectors`, `/chart`, `/news`, `/calendar`, the shop (`/shop list`,
-`/shop buy`), bounded shorts (`/short`, `/shorts`, `/cover`), true margin
+`/sectors`, `/chart`, `/news`, `/calendar`, the interactive shop (`/shop`,
+with `item:` deep links), bounded shorts (`/short`, `/shorts`, `/cover`), true margin
 (`margin_tier` shop item, `/margin`, `/collateral`, `/liquidations`),
 seasons/league (`/league info|join|standings`), resting orders
 (`/order buy|sell|list|cancel` — limit, stop, stop-limit),

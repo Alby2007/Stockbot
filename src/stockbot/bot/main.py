@@ -18,6 +18,7 @@ from stockbot.bot.feed import ChannelGone
 from stockbot.bot.feed import poll_once as feed_poll_once
 from stockbot.bot.leaderboard import sync_leaderboard_boards
 from stockbot.bot.notify import DeliveryForbidden, poll_once
+from stockbot.bot.shop_view import SHOP_CID_PREFIX, handle_shop_component
 from stockbot.config import get_settings
 from stockbot.logging import setup_logging
 from stockbot.observability import write_heartbeat
@@ -217,6 +218,26 @@ class StockBotClient(discord.Client):
                     else:
                         await interaction.response.send_message(
                             "Couldn't refresh that chart — run /chart again.",
+                            ephemeral=True,
+                        )
+                except discord.HTTPException:
+                    pass
+        elif str(data.get("custom_id", "")).startswith(SHOP_CID_PREFIX):
+            # Same restart-survival fallback as chart buttons; the shop
+            # handler's _INFLIGHT guard dedups the double dispatch.
+            try:
+                await handle_shop_component(interaction)
+            except Exception:
+                log.exception("shop component interaction failed")
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(
+                            "Couldn't refresh that shop — run /shop again.",
+                            ephemeral=True,
+                        )
+                    else:
+                        await interaction.response.send_message(
+                            "Couldn't refresh that shop — run /shop again.",
                             ephemeral=True,
                         )
                 except discord.HTTPException:
