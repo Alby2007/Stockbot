@@ -369,6 +369,8 @@ async def their_card_autocomplete(
     # snowflake int, or a string depending on what Discord resolved --
     # coerce whatever shows up.
     other_id = getattr(other, "id", other)
+    if other_id is None:
+        return await card_autocomplete(interaction, current)
     try:
         other_id = int(other_id)
     except (TypeError, ValueError):
