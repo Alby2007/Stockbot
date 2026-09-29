@@ -1141,6 +1141,44 @@ baseline, Gini 0.005->0.008 as P&L diverged, LP resting depth persisted
 (~48 open orders between active ticks), all 4 shorters held real
 margin shorts, FAUCET-leg audit clean (NPC_STAKE + STARTING_GRANT only).
 
+**Collectibles done** (`migrations/0059_collectibles.sql`,
+`src/stockbot/collectibles/{pull,service}.py`,
+`bot/collection_view.py`, `/card` `/collection` `/open` `/craft`
+`/feature`): card_sets freeze membership at release (IPOs/delistings
+never mutate a released set — pull pools and completion denominators
+are immutable). `cards` seeds one INSTRUMENT card per instrument
+(82), 10 EPIC + 5 LEGENDARY LORE cards, and commemoratives minted by
+`grant_commemorative` (backfilled for IPO subscribers / halt survivors,
+never in pack pools). Pulls are tier-first: `resolve_pull` rolls the
+frame tier from `pack.rate_*` weights, then draws uniformly from the
+tier pool — instrument tiers share the 82-card pool and the tier IS the
+frame stamped; lore tiers draw the EPIC/LEGENDARY lore pools.
+`pull_seed` = HMAC(master|packs, uid|pull_seq) mirrors `tick_seed`, and
+every `card_pulls` row records pull_seq + pity_count_before so any pull
+replays byte-for-byte (the test does exactly this). Pity: `pity_count`
+>= `pack.pity_threshold` clamps the tier to >=GOLD then resets on rare+;
+`pack_premium`'s `metadata.floor="GOLD"` clamps only the LAST card of
+the pack. `open_pack` is one transaction: record_idempotency_key ->
+`use_consumable` -> FOR UPDATE on users (pack_pulls/pity/shards) and
+each user_cards row -> classify (NEW inserts, higher frame UPGRADES in
+place, equal-or-lower DUPLICATE burns to `pack.shards_*` value on
+`users.shards` — off-ledger vanity material, one source one sink).
+EPIC/LEGENDARY pulls emit `CARD_PULL` feed events (achievement class,
+mention kept — bots never open packs). The `/open` reveal commits the
+transaction BEFORE animating (C10 — a 4s staged edit never pins a
+pooled conn, and a mid-reveal restart still leaves cards owned).
+Shards: `craft_card` buys a missing instrument card at STANDARD,
+`upgrade_frame` steps held instrument frames toward PLATINUM at
+`pack.craft_*` costs; lore/commemoratives can't be crafted (the chase
+stays chase). `users.featured_card` pins a held card — shows in
+`profile_stats.featured_card`/`/profile` and appends after title flair
+in `equipped_flair_map` (title AND card when both set). The binder is
+stateless `cards:pg:{owner}:{page}` cids on the shop_view pattern with
+a `cards:` branch in `on_interaction`; it resolves owners via
+get_user/fetch_user fallback, NOT guild.get_member (no privileged
+members intent). Both pack items are plain CONSUMABLE shop rows — they
+land in `/shop` → Consumables and stack normally.
+
 **Public tape done** (`migrations/0055_feed.sql`, `src/stockbot/feed`,
 `src/stockbot/bot/feed.py`, `/feed-setup` `/feed-remove`): a per-guild
 market-drama channel. `feed_channels` binds one channel per guild;

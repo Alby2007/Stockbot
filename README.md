@@ -17,6 +17,9 @@ with `item:` deep links), bounded shorts (`/short`, `/shorts`, `/cover`), true m
 (`margin_tier` shop item, `/margin`, `/collateral`, `/liquidations`),
 seasons/league (`/league info|join|standings`), resting orders
 (`/order buy|sell|list|cancel` — limit, stop, stop-limit),
+collectible cards (`/open`, `/collection`, `/card`, `/craft`, `/feature`
+— packs in `/shop`, duplicates burn to shards for crafting, featured
+cards show on `/profile` and the leaderboard),
 admin tools (`/admin`), and the economy simulation harness
 (`python -m stockbot.simulation.harness`).
 

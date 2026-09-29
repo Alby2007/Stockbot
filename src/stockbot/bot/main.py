@@ -13,6 +13,12 @@ import discord
 
 from stockbot import db
 from stockbot.bot.chart_view import CHART_CID_PREFIX, handle_chart_component
+from stockbot.bot.collection_view import (
+    CID_PREFIX as COLLECTION_CID_PREFIX,
+)
+from stockbot.bot.collection_view import (
+    handle_collection_component,
+)
 from stockbot.bot.commands import guild_welcome_message, register_commands
 from stockbot.bot.feed import ChannelGone
 from stockbot.bot.feed import poll_once as feed_poll_once
@@ -238,6 +244,24 @@ class StockBotClient(discord.Client):
                     else:
                         await interaction.response.send_message(
                             "Couldn't refresh that shop — run /shop again.",
+                            ephemeral=True,
+                        )
+                except discord.HTTPException:
+                    pass
+        elif str(data.get("custom_id", "")).startswith(COLLECTION_CID_PREFIX):
+            try:
+                await handle_collection_component(interaction)
+            except Exception:
+                log.exception("collection component interaction failed")
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(
+                            "Couldn't turn that page — run /collection again.",
+                            ephemeral=True,
+                        )
+                    else:
+                        await interaction.response.send_message(
+                            "Couldn't turn that page — run /collection again.",
                             ephemeral=True,
                         )
                 except discord.HTTPException:

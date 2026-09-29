@@ -154,10 +154,11 @@ async def test_categories_cover_catalog_within_select_cap(
 ) -> None:
     """Every purchasable item is reachable: home -> category -> item.
     No Select exceeds Discord's 25-option cap, and the union equals the
-    purchasable catalog (currently 23 -- pinned so catalog drift is loud)."""
+    purchasable catalog (currently 25 -- pinned so catalog drift is loud;
+    includes the two card packs added in 0059)."""
     state = await load_shop_state(conn, _snowflake())
     purchasable = {i.key for i in state.items if is_purchasable(i)}
-    assert len(purchasable) == 23
+    assert len(purchasable) == 25
 
     reachable: set[str] = set()
     for slug, _label, _kinds in CATEGORIES:

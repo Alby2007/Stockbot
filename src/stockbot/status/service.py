@@ -195,6 +195,40 @@ async def evaluate_badges(
             """
         )
         granted += [(int(r[0]), str(r[1])) for r in await cur.fetchall()]
+        # Collectible completion (0060): held-card counts against frozen
+        # set denominators, filtered by the badge row's card_set /
+        # card_kind / min_frame metadata so tiers need no code changes.
+        await cur.execute(
+            """
+            INSERT INTO entitlements (user_id, item_key)
+            SELECT x.user_id, x.key FROM (
+                SELECT uc.user_id, s.key, count(*) AS metric_value,
+                       (s.metadata->>'threshold')::int AS threshold
+                FROM user_cards uc
+                JOIN users u ON u.id = uc.user_id AND NOT u.is_bot
+                JOIN cards c ON c.key = uc.card_key
+                JOIN card_sets cs ON cs.key = c.set_key
+                JOIN shop_items s
+                  ON s.kind = 'BADGE' AND s.metadata->>'metric' = 'cards'
+                WHERE cs.key = COALESCE(s.metadata->>'card_set', cs.key)
+                  AND c.kind = COALESCE(s.metadata->>'card_kind', c.kind)
+                  AND (CASE uc.best_frame
+                         WHEN 'STANDARD' THEN 0 WHEN 'SILVER' THEN 1
+                         WHEN 'GOLD' THEN 2 WHEN 'PLATINUM' THEN 3
+                         WHEN 'EPIC' THEN 4 WHEN 'LEGENDARY' THEN 5
+                         ELSE -1 END)
+                      >= (CASE s.metadata->>'min_frame'
+                            WHEN 'STANDARD' THEN 0 WHEN 'SILVER' THEN 1
+                            WHEN 'GOLD' THEN 2 WHEN 'PLATINUM' THEN 3
+                            WHEN 'EPIC' THEN 4 WHEN 'LEGENDARY' THEN 5
+                            ELSE -1 END)
+                GROUP BY uc.user_id, s.key
+            ) x WHERE x.metric_value >= x.threshold
+            ON CONFLICT DO NOTHING
+            RETURNING user_id, item_key
+            """
+        )
+        granted += [(int(r[0]), str(r[1])) for r in await cur.fetchall()]
         for user_id, item_key in granted:
             await cur.execute(
                 """
@@ -313,6 +347,7 @@ class ProfileStats:
     quests_completed: int
     trophies: list[str]
     title: str | None
+    featured_card: str | None
     active_season_equity_minor: int | None
 
 
@@ -321,9 +356,13 @@ async def profile_stats(conn: AsyncConnection, user_id: int) -> ProfileStats | N
         await cur.execute(
             """
             SELECT u.created_at, u.total_traded_minor, u.quests_completed,
-                   s.name, s.metadata->>'emoji'
+                   s.name, s.metadata->>'emoji',
+                   c.name, uc.best_frame
             FROM users u
             LEFT JOIN shop_items s ON s.key = u.equipped_title
+            LEFT JOIN user_cards uc
+              ON uc.user_id = u.id AND uc.card_key = u.featured_card
+            LEFT JOIN cards c ON c.key = uc.card_key
             WHERE u.id = %s
             """,
             (user_id,),
@@ -331,10 +370,21 @@ async def profile_stats(conn: AsyncConnection, user_id: int) -> ProfileStats | N
         row = await cur.fetchone()
     if row is None:
         return None
-    created_at, total_traded, quests_completed, title_name, title_emoji = row
+    (
+        created_at,
+        total_traded,
+        quests_completed,
+        title_name,
+        title_emoji,
+        card_name,
+        card_frame,
+    ) = row
     title = (
         f"{title_emoji} {title_name}" if title_emoji else title_name
     ) if title_name else None
+    featured_card = (
+        f"{card_name} · {card_frame}" if card_name else None
+    )
 
     equity = await net_worth_minor(conn, user_id)
     rank_row = await user_rank(conn, user_id)
@@ -385,6 +435,7 @@ async def profile_stats(conn: AsyncConnection, user_id: int) -> ProfileStats | N
         quests_completed=int(quests_completed),
         trophies=trophies,
         title=title,
+        featured_card=featured_card,
         active_season_equity_minor=active_equity,
     )
 
@@ -467,26 +518,44 @@ async def pro_terminal_stats(
 async def equipped_flair_map(
     conn: AsyncConnection, user_ids: list[int]
 ) -> dict[int, str]:
-    """{user_id: "emoji + title"} for users with an equipped title --
-    one IN() query joining users.equipped_title to the shop row for
-    name+emoji. Feeds the leaderboard board, /leaderboard, /whois."""
+    """{user_id: "emoji + title · card"} for users with an equipped
+    title and/or featured card -- one IN() query joining users to the
+    shop row for title text and user_cards/cards for the featured card.
+    When both are set the card appends after the title (a user can only
+    feature what they hold, so a featured card is a deliberate flex).
+    Feeds the leaderboard board, /leaderboard, /whois."""
     if not user_ids:
         return {}
+    frame_glyph = {
+        "STANDARD": "⚪", "SILVER": "🔘", "GOLD": "🟡",
+        "PLATINUM": "💠", "EPIC": "🟣", "LEGENDARY": "🌟",
+    }
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            SELECT u.id, s.name, s.metadata->>'emoji'
+            SELECT u.id, s.name, s.metadata->>'emoji',
+                   c.name, uc.best_frame
             FROM users u
-            JOIN shop_items s ON s.key = u.equipped_title
+            LEFT JOIN shop_items s ON s.key = u.equipped_title
+            LEFT JOIN user_cards uc
+              ON uc.user_id = u.id AND uc.card_key = u.featured_card
+            LEFT JOIN cards c ON c.key = uc.card_key
             WHERE u.id = ANY(%s)
             """,
             (user_ids,),
         )
         rows = await cur.fetchall()
-    return {
-        int(r[0]): f"{r[2]} {r[1]}" if r[2] else str(r[1])
-        for r in rows
-    }
+    flair: dict[int, str] = {}
+    for uid, tname, temoji, cname, cframe in rows:
+        parts: list[str] = []
+        if tname:
+            parts.append(f"{temoji} {tname}" if temoji else str(tname))
+        if cname:
+            glyph = frame_glyph.get(str(cframe), "🎴")
+            parts.append(f"{glyph} {cname}")
+        if parts:
+            flair[int(uid)] = " · ".join(parts)
+    return flair
 
 
 @dataclass(frozen=True)

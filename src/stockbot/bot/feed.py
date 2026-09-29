@@ -167,6 +167,15 @@ def _fmt_market_news(items: list[dict[str, Any]]) -> str:
     return "📰 " + ", ".join(parts)
 
 
+def _fmt_card_pull(items: list[dict[str, Any]]) -> str:
+    # Achievement class (like JACKPOT): the mention stays -- NPCs can't
+    # reach packs, so attribution is safe.
+    parts = [
+        f"{_mention(p['subject'])} pulled {p['tier']} {p['name']}" for p in items
+    ]
+    return "🃏 " + "; ".join(parts)
+
+
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "LIQUIDATION": _fmt_liquidation,
     "SQUEEZE": _fmt_squeeze,
@@ -178,6 +187,7 @@ _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "SEASON_RESULT": _fmt_season_result,
     "NEWS_LANDED": _fmt_market_news,
     "EARNINGS": _fmt_market_news,
+    "CARD_PULL": _fmt_card_pull,
 }
 
 

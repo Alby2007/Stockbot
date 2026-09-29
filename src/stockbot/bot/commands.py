@@ -48,9 +48,12 @@ from stockbot.alerts.service import cancel_alert, create_alert, list_alerts
 from stockbot.bot.autocomplete import (
     admin_order_autocomplete,
     alert_autocomplete,
+    card_autocomplete,
     equipped_item_autocomplete,
     option_autocomplete,
     order_autocomplete,
+    owned_card_autocomplete,
+    pack_autocomplete,
     quest_reroll_autocomplete,
     sector_autocomplete,
     shop_item_autocomplete,
@@ -67,6 +70,12 @@ from stockbot.bot.chart_view import (
     save_chart_prefs,
 )
 from stockbot.bot.charts import render_candle_chart
+from stockbot.bot.collection_view import (
+    build_page as build_collection_page,
+)
+from stockbot.bot.collection_view import (
+    frame_glyph as _frame_glyph,
+)
 from stockbot.bot.format import format_money, format_pct, format_price
 from stockbot.bot.leaderboard import (
     bind_leaderboard_channel,
@@ -88,6 +97,19 @@ from stockbot.claims.errors import (
     FirstClaimLockedError,
 )
 from stockbot.claims.service import claim_daily
+from stockbot.collectibles.pull import FRAME_RANK
+from stockbot.collectibles.service import (
+    PullOutcome,
+    collection_stats,
+    craft_card,
+    find_card,
+    list_collection,
+    set_featured_card,
+    upgrade_frame,
+)
+from stockbot.collectibles.service import (
+    open_pack as open_card_pack,
+)
 from stockbot.compliance.wash_trade import scan_for_wash_trades
 from stockbot.config import get_settings
 from stockbot.ipo import service as ipo_svc
@@ -164,7 +186,7 @@ from stockbot.shorts.service import (
     open_bounded_short,
 )
 from stockbot.status import service as status_svc
-from stockbot.trading.errors import TradingError
+from stockbot.trading.errors import DuplicateInteractionError, TradingError
 from stockbot.trading.service import (
     execute_trade,
     max_affordable_shares,
@@ -231,6 +253,30 @@ def _welcome_suffix(result: BootstrapResult | None) -> str:
         "what's tradeable, or `/start` for a full walkthrough. Your first "
         "`/claim` unlocks 24h after your account is created."
     )
+
+
+def _frame_glyph_for(card: Any) -> str:
+    """Card-row glyph when no held frame applies: rarity for lore,
+    medal for commemoratives, white circle for instruments."""
+    if card.kind == "LORE" and card.rarity:
+        return _frame_glyph(card.rarity)
+    if card.kind == "COMMEMORATIVE":
+        return "🏅"
+    return _frame_glyph("STANDARD")
+
+
+def _pull_embed(outcome: PullOutcome, index: int, total: int) -> discord.Embed:
+    """One staged-reveal card: frame glyph + name + outcome, duplicates
+    carrying their shard award (C6 -- a visible 'rare' dupe must never
+    read as a bare loss)."""
+    dup = f" — duplicate, +{outcome.shards} shards" if outcome.outcome == "DUPLICATE" else ""
+    upgrade = " — upgraded frame!" if outcome.outcome == "UPGRADE" else ""
+    embed = discord.Embed(
+        title=f"{_frame_glyph(outcome.tier)} {outcome.tier}",
+        description=f"**{outcome.name}**{dup}{upgrade}",
+    )
+    embed.set_footer(text=f"Card {index}/{total}")
+    return embed
 
 
 async def _held_shares(
@@ -1306,6 +1352,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
         embed.add_field(name="Lifetime volume", value=format_money(stats.lifetime_volume_minor))
         embed.add_field(name="Quests", value=str(stats.quests_completed))
+        if stats.featured_card:
+            embed.add_field(name="Featured card", value=stats.featured_card)
         if stats.trophies:
             embed.add_field(
                 name="Trophies & badges",
@@ -2372,6 +2420,170 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             view=view,
             ephemeral=True,
         )
+
+    @tree.command(name="card", description="Look up a collectible card and your copy")
+    @app_commands.describe(card="Card name or key, e.g. card_nort or The Whale")
+    @app_commands.autocomplete(card=card_autocomplete)
+    async def card_lookup(interaction: discord.Interaction, card: str) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            c = await find_card(conn, card)
+            if c is None:
+                await interaction.response.send_message(
+                    f"No card named **{card}** — browse `/collection`.",
+                    ephemeral=True,
+                )
+                return
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT best_frame, copies FROM user_cards "
+                    "WHERE user_id = %s AND card_key = %s",
+                    (interaction.user.id, c.key),
+                )
+                held = await cur.fetchone()
+        embed = discord.Embed(
+            title=f"{_frame_glyph_for(c)} {c.name}",
+            description=c.flavor,
+        )
+        kind_label = (
+            f"{c.kind.lower().capitalize()} · {c.set_key} set"
+            + (f" · {c.rarity}" if c.rarity else "")
+        )
+        embed.add_field(name="Card", value=kind_label)
+        if held:
+            embed.add_field(
+                name="Yours",
+                value=f"{_frame_glyph(str(held[0]))} {held[0]}"
+                + (f" ×{held[1]}" if int(held[1]) > 1 else ""),
+            )
+        else:
+            embed.add_field(name="Yours", value="Not collected")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @tree.command(name="collection", description="Browse a card binder")
+    @app_commands.describe(user="Whose binder to view (default: yours)")
+    async def collection(
+        interaction: discord.Interaction, user: discord.User | None = None
+    ) -> None:
+        target = user or interaction.user
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            stats = await collection_stats(conn, target.id)
+            rows = await list_collection(conn, target.id)
+        embed, view = build_collection_page(
+            target.display_name, stats, rows, target.id, 0
+        )
+        await interaction.response.send_message(embed=embed, view=view)
+
+    @tree.command(name="open", description="Open a card pack with a staged reveal")
+    @app_commands.describe(pack="Which pack to open")
+    @app_commands.autocomplete(pack=pack_autocomplete)
+    async def open_pack_cmd(interaction: discord.Interaction, pack: str) -> None:
+        # C10: the pull transaction COMMITS and releases the connection
+        # before the reveal starts -- a ~4s animation never pins a pooled
+        # connection, and a restart mid-reveal leaves cards correctly
+        # owned (/collection is the source of truth).
+        await interaction.response.defer()
+        try:
+            async with db.connection() as conn:
+                await bootstrap_user(conn, interaction.user.id)
+                outcomes = await open_card_pack(
+                    conn,
+                    interaction.user.id,
+                    pack,
+                    interaction_id=str(interaction.id),
+                    master_seed=get_settings().master_seed,
+                )
+        except ShopError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        except DuplicateInteractionError:
+            await interaction.followup.send(
+                "That pack was already opened.", ephemeral=True
+            )
+            return
+
+        # Best lands last -- ascending pulled-tier order for the reveal.
+        reveals = sorted(outcomes, key=lambda o: FRAME_RANK.get(o.tier, 0))
+        if reveals:
+            # First card on the deferred response; the rest edit in.
+            embed = _pull_embed(reveals[0], 1, len(reveals))
+            await interaction.edit_original_response(embed=embed)
+            for idx, outcome in enumerate(reveals[1:], start=2):
+                await asyncio.sleep(1.2)
+                embed = _pull_embed(outcome, idx, len(reveals))
+                await interaction.edit_original_response(embed=embed)
+        summary = "\n".join(
+            f"{_frame_glyph(o.tier)} **{o.name}** — {o.outcome.lower()}"
+            + (f" (+{o.shards} shards)" if o.shards else "")
+            for o in reveals
+        )
+        await asyncio.sleep(0.6)
+        await interaction.edit_original_response(
+            embed=discord.Embed(title=f"Pack opened — {len(reveals)} cards", description=summary)
+        )
+
+    @tree.command(name="craft", description="Craft a missing card or upgrade a frame with shards")
+    @app_commands.describe(card="Card to craft (missing) or frame-upgrade (held)")
+    @app_commands.autocomplete(card=card_autocomplete)
+    async def craft(interaction: discord.Interaction, card: str) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            c = await find_card(conn, card)
+            if c is None:
+                await interaction.response.send_message(
+                    f"No card named **{card}**.", ephemeral=True
+                )
+                return
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM user_cards WHERE user_id = %s AND card_key = %s",
+                    (interaction.user.id, c.key),
+                )
+                held = await cur.fetchone() is not None
+            try:
+                if held:
+                    _k, frame, cost = await upgrade_frame(conn, interaction.user.id, c.key)
+                    message = (
+                        f"Upgraded **{c.name}** to {_frame_glyph(frame)} {frame} "
+                        f"for {cost} shards."
+                    )
+                else:
+                    _k, cost = await craft_card(conn, interaction.user.id, c.key)
+                    message = f"Crafted **{c.name}** (⚪ STANDARD) for {cost} shards."
+            except ShopError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        await interaction.response.send_message(message)
+
+    @tree.command(
+        name="feature",
+        description="Pin a held card on your profile and leaderboard flair",
+    )
+    @app_commands.describe(card="Card to feature; omit to clear")
+    @app_commands.autocomplete(card=owned_card_autocomplete)
+    async def feature(interaction: discord.Interaction, card: str | None = None) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            c = await find_card(conn, card) if card else None
+            if card and c is None:
+                await interaction.response.send_message(
+                    f"No card named **{card}**.", ephemeral=True
+                )
+                return
+            try:
+                key = await set_featured_card(
+                    conn, interaction.user.id, c.key if c else None
+                )
+            except ShopError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        if key and c:
+            await interaction.response.send_message(
+                f"Now featuring **{c.name}** on your profile."
+            )
+        else:
+            await interaction.response.send_message("Featured card cleared.")
 
     ipo_group = app_commands.Group(
         name="ipo", description="IPO subscriptions — commit cash before listing day"

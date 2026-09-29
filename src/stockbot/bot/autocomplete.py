@@ -319,3 +319,66 @@ async def tunable_param_autocomplete(
         for p in TUNABLE_PARAMS
         if not cur or p.startswith(cur)
     ][:MAX_CHOICES]
+
+
+async def card_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Card picker by name or key -- 99 catalog rows, queried fresh
+    (sets are frozen so a cache would only help under churn)."""
+    async with db.connection() as conn, conn.cursor() as cur:
+        await cur.execute("SELECT key, name FROM cards ORDER BY key")
+        rows = [(str(r[0]), str(r[1])) for r in await cur.fetchall()]
+    q = current.strip().lower()
+    return [
+        app_commands.Choice(name=name, value=key)
+        for key, name in rows
+        if not q or q in name.lower() or key.startswith(q)
+    ][:MAX_CHOICES]
+
+
+async def owned_card_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """The clicker's held cards -- /craft upgrade and /feature targets."""
+    async with db.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT c.key, c.name, u.best_frame FROM user_cards u
+            JOIN cards c ON c.key = u.card_key
+            WHERE u.user_id = %s ORDER BY c.key
+            """,
+            (interaction.user.id,),
+        )
+        rows = [(str(r[0]), str(r[1]), str(r[2])) for r in await cur.fetchall()]
+    q = current.strip().lower()
+    return [
+        app_commands.Choice(name=f"{name} ({frame})", value=key)
+        for key, name, frame in rows
+        if not q or q in name.lower() or key.startswith(q)
+    ][:MAX_CHOICES]
+
+
+async def pack_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Openable packs the clicker holds -- /open targets."""
+    async with db.connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT s.key, s.name, e.quantity FROM entitlements e
+            JOIN shop_items s ON s.key = e.item_key
+            WHERE e.user_id = %s AND s.kind = 'CONSUMABLE'
+              AND s.metadata ? 'cards'
+              AND (e.expires_at IS NULL OR e.expires_at > now())
+            ORDER BY s.key
+            """,
+            (interaction.user.id,),
+        )
+        rows = [(str(r[0]), str(r[1]), int(r[2])) for r in await cur.fetchall()]
+    q = current.strip().lower()
+    return [
+        app_commands.Choice(name=f"{name} ×{qty}", value=key)
+        for key, name, qty in rows
+        if not q or key.startswith(q)
+    ][:MAX_CHOICES]
