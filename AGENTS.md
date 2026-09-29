@@ -299,6 +299,23 @@ both `evaluate_badges` call sites. `listing_credit` is a $500 stackable
 CONSUMABLE `/commission` spends to call `admin.add_instrument` in the same
 tx — a bad listing rolls the consume back. `/purchases` reads
 ledger_entries `SHOP_%` debits. `sandbox_access` repriced $30 → $10.
+Embed color language: `bot/format.py` owns the shared palette —
+`EMBED_UP/DOWN/WARN/GOLD/FLAT/INFO` stripe ints, `stripe_for_change()`
+(day-move → stripe), `pct_emoji()` (🟩/🟥/⬜ for markdown surfaces), and
+`ansi_pct()`/`ansi_dim()` for ```` ```ansi ```` fenced tables (real
+red/green text on desktop AND mobile; escapes cost ~9 bytes/cell and DO
+count against the 4,096-char description cap — `/market` dropped its
+per-row sector column into dim sub-headers to afford the color; the
+budget is locked by `test_market_embed_char_budget`). Color is always
+decoration on top of a `+`/`-` sign or icon — never the only signal
+(colorblind). Semantic map: day-change surfaces stripe by direction,
+`/margin` stripes by health (red undermargined, amber inside
+`margin.warn_ratio`, info when unmargined), leaderboards/`/collectors`
+gold with 🥇🥈🥉 podium medals (`_rank_tag`/`_COLLECTOR_MEDALS`), risk
+surfaces (`/collateral`, shorts, options positions) warn-amber,
+liquidations red, informational lists blue, card reveals use
+`collection_view.frame_color` (per-frame stripe + `FRAME_GLYPH`). The
+feed tape stays plain text — no embeds there by design.
 Shop themes (0046): `theme_*` COSMETIC metadata IS the render palette —
 `shop.service.palette_from_metadata` normalizes it over
 `charts._DEFAULT_PALETTE` keys {up, down, bg, grid, text, accent, spine,

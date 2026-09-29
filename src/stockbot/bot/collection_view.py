@@ -19,6 +19,7 @@ from typing import Any
 import discord
 
 from stockbot import db
+from stockbot.bot.format import EMBED_GOLD
 
 log = logging.getLogger("stockbot.bot.collection_view")
 
@@ -35,6 +36,18 @@ FRAME_GLYPH = {
     "EPIC": "🟣",
     "LEGENDARY": "🌟",
     "PART": "🧩",
+}
+
+# Embed stripe per frame -- a legendary pull announces itself on the
+# reveal card before the eye reaches the name.
+FRAME_COLOR = {
+    "STANDARD": 0xBDC3C7,
+    "SILVER": 0x95A5A6,
+    "GOLD": 0xF1C40F,
+    "PLATINUM": 0x5DADEC,
+    "EPIC": 0x9B59B6,
+    "LEGENDARY": 0xE67E22,
+    "PART": 0x3498DB,
 }
 
 # Print-context stamps: one glyph per provenance mark.
@@ -91,6 +104,10 @@ def parse_cid(custom_id: str) -> tuple[str, int, int] | None:
 
 def frame_glyph(frame: str) -> str:
     return FRAME_GLYPH.get(frame, "❔")
+
+
+def frame_color(frame: str) -> int | None:
+    return FRAME_COLOR.get(frame)
 
 
 @dataclass
@@ -182,6 +199,7 @@ def build_page(
         description=summary
         + "\n\n"
         + ("\n".join(window) if window else "*No cards yet — `/open` a pack.*"),
+        color=EMBED_GOLD,
     )
     embed.set_footer(text=f"Page {page + 1}/{page_count}")
 

@@ -73,6 +73,7 @@ from stockbot.bot.chart_view import (
 from stockbot.bot.charts import render_candle_chart
 from stockbot.bot.collection_view import (
     STAMP_LABEL,
+    frame_color,
     stamp_glyphs,
 )
 from stockbot.bot.collection_view import (
@@ -81,7 +82,21 @@ from stockbot.bot.collection_view import (
 from stockbot.bot.collection_view import (
     frame_glyph as _frame_glyph,
 )
-from stockbot.bot.format import format_money, format_pct, format_price
+from stockbot.bot.format import (
+    EMBED_DOWN,
+    EMBED_FLAT,
+    EMBED_GOLD,
+    EMBED_INFO,
+    EMBED_UP,
+    EMBED_WARN,
+    ansi_dim,
+    ansi_pct,
+    format_money,
+    format_pct,
+    format_price,
+    pct_emoji,
+    stripe_for_change,
+)
 from stockbot.bot.leaderboard import (
     bind_leaderboard_channel,
     delete_board_message,
@@ -285,6 +300,82 @@ def _frame_glyph_for(card: Any) -> str:
     return _frame_glyph("STANDARD")
 
 
+# Podium medals on ranked surfaces -- same language as leaderboard.py.
+_COLLECTOR_MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+
+def _market_embed(
+    snapshots: list[InstrumentSnapshot],
+    venues: dict[int, dict[str, Any]],
+    cur_tick: int | None,
+) -> discord.Embed:
+    """One status line + one ANSI section per venue, in market-id order.
+
+    Index rows (sector_key 'index') leave the table for the venue status
+    line -- they quote the tape, they aren't tradeable. Sector grouping
+    lives in dim sub-headers, not a per-row column: the ANSI escapes cost
+    ~9 bytes/cell and description caps at 4,096 -- a sector column prices
+    out the color.
+    """
+    indexes = {s.market_id: s for s in snapshots if s.sector_key == "index"}
+    status_lines: list[str] = []
+    for mid, m in venues.items():
+        label = f"**{m['code']}** {m['name']}"
+        idx = indexes.get(mid)
+        idx_str = ""
+        if idx is not None:
+            idx_str = f"  ·  {idx.ticker} {format_price(idx.quoted_price)}"
+            if idx.day_change_pct is not None:
+                idx_str += (
+                    f" {pct_emoji(idx.day_change_pct)} {format_pct(idx.day_change_pct)}"
+                )
+        if cur_tick is not None:
+            open_t = int(m["open_ticks"])
+            closed_t = int(m["closed_ticks"])
+            off = int(m["offset_ticks"])
+            if market_phase(m, cur_tick) == "OPEN":
+                until = ticks_until_close(cur_tick, open_t, closed_t, off)
+                status_lines.append(f"{label}: OPEN — closes in ~{until} min{idx_str}")
+            else:
+                until = ticks_until_open(cur_tick, open_t, closed_t, off)
+                status_lines.append(f"{label}: CLOSED — reopens in ~{until} min{idx_str}")
+        else:
+            status_lines.append(f"{label}: not yet open{idx_str}")
+
+    sections: list[str] = []
+    for mid in venues:
+        rows = sorted(
+            (s for s in snapshots if s.market_id == mid and s.sector_key != "index"),
+            key=lambda s: (s.sector_key, s.ticker),
+        )
+        if not rows:
+            continue
+        lines = [ansi_dim(f"── {venues[mid]['code']} ──   ticker    price      24h ⏸")]
+        prev_sector: str | None = None
+        for s in rows:
+            if s.sector_key != prev_sector:
+                prev_sector = s.sector_key
+                lines.append(ansi_dim(f"   {prev_sector.upper()}"))
+            marker = " ⏸" if s.is_halted else ""
+            lines.append(
+                f"{s.ticker:<6} {format_price(s.quoted_price):>9} "
+                f"{ansi_pct(s.day_change_pct)}{marker}"
+            )
+        sections.append("\n".join(lines))
+
+    idx_moves = [s.day_change_pct for s in indexes.values() if s.day_change_pct is not None]
+    blend = sum(idx_moves) / len(idx_moves) if idx_moves else None
+    return discord.Embed(
+        title="Market",
+        description="\n".join(status_lines)
+        + "```ansi\n"
+        + "\n\n".join(sections)
+        + "\n```",
+        color=stripe_for_change(blend),
+        timestamp=datetime.now(UTC),
+    )
+
+
 def _pull_embed(outcome: PullOutcome, index: int, total: int) -> discord.Embed:
     """One staged-reveal card: frame glyph + name + mint serial + print
     stamps + outcome, duplicates carrying their shard award (C6 -- a
@@ -299,6 +390,7 @@ def _pull_embed(outcome: PullOutcome, index: int, total: int) -> discord.Embed:
               else f"{_frame_glyph(outcome.tier)} {outcome.tier}",
         description=f"**{outcome.name}** #{outcome.serial}{dup}{upgrade}"
         + (f"\n*{stamp_names}*" if stamp_names else ""),
+        color=frame_color(outcome.tier),
     )
     embed.set_footer(text=f"Card {index}/{total}")
     return embed
@@ -414,6 +506,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 "same instruments, priced by a factor model that reacts to "
                 "order flow. Fake money, real mechanics."
             ),
+            color=EMBED_INFO,
         )
         if bootstrap.grant_pending:
             account_line = (
@@ -589,46 +682,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             venues = await markets_map(conn)
             cur_tick = await current_tick_index(conn)
 
-        # One status line + one section per venue, in market-id order.
-        status_lines: list[str] = []
-        for m in venues.values():
-            label = f"**{m['code']}** {m['name']}"
-            if cur_tick is not None:
-                open_t = int(m["open_ticks"])
-                closed_t = int(m["closed_ticks"])
-                off = int(m["offset_ticks"])
-                if market_phase(m, cur_tick) == "OPEN":
-                    until = ticks_until_close(cur_tick, open_t, closed_t, off)
-                    status_lines.append(f"{label}: OPEN — closes in ~{until} min")
-                else:
-                    until = ticks_until_open(cur_tick, open_t, closed_t, off)
-                    status_lines.append(f"{label}: CLOSED — reopens in ~{until} min")
-            else:
-                status_lines.append(f"{label}: not yet open")
-
-        sections: list[str] = []
-        for mid in venues:
-            rows = sorted(
-                (s for s in snapshots if s.market_id == mid),
-                key=lambda s: (s.sector_key, s.ticker),
-            )
-            if not rows:
-                continue
-            lines = [f"── {venues[mid]['code']} ──", "ticker  sector           price       24h"]
-            for s in rows:
-                marker = " (halted)" if s.is_halted else ""
-                change = format_pct(s.day_change_pct) if s.day_change_pct is not None else "   n/a"
-                lines.append(
-                    f"{s.ticker:<6} {s.sector_key:<11} {format_price(s.quoted_price):>12} "
-                    f"{change:>9}{marker}"
-                )
-            sections.append("\n".join(lines))
-
-        embed = discord.Embed(
-            title="Market",
-            description="\n".join(status_lines) + "```\n" + "\n\n".join(sections) + "\n```",
+        await interaction.response.send_message(
+            embed=_market_embed(snapshots, venues, cur_tick)
         )
-        await interaction.response.send_message(embed=embed)
 
     @tree.command(name="stock", description="Show detail for one instrument")
     @app_commands.describe(ticker="Instrument ticker, e.g. NORT")
@@ -665,7 +721,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
             return
 
-        embed = discord.Embed(title=f"{snapshot.ticker} \u2014 {snapshot.name}")
+        embed = discord.Embed(
+            title=f"{snapshot.ticker} \u2014 {snapshot.name}",
+            color=stripe_for_change(snapshot.day_change_pct),
+        )
         embed.add_field(name="Sector", value=snapshot.sector_name)
         venue = venues.get(snapshot.market_id)
         if venue is not None:
@@ -696,7 +755,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 value=f"{format_price(snapshot.bid)} / {format_price(snapshot.ask)}",
             )
         if snapshot.day_change_pct is not None:
-            embed.add_field(name="24h change", value=format_pct(snapshot.day_change_pct))
+            embed.add_field(
+                name="24h change",
+                value=f"{pct_emoji(snapshot.day_change_pct)} "
+                f"{format_pct(snapshot.day_change_pct)}",
+            )
         embed.add_field(name="Impact", value=format_pct(float(snapshot.impact)))
         bids, asks = depth
         if bids or asks:
@@ -873,7 +936,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
         filename = f"{snapshot.ticker}.png"
         file = discord.File(buf, filename=filename)
-        embed = discord.Embed(title=f"{snapshot.ticker} \u2014 {snapshot.name}")
+        embed = discord.Embed(
+            title=f"{snapshot.ticker} \u2014 {snapshot.name}",
+            color=stripe_for_change(snapshot.day_change_pct),
+        )
         embed.set_image(url=f"attachment://{filename}")
         if resolved_axis == "time" and end_ts is not None:
             ending = end_ts.astimezone(UTC).strftime("%b %d %H:%M UTC")
@@ -901,15 +967,21 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         def _lines(items: list[InstrumentSnapshot]) -> str:
             return "ticker  v    price       24h\n" + "\n".join(
                 f"{s.ticker:<6} {s.market_code:<3} {format_price(s.quoted_price):>10} "
-                f"{format_pct(s.day_change_pct):>9}"  # type: ignore[arg-type]
+                f"{ansi_pct(s.day_change_pct)}"
                 for s in items
             )
 
         embed = discord.Embed(title="Movers (24h)")
         embed.add_field(
-            name="Top gainers", value=f"```\n{_lines(ranked[-5:][::-1])}\n```", inline=False
+            name="📈 Top gainers",
+            value=f"```ansi\n{_lines(ranked[-5:][::-1])}\n```",
+            inline=False,
         )
-        embed.add_field(name="Top losers", value=f"```\n{_lines(ranked[:5])}\n```", inline=False)
+        embed.add_field(
+            name="📉 Top losers",
+            value=f"```ansi\n{_lines(ranked[:5])}\n```",
+            inline=False,
+        )
         await interaction.response.send_message(embed=embed)
 
     @tree.command(name="sectors", description="Show average performance by sector")
@@ -927,12 +999,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         for (market_code, sector_key), members in sorted(by_sector.items()):
             changes = [s.day_change_pct for s in members if s.day_change_pct is not None]
             avg_change = sum(changes) / len(changes) if changes else None
-            change_str = format_pct(avg_change) if avg_change is not None else "   n/a"
             venue = f"{market_code:<4}" if len({s.market_code for s in snapshots}) > 1 else ""
-            lines.append(f"{venue}{sector_key:<11} {members[0].sector_name:<16} {change_str:>9}")
+            lines.append(
+                f"{venue}{sector_key:<11} {members[0].sector_name:<16} "
+                f"{ansi_pct(avg_change)}"
+            )
 
         embed = discord.Embed(title="Sectors (avg 24h change)")
-        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        embed.description = "```ansi\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(embed=embed)
 
     @tree.command(name="calendar", description="Show upcoming earnings dates")
@@ -1086,10 +1160,12 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         lines = [f"Cash: {format_money(cash)}"]
         holdings_value = Decimal(0)
         accrued_minor = Decimal(0)
+        unrealized = Decimal(0)
         for ticker, quantity, avg_cost, quoted_price, fees_acc, divs_acc in positions:
             market_value = Decimal(quantity) * Decimal(quoted_price)
             holdings_value += market_value
             accrued_minor += Decimal(fees_acc) + Decimal(divs_acc)
+            unrealized += Decimal(quantity) * (Decimal(quoted_price) - Decimal(avg_cost))
             is_short = quantity < 0
             unrealized_pct = (
                 (
@@ -1103,7 +1179,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             tag = "SHORT " if is_short else ""
             lines.append(
                 f"{tag}{ticker:<6} {quantity:>6} @ {format_price(avg_cost):>10}  "
-                f"now {format_price(quoted_price):>10}  {format_pct(unrealized_pct):>8}"
+                f"now {format_price(quoted_price):>10}  {ansi_pct(unrealized_pct, 8)}"
             )
         # Net worth nets out accrued borrow fees / dividend obligations,
         # same as the margin health and league scoring paths.
@@ -1111,9 +1187,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         lines.append(f"\nNet worth: {format_money(net_worth_minor)}")
 
         embed = discord.Embed(
-            title=f"{interaction.user.display_name}'s {scope + ' ' if scope else ''}portfolio"
+            title=f"{interaction.user.display_name}'s {scope + ' ' if scope else ''}portfolio",
+            color=stripe_for_change(float(unrealized) if positions else None),
         )
-        embed.description = "```\n" + "\n".join(lines) + "\n```"
+        embed.description = "```ansi\n" + "\n".join(lines) + "\n```"
         if not positions:
             embed.set_footer(
                 text=(
@@ -1830,9 +1907,21 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 season_id = entry[0]
             health = await compute_health(conn, interaction.user.id, season_id)
             tier = await margin_tier(conn, interaction.user.id, season_id)
+            mcfg = await margin_config(conn)
 
+        if health.undermargined:
+            stripe = EMBED_DOWN
+        elif not health.margined:
+            stripe = EMBED_INFO
+        else:
+            warn_ratio = mcfg["margin.warn_ratio"]
+            near_warn = warn_ratio > 0 and Decimal(health.equity_minor) < warn_ratio * Decimal(
+                health.maint_req_minor
+            )
+            stripe = EMBED_WARN if near_warn else EMBED_UP
         embed = discord.Embed(
-            title=f"{'League m' if league else 'M'}argin — {interaction.user.display_name}"
+            title=f"{'League m' if league else 'M'}argin — {interaction.user.display_name}",
+            color=stripe,
         )
         embed.add_field(name="Equity", value=format_money(health.equity_minor))
         embed.add_field(name="Cash", value=format_money(health.cash_minor))
@@ -1907,7 +1996,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"SI {float(r[5]) * 100:.1f}%  fees {format_money(fees)}"
                 + (f"  divs {format_money(divs)}" if divs else "")
             )
-        embed = discord.Embed(title="Collateral — open shorts")
+        embed = discord.Embed(title="Collateral — open shorts", color=EMBED_WARN)
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(
             content=_welcome_suffix(bootstrap) or None, embed=embed
@@ -1929,7 +2018,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"{format_price(r['fill_price']):>10}  {format_money(r['penalty_minor']):>9}"
             for r in rows
         ]
-        embed = discord.Embed(title="Liquidations")
+        embed = discord.Embed(title="Liquidations", color=EMBED_DOWN)
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(
             content=_welcome_suffix(bootstrap) or None, embed=embed
@@ -2475,6 +2564,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         embed = discord.Embed(
             title=f"{_frame_glyph_for(c)} {c.name}",
             description=c.flavor,
+            color=frame_color(str(held[0])) if held else EMBED_FLAT,
         )
         kind_label = (
             f"{c.kind.lower().capitalize()} · {c.set_key} set"
@@ -2548,14 +2638,15 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 else ""
             )
             lines.append(
-                f"{idx:>3}. <@{r['user_id']}> — **{int(r['score'])}** "
-                f"({int(r['cards'])} cards){top}"
+                f"{_COLLECTOR_MEDALS.get(idx, f'{idx:>3}.')} <@{r['user_id']}> — "
+                f"**{int(r['score'])}** ({int(r['cards'])} cards){top}"
             )
         embed = discord.Embed(
             title="Collector leaderboard",
             description="\n".join(lines)
             if lines
             else "No cards yet — `/open` a pack to start a binder.",
+            color=EMBED_GOLD,
         )
         if mine:
             embed.set_footer(
@@ -2614,7 +2705,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await asyncio.sleep(0.6)
         await interaction.edit_original_response(
             embed=discord.Embed(
-                title=f"Pack opened — {len(reveals)} cards", description=summary
+                title=f"Pack opened — {len(reveals)} cards",
+                description=summary,
+                color=frame_color(reveals[-1].tier) if reveals else None,
             )
         )
 
@@ -2811,7 +2904,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"`{discord.utils.format_dt(ts, 'd')}` **{label}**{gifted}"
                 f" — {format_money(int(spent))}"
             )
-        embed = discord.Embed(title="Recent purchases", description="\n".join(lines))
+        embed = discord.Embed(
+            title="Recent purchases", description="\n".join(lines), color=EMBED_INFO
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     trade_group = app_commands.Group(
@@ -2912,7 +3007,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             ) or "nothing"
             lines.append(f"`#{t.id}` {direction} <@{other}> — {side} ⇄ {gets}")
         await interaction.response.send_message(
-            embed=discord.Embed(title="Open trades", description="\n".join(lines)),
+            embed=discord.Embed(
+                title="Open trades", description="\n".join(lines), color=EMBED_INFO
+            ),
             ephemeral=True,
         )
 
@@ -3273,7 +3370,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     c = chain["cells"][side][(d, k)]
                     row += f"{format_price(c['premium']):>8} {c['delta']:>5.2f} "
                 lines.append(row)
-        embed = discord.Embed(title=f"Options chain — {chain['ticker']}")
+        embed = discord.Embed(
+            title=f"Options chain — {chain['ticker']}", color=EMBED_INFO
+        )
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(embed=embed)
 

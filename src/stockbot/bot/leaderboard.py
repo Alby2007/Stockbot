@@ -20,13 +20,23 @@ import discord
 from psycopg import AsyncConnection
 
 from stockbot import db
-from stockbot.bot.format import format_money
+from stockbot.bot.format import EMBED_GOLD, format_money
 from stockbot.status import service as status_svc
 from stockbot.status.service import LeaderboardRow
 
 log = logging.getLogger("stockbot.bot.leaderboard")
 
 BOARD_LIMIT = 15
+
+# Medals replace the numeric rank for the podium rows; `tag` stays a
+# fixed visual width so the equity column doesn't jump on the podium.
+_MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+
+def _rank_tag(rank: int) -> str:
+    if rank in _MEDALS:
+        return _MEDALS[rank]
+    return f"{rank:>3}."
 
 # Per-guild content hashes -- unchanged boards skip the REST edit entirely
 # (overnight the ranking is flat and edit spam just burns rate limit).
@@ -59,10 +69,10 @@ def leaderboard_embed(
     footer so the board's freshness is legible. `caller` appends a
     "You: rank N" note for the command surface (boards pass None);
     `flair` is {user_id: equipped-title string}."""
-    embed = discord.Embed(title="Leaderboard — net worth")
+    embed = discord.Embed(title="Leaderboard — net worth", color=EMBED_GOLD)
     if rows:
         embed.description = "\n".join(
-            f"{r.rank:>3}. <@{r.user_id}>"
+            f"{_rank_tag(r.rank)} <@{r.user_id}>"
             + (f" · {flair[r.user_id]}" if flair and r.user_id in flair else "")
             + f"  {format_money(r.equity_minor):>14}"
             for r in rows[:limit]

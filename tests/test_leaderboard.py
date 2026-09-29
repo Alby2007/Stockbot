@@ -53,9 +53,21 @@ def test_leaderboard_embed_ranks_and_footer() -> None:
     desc = embed.description or ""
     assert "<@101>" in desc and "<@103>" in desc
     lines = desc.splitlines()
-    assert lines[0].startswith("  1.")
+    assert lines[0].startswith("🥇")
     assert "$100,000.00" in lines[0]
     assert "Updated" in (embed.footer.text or "")
+
+
+def test_leaderboard_embed_medals_and_gold() -> None:
+    rows = [_row(101 + i, 10_000_000 - i * 500, i + 1, 20) for i in range(5)]
+    embed = leaderboard_embed(rows)
+    assert embed.color is not None and embed.color.value == 0xF1C40F
+    lines = (embed.description or "").splitlines()
+    assert lines[0].startswith("🥇")
+    assert lines[1].startswith("🥈")
+    assert lines[2].startswith("🥉")
+    # Rank 4+ stays numeric -- medals are podium-only.
+    assert lines[3].startswith("  4.")
 
 
 def test_leaderboard_embed_empty_board() -> None:

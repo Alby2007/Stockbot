@@ -33,7 +33,7 @@ from psycopg import AsyncConnection
 from stockbot import db
 from stockbot.accounts.errors import UserDisabledError
 from stockbot.accounts.service import bootstrap_user
-from stockbot.bot.format import format_money
+from stockbot.bot.format import EMBED_GOLD, EMBED_INFO, format_money
 from stockbot.ledger.errors import (
     InsufficientFundsError,
     UnknownAccountError,
@@ -248,7 +248,7 @@ class _ShopButton(discord.ui.Button[discord.ui.View]):
 
 
 def build_shop_home(state: ShopState) -> tuple[discord.Embed, discord.ui.View]:
-    embed = discord.Embed(title="Shop")
+    embed = discord.Embed(title="Shop", color=EMBED_GOLD)
     embed.description = f"Balance: **{format_money(state.balance_minor)}**"
     if state.deal_key is not None:
         deal_item = find_shop_item(state, state.deal_key)
@@ -291,7 +291,7 @@ def build_shop_home(state: ShopState) -> tuple[discord.Embed, discord.ui.View]:
 def build_shop_category(state: ShopState, slug: str) -> tuple[discord.Embed, discord.ui.View]:
     label = _CATEGORY_BY_SLUG[slug][0]
     items = _items_in(state, slug)
-    embed = discord.Embed(title=f"Shop — {label}")
+    embed = discord.Embed(title=f"Shop — {label}", color=EMBED_GOLD)
     embed.description = f"Balance: **{format_money(state.balance_minor)}**"
     options: list[discord.SelectOption] = []
     for item in items:
@@ -365,7 +365,7 @@ def build_shop_card(
     state: ShopState, item: ShopItem, *, note: str | None = None
 ) -> tuple[discord.Embed, discord.ui.View]:
     slug = _CATEGORY_FOR_KIND.get(item.kind, "capabilities")
-    embed = discord.Embed(title=f"{_emoji(item)} {item.name}")
+    embed = discord.Embed(title=f"{_emoji(item)} {item.name}", color=EMBED_INFO)
     lines = [item.description, "", f"**Price:** {_price_text(item, state)}"]
     owned = state.owned(item.key)
     if owned:

@@ -18,6 +18,7 @@ from typing import Any
 import discord
 
 from stockbot import db
+from stockbot.bot.format import EMBED_FLAT, EMBED_INFO, EMBED_UP
 
 log = logging.getLogger("stockbot.bot.trade_view")
 
@@ -85,12 +86,20 @@ async def render_trade(
         gave += f" + **{trade.give_shards}** shards"
     if trade.want_shards:
         want += f" + **{trade.want_shards}** shards"
+    resolved_colors = {
+        "accepted": EMBED_UP,
+        "declined": EMBED_FLAT,
+        "cancelled": EMBED_FLAT,
+        "expired": EMBED_FLAT,
+        "voided": EMBED_FLAT,
+    }
     embed = discord.Embed(
         title=f"Trade offer #{trade.id}" + (f" — {resolved}" if resolved else ""),
         description=(
             f"<@{trade.proposer}> gives: {gave}\n"
             f"<@{trade.counterparty}> gives: {want}"
         ),
+        color=resolved_colors.get(resolved or "", EMBED_INFO),
     )
     if resolved is None:
         embed.set_footer(
