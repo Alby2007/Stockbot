@@ -1,8 +1,8 @@
-"""Interactive chart controls: pan / zoom / timeframe / axis buttons.
+"""Interactive chart controls: pan / zoom navigation plus a span Select.
 
 Stateless by construction -- the whole window state rides inside each
-button's custom_id (`cbt:{action}:{iid}:{end}:{span}:{axis}:{theme}`), so
-a click needs no server-side session. Two entry paths reach
+component's custom_id (`cbt:{action}:{iid}:{end}:{span}:{axis}:{theme}`),
+so a click needs no server-side session. Two entry paths reach
 `handle_chart_component`: the View's item callbacks while the sending
 process lives, and `StockBotClient.on_interaction` as the post-restart
 fallback (discord.py dispatches a component interaction to both; the
@@ -11,11 +11,14 @@ handler's is_done() guard makes the second call a no-op).
 Actions: panl/panr (shift the window half a span), zin/zout (halve/double
 the span), home (re-anchor to the last open tick), s<span> (timeframe
 presets: set span, re-anchor), ax (toggle the x-axis between real time
-and raw ticks). `axis` is "time" (UTC wall-clock labels) or "ticks";
-`theme` is the equipped theme item key ("-" = default palette) and rides
-the cid rather than the clicker's pref -- a shared chart message can't
-repaint per-clicker. Legacy 5/6-field cids parse as time/no-theme -- an
-in-place upgrade.
+and raw ticks). The timeframe presets and the axis toggle ride one
+Select whose cid action is `sel` -- its option values ARE the actions
+("s960", "ax"); legacy `s<span>` buttons on old messages still resolve.
+`axis` is "time" (UTC wall-clock labels) or "ticks"; `theme` is the
+equipped theme item key ("-" = default palette) and rides the cid rather
+than the clicker's pref -- a shared chart message can't repaint
+per-clicker. Legacy 5/6-field cids parse as time/no-theme -- an in-place
+upgrade.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from psycopg import AsyncConnection
 
 from stockbot import db
 from stockbot.bot.charts import bucket_for_span, render_candle_chart
+from stockbot.bot.format import stripe_for_change
 from stockbot.shop.service import owns_item
 
 log = logging.getLogger("stockbot.bot.chart_view")
@@ -45,18 +49,11 @@ TIMEFRAME_SPANS = {
 PRO_SPANS = {"2w", "1M"}  # TIMEFRAME_SPANS keys gated on pro_terminal
 
 _BUTTONS = [
-    ("\u25c0 Older", "panl", 0),
-    ("Newer \u25b6", "panr", 0),
-    ("Zoom in", "zin", 0),
-    ("Zoom out", "zout", 0),
-    ("Latest", "home", 0),
-    ("1H", "s60", 1),
-    ("4H", "s240", 1),
-    ("1D", "s960", 1),
-    ("1W", "s4800", 1),
-    # Pro spans render for everyone -- a gated click advertises the tier.
-    ("2W", "s9600", 2),
-    ("1M", "s19200", 2),
+    ("\u25c0 Older", "panl"),
+    ("Newer \u25b6", "panr"),
+    ("Zoom in", "zin"),
+    ("Zoom out", "zout"),
+    ("Latest", "home"),
 ]
 
 
@@ -239,33 +236,50 @@ class _ChartButton(discord.ui.Button[discord.ui.View]):
         await handle_chart_component(interaction)
 
 
+class _ChartSelect(discord.ui.Select[discord.ui.View]):
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await handle_chart_component(interaction)
+
+
 def build_chart_view(
     iid: int, end: int, span: int, axis: str = "time",
     theme: str | None = None, mine: bool = False,
 ) -> discord.ui.View:
-    """Button rows encoding the current window -- every button's custom_id
-    carries (action, iid, end, span, axis, theme, mine) so no state lives
-    process-side. The theme rides the cid rather than the clicker's pref:
-    a shared chart message can't repaint per-clicker. `mine` marks
-    ephemeral /chart messages: clicks keep drawing the clicker's own
-    marks and reply with a fresh ephemeral message."""
+    """Component rows encoding the current window -- every component's
+    custom_id carries (action, iid, end, span, axis, theme, mine) so no
+    state lives process-side. The theme rides the cid rather than the
+    clicker's pref: a shared chart message can't repaint per-clicker.
+    `mine` marks ephemeral /chart messages: clicks keep drawing the
+    clicker's own marks and reply with a fresh ephemeral message.
+
+    Row 0 is navigation; row 1 is a single Select for the six span
+    presets and the axis toggle -- its option values are the actions
+    ("s960", "ax") resolved by the `sel` cid, which halves the chrome
+    under every chart and lets gated Pro spans read as menu entries."""
     view = discord.ui.View(timeout=None)
-    for label, action, row in _BUTTONS:
+    for label, action in _BUTTONS:
         view.add_item(
             _ChartButton(
                 style=discord.ButtonStyle.secondary,
                 label=label,
                 custom_id=encode_cid(action, iid, end, span, axis, theme, mine),
-                row=row,
+                row=0,
             )
         )
-    # The toggle labels the mode a click switches TO, not the current one.
+    # The toggle labels the mode a pick switches TO, not the current one.
     other = "ticks" if axis == "time" else "time"
+    options = [
+        discord.SelectOption(
+            label=label.upper(), value=f"s{t}", default=t == span
+        )
+        for label, t in TIMEFRAME_SPANS.items()
+    ]
+    options.append(discord.SelectOption(label=f"Axis: {other}", value="ax"))
     view.add_item(
-        _ChartButton(
-            style=discord.ButtonStyle.secondary,
-            label=f"Axis: {other}",
-            custom_id=encode_cid("ax", iid, end, span, axis, theme, mine),
+        _ChartSelect(
+            custom_id=encode_cid("sel", iid, end, span, axis, theme, mine),
+            placeholder="Span…",
+            options=options,
             row=1,
         )
     )
@@ -330,6 +344,12 @@ async def _handle(interaction: discord.Interaction) -> None:
             )
             return
         ticker, name = str(info[0]), str(info[1])
+        if action == "sel":
+            # The span Select's option values ARE the actions ("s960",
+            # "ax") -- normalize so legacy s<span> buttons and menu picks
+            # share one path.
+            values = data.get("values") or []
+            action = str(values[0]) if values else ""
         if action == "ax":
             # Axis toggle: same window, flipped label mode.
             new_end, new_span = end, span
@@ -370,10 +390,15 @@ async def _handle(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
-    buf, resolved_end, end_ts = result
+    buf, resolved_end, end_ts, last_close, window_delta = result
 
     filename = f"{ticker}.png"
-    embed = discord.Embed(title=f"{ticker} \u2014 {name}")
+    # Price + delta in the title make the embed useful on a slow
+    # connection; the direction-coloured stripe lands before the PNG.
+    embed = discord.Embed(
+        title=f"{ticker} \u2014 {name} · {last_close:,.2f} {window_delta:+.2%}",
+        color=stripe_for_change(window_delta),
+    )
     embed.set_image(url=f"attachment://{filename}")
     if axis == "time" and end_ts is not None:
         ending = end_ts.astimezone(UTC).strftime("%b %d %H:%M UTC")

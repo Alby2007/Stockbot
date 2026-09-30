@@ -26,7 +26,7 @@ async def test_render_returns_a_png_after_a_tick(conn: AsyncConnection) -> None:
 
     result = await render_candle_chart(conn, instrument_id, "TEST")
     assert result is not None
-    buf, _end, _end_ts = result
+    buf, _end, _end_ts, _lc, _wd = result
     data = buf.read()
     assert data[:8] == b"\x89PNG\r\n\x1a\n"
 
@@ -56,7 +56,7 @@ async def test_render_covers_closed_session_rows(conn: AsyncConnection) -> None:
 
     result = await render_candle_chart(conn, instrument_id, "TEST")
     assert result is not None
-    buf, _end, _end_ts = result
+    buf, _end, _end_ts, _lc, _wd = result
     assert buf.read()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
@@ -284,7 +284,7 @@ async def test_render_returns_end_ts(conn: AsyncConnection) -> None:
     await _seed_synthetic_candles(conn, iid, 30)
     result = await render_candle_chart(conn, iid, "TEST", span=10)
     assert result is not None
-    _buf, end, end_ts = result
+    _buf, end, end_ts, _lc, _wd = result
     assert end == 29
     assert end_ts is not None  # newest candle's tick timestamp
 
@@ -296,7 +296,7 @@ async def test_render_axis_ticks_still_works(conn: AsyncConnection) -> None:
         conn, iid, "TEST", span=10, axis="ticks"
     )
     assert result is not None
-    buf, _end, _ts = result
+    buf, _end, _ts, _lc, _wd = result
     assert buf.read()[:8] == b"\x89PNG\r\n\x1a\n"
 
 
@@ -516,3 +516,49 @@ async def test_viewer_overlay_updates_on_fill_amendment(
     second = await render_candle_chart(conn, iid, "TEST", viewer_id=777003)
     assert second is not None
     assert second[0].read() != first[0].read()
+
+
+def test_y_pad_scales_with_span_not_price() -> None:
+    """Chart-plan D1: the absolute 0.2%-of-price floor used to beat the
+    8% pad on any window quieter than ~2.5% range (most of them), halving
+    the panel to padding. Now the pad is relative and the floor only
+    rescues a genuinely flat window."""
+    from stockbot.bot.charts import _y_pad
+
+    # The APEX case: span 0.29 on a ~$72 stock. 8% pad, not the old
+    # 0.145 floor -- the data occupies ~86% of the panel, not ~50%.
+    assert _y_pad(0.29, 72.45) == pytest.approx(0.29 * 0.08)
+    assert _y_pad(5.0, 100.0) == pytest.approx(0.4)
+    # Genuinely flat data still gets the absolute rescue.
+    assert _y_pad(0.0, 100.0) == pytest.approx(0.2)
+    assert _y_pad(0.0, 0.0) == pytest.approx(1e-6)
+
+
+async def test_render_png_is_1200x675(conn: AsyncConnection) -> None:
+    """Chart-plan D3: figsize (8, 4.5) @ dpi 150 keeps the same ~1200px
+    upload while every point-sized element renders ~25% larger."""
+    import struct
+
+    iid = await _instrument_id(conn)
+    await _seed_synthetic_candles(conn, iid, 30)
+    result = await render_candle_chart(conn, iid, "TEST", span=10)
+    assert result is not None
+    buf = result[0]
+    data = buf.read()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    width, height = struct.unpack(">II", data[16:24])
+    assert (width, height) == (1200, 675)
+
+
+async def test_render_returns_window_stats(conn: AsyncConnection) -> None:
+    """The 4th/5th return values drive the embed title -- they must match
+    what the PNG's title shows for the same window."""
+    iid = await _instrument_id(conn)
+    await _seed_synthetic_candles(conn, iid, 30)
+    result = await render_candle_chart(conn, iid, "TEST", span=10)
+    assert result is not None
+    _buf, _end, _ts, last_close, window_delta = result
+    # Seeded shape: close = 100+g, open = 100+g-0.5; a 10-tick window
+    # ending at tick 29 spans opens 20..29.
+    assert last_close == pytest.approx(129.0)
+    assert window_delta == pytest.approx(129.0 / 119.5 - 1)

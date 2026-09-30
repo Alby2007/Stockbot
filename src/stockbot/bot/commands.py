@@ -71,7 +71,7 @@ from stockbot.bot.chart_view import (
     load_chart_prefs,
     save_chart_prefs,
 )
-from stockbot.bot.charts import render_candle_chart
+from stockbot.bot.charts import bucket_for_span, render_candle_chart
 from stockbot.bot.collection_view import (
     STAMP_LABEL,
     frame_color,
@@ -981,20 +981,26 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         if result is None:
             await interaction.followup.send("No price history yet.", ephemeral=True)
             return
-        buf, end, end_ts = result
+        buf, end, end_ts, last_close, window_delta = result
 
         filename = f"{snapshot.ticker}.png"
         file = discord.File(buf, filename=filename)
+        # Same stripe/title the component-edit embed uses -- price and
+        # window delta are useful before the PNG finishes uploading.
         embed = discord.Embed(
-            title=f"{snapshot.ticker} \u2014 {snapshot.name}",
-            color=stripe_for_change(snapshot.day_change_pct),
+            title=f"{snapshot.ticker} \u2014 {snapshot.name} \u00b7 "
+                  f"{last_close:,.2f} {window_delta:+.2%}",
+            color=stripe_for_change(window_delta),
         )
         embed.set_image(url=f"attachment://{filename}")
         if resolved_axis == "time" and end_ts is not None:
             ending = end_ts.astimezone(UTC).strftime("%b %d %H:%M UTC")
         else:
             ending = str(end)
-        embed.set_footer(text=f"{span} open ticks ending {ending} · pan/zoom buttons below")
+        embed.set_footer(
+            text=f"{span} open ticks ending {ending} \u00b7 "
+                 f"{bucket_for_span(span)}t/candle"
+        )
         await interaction.followup.send(
             embed=embed,
             file=file,

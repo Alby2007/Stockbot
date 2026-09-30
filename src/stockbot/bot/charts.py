@@ -69,6 +69,10 @@ async def _palette_for(
 # fingerprint catches it so a mid-tick trade still re-renders.
 _RENDER_CACHE: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
 _RENDER_CACHE_MAX = 64
+# Bump whenever _render_png's layout/styling changes: the fingerprint
+# below keys on row data only, so without it a code change would serve
+# pre-change PNGs from a long-lived process's cache.
+_RENDER_VERSION = 2
 
 
 def bucket_for_span(span: int) -> int:
@@ -290,11 +294,12 @@ async def render_candle_chart(
     axis: str = "time",
     theme: str | None = None,
     viewer_id: int | None = None,
-) -> tuple[io.BytesIO, int, Any] | None:
+) -> tuple[io.BytesIO, int, Any, float, float] | None:
     """Candlestick chart of the `span` open ticks ending at `end`.
-    Returns (png, resolved_end, end_ts) -- the clamped end tick for
-    button state and the newest candle's timestamp for footers -- or
-    None if the window holds no candles.
+    Returns (png, resolved_end, end_ts, last_close, window_delta) -- the
+    clamped end tick for button state, the newest candle's timestamp for
+    footers, and the window's last close / fractional net change for the
+    embed -- or None if the window holds no candles.
 
     `viewer_id` overlays that user's own marks (entry line + P&L band,
     bounded-short knockout) -- the render becomes viewer-specific, so
@@ -318,6 +323,7 @@ async def render_candle_chart(
     # user's palette to everyone on the same window. Same for the viewer
     # marks: position changes bust the key so a fresh fill re-renders.
     fp = (
+        _RENDER_VERSION,
         instrument_id,
         span,
         axis,
@@ -343,7 +349,12 @@ async def render_candle_chart(
         while len(_RENDER_CACHE) > _RENDER_CACHE_MAX:
             _RENDER_CACHE.popitem(last=False)
     end_ts = rows[0][8]  # newest-first: the window's true right edge
-    return buf, resolved_end, end_ts
+    # Window stats for the embed stripe/title -- same inputs the PNG
+    # uses, so a slow-connection embed agrees with the image.
+    last_close = float(rows[0][4])
+    first_open = float(rows[-1][1])
+    window_delta = last_close / first_open - 1 if first_open else 0.0
+    return buf, resolved_end, end_ts, last_close, window_delta
 
 
 def _axis_formatter(
@@ -389,6 +400,18 @@ def _axis_formatter(
     return _fmt
 
 
+def _y_pad(price_span: float, price_lo: float) -> float:
+    """Vertical pad around the price range. An 8%-of-span pad keeps
+    ~86% of the panel on data at every range; the old absolute
+    0.2%-of-price floor beat that pad on any window quieter than ~2.5%
+    range, which is most of them -- the half-empty-panel bug. The floor
+    is now reserved for the degenerate all-flat window where the span
+    collapses and the pad would be a hair-thin interval."""
+    if price_span <= 0:
+        return max(price_lo * 0.002, 1e-6)
+    return price_span * 0.08
+
+
 def _render_png(
     rows: list[Any], ticker: str, span: int = 240, bucket: int = 1,
     axis: str = "time", palette: dict[str, str] | None = None,
@@ -420,26 +443,35 @@ def _render_png(
         price_hi = max(price_hi, *bshort)
         price_lo = min(price_lo, *bshort)
     price_span = price_hi - price_lo
-    # Autoscale on flat/near-flat data collapses ylim to a hair-thin
-    # interval and eps-height doji bodies would fill the whole panel --
-    # force the pad so the displayed range is always meaningful.
-    ypad = max(price_span * 0.08, price_lo * 0.002, 1e-9)
+    ypad = _y_pad(price_span, price_lo)
     view = price_span + 2 * ypad
     doji_eps = view * 0.004  # minimum body height so doji stay visible
 
-    fig = Figure(figsize=(10, 6), facecolor=p["bg"])
-    gs = fig.add_gridspec(2, 1, height_ratios=(3, 1), hspace=0.05)
-    ax = fig.add_subplot(gs[0])
-    axv = fig.add_subplot(gs[1], sharex=ax)
-    for a in (ax, axv):
-        a.set_facecolor(p["bg"])
-        a.tick_params(colors=p["text"], labelsize=8)
-        # Horizontal gridlines only -- the session separators below carry
-        # the vertical reference, without the crosshatch noise.
-        a.grid(axis="y", color=p["grid"], alpha=0.06)
-        for spine in a.spines.values():
-            spine.set_color(p["spine"])
-    ax.tick_params(labelbottom=False)
+    # 8x4.5 inches at dpi 150 = 1200x675: the same pixels as 10x6 at
+    # dpi 120, so every point-sized element renders ~25% bigger at the
+    # ~550px inline width Discord actually shows, at the same byte cost.
+    fig = Figure(figsize=(8, 4.5), facecolor=p["bg"])
+    ax = fig.add_subplot(111)
+    ax.set_facecolor(p["bg"])
+    # Monospace numerics: financial figures read as data in a tabular
+    # font, and DejaVu Sans Mono ships with matplotlib (no asset needed).
+    ax.tick_params(
+        colors=p["text"], labelsize=10, labelfontfamily="monospace"
+    )
+    # Horizontal gridlines only -- the session separators below carry
+    # the vertical reference, without the crosshatch noise.
+    ax.grid(axis="y", color=p["grid"], alpha=0.13)
+    for spine in ax.spines.values():
+        spine.set_color(p["spine"])
+    # Price axis on the right, ticks drawn inside the panel -- the right
+    # gutter then belongs to the last-price pill alone, like the
+    # terminals the palette imitates.
+    ax.yaxis.tick_right()
+    ax.tick_params(axis="y", pad=-42)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.xaxis.set_major_formatter(
+        FuncFormatter(_axis_formatter(times, ticks, axis))
+    )
 
     # Ticker watermark behind everything -- cheap terminal flavor.
     ax.text(
@@ -447,7 +479,7 @@ def _render_png(
         0.45,
         ticker,
         transform=ax.transAxes,
-        fontsize=64,
+        fontsize=52,
         color=p["text"],
         alpha=0.035,
         ha="center",
@@ -466,7 +498,7 @@ def _render_png(
             spans.append((run_start, i - 1))
             run_start = None
     for lo_i, hi_i in spans:
-        ax.axvspan(lo_i - 0.5, hi_i + 0.5, color=p["grid"], alpha=0.03, lw=0)
+        ax.axvspan(lo_i - 0.5, hi_i + 0.5, color=p["grid"], alpha=0.08, lw=0)
 
     # X positions are ordinal (0..N-1): the window holds OPEN candles only
     # (plus a short CLOSED tail), so a skipped closed run shows as a price
@@ -489,18 +521,36 @@ def _render_png(
             price_hi + ypad,
             _gap_tag(times[i - 1], times[i], ticks[i - 1], ticks[i]),
             color=p["text"],
-            fontsize=6,
+            fontsize=8,
             ha="center",
             va="top",
             alpha=0.85,
             bbox=dict(facecolor=p["bg"], edgecolor="none", alpha=0.8, pad=0.4),
         )
 
+    # Volume underlay: bars normalized into the bottom ~15% of the price
+    # panel (what compact terminal charts do) -- a dedicated volume pane
+    # would permanently reserve a quarter of the canvas, and sit empty
+    # on the zero-volume windows this market is mostly made of.
+    vol_colors = [
+        p["muted"] if s == "CLOSED" else (p["up"] if u else p["down"])
+        for s, u in zip(sessions, up, strict=True)
+    ]
+    vmax = max(volumes) if volumes else 0
+    if vmax > 0:
+        ax.bar(
+            pos,
+            [v / vmax * view * 0.15 for v in volumes],
+            bottom=price_lo - ypad,
+            width=bar_w,
+            color=vol_colors,
+            alpha=0.25,
+            zorder=0.5,
+        )
+
     # Candlesticks: wick low->high, body over [min(o,c), |o-c|].
-    vol_colors = []
     for i, x in enumerate(pos):
-        closed = sessions[i] == "CLOSED"
-        color = p["muted"] if closed else (p["up"] if up[i] else p["down"])
+        color = vol_colors[i]
         ax.vlines(x, lows[i], highs[i], color=color, linewidth=wick_lw)
         body_lo = min(opens[i], closes[i])
         body_h = max(abs(closes[i] - opens[i]), doji_eps)
@@ -510,7 +560,6 @@ def _render_png(
                 facecolor=color, edgecolor=color, linewidth=0.5,
             )
         )
-        vol_colors.append(color)
 
         if halts[i] is not None:
             ax.scatter(
@@ -534,7 +583,8 @@ def _render_png(
         f"C {closes[-1]:,.2f}   Δ {window_delta:+.2%}",
         transform=ax.transAxes,
         color=window_color,
-        fontsize=9,
+        fontsize=11,
+        fontfamily="monospace",
         va="top",
         ha="left",
     )
@@ -549,7 +599,8 @@ def _render_png(
         xycoords=("axes fraction", "data"),
         color=p["pill_text"],
         fontweight="bold",
-        fontsize=8,
+        fontsize=9,
+        fontfamily="monospace",
         va="center",
         annotation_clip=False,
         bbox=dict(
@@ -584,7 +635,8 @@ def _render_png(
                 xycoords=("axes fraction", "data"),
                 color=p["pill_text"],
                 fontweight="bold",
-                fontsize=7,
+                fontsize=8,
+                fontfamily="monospace",
                 va="center",
                 annotation_clip=False,
                 bbox=dict(
@@ -600,7 +652,8 @@ def _render_png(
             f"@ {avg_cost:,.2f}   {pnl:+.1%}",
             transform=ax.transAxes,
             color=pos_color,
-            fontsize=8,
+            fontsize=9,
+            fontfamily="monospace",
             va="top",
             ha="left",
         )
@@ -616,7 +669,8 @@ def _render_png(
                 xycoords=("axes fraction", "data"),
                 color=p["pill_text"],
                 fontweight="bold",
-                fontsize=7,
+                fontsize=8,
+                fontfamily="monospace",
                 va="center",
                 annotation_clip=False,
                 bbox=dict(
@@ -631,7 +685,8 @@ def _render_png(
             f"B.SHORT @ {bs_entry:,.2f} · KO {ko:,.2f}",
             transform=ax.transAxes,
             color=p["down"],
-            fontsize=8,
+            fontsize=9,
+            fontfamily="monospace",
             va="top",
             ha="left",
         )
@@ -643,7 +698,7 @@ def _render_png(
             price_hi + ypad,
             "CLOSED",
             color=p["text"],
-            fontsize=6,
+            fontsize=8,
             ha="center",
             va="top",
             alpha=0.7,
@@ -651,38 +706,36 @@ def _render_png(
 
     closed_now = sessions[-1] == "CLOSED"
     bucket_note = f" · {bucket}t/candle" if bucket > 1 else ""
+    # Terminal header: the last price is the information; span/session
+    # state is the small muted detail. The ticker moved to the right --
+    # the embed and watermark already carry it.
     ax.set_title(
+        f"{closes[-1]:,.2f}   {window_delta:+.2%}",
+        loc="left",
+        fontsize=14,
+        color=window_color,
+        fontweight="bold",
+        fontfamily="monospace",
+        pad=8,
+    )
+    ax.text(
+        1.0,
+        1.015,
         f"{ticker} · {_span_label(span)}{bucket_note}"
         + (" · MARKET CLOSED" if closed_now else ""),
-        color=p["text"],
-        fontsize=11,
+        transform=ax.transAxes,
+        color=p["muted"],
+        fontsize=9,
+        ha="right",
+        va="bottom",
     )
     ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.2f}"))
-    ax.set_ylabel("price", color=p["text"], fontsize=8)
     ax.margins(x=0.02)
-
-    axv.bar(pos, volumes, width=bar_w, color=vol_colors, alpha=0.6)
-    axv.set_ylim(bottom=0)
-    # Ordinal positions hold OPEN candles only (+ a closed tail): a skipped
-    # closed run reads as a jump in the axis labels, not a hole in the plot.
-    axv.xaxis.set_major_locator(MaxNLocator(integer=True))
-    axv.xaxis.set_major_formatter(
-        FuncFormatter(_axis_formatter(times, ticks, axis))
-    )
-    axv.set_xlabel(
-        "tick" if axis == "ticks" else "time (UTC)", color=p["text"], fontsize=8
-    )
-    axv.set_ylabel("volume", color=p["text"], fontsize=8)
-    axv.yaxis.set_major_formatter(
-        FuncFormatter(
-            lambda v, _: f"{v / 1e3:,.0f}k" if v >= 1000 else f"{max(v, 0):,.0f}"
-        )
-    )
 
     # Right gutter reserved for the price pill's annotate (x=1.005 lands
     # inside the rect boundary instead of clipping at the figure edge).
-    gs.tight_layout(fig, rect=(0, 0, 0.94, 1))
+    fig.tight_layout(rect=(0, 0, 0.95, 1), pad=0.5)
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120, facecolor=fig.get_facecolor())
+    fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
     buf.seek(0)
     return buf

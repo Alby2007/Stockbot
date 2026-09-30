@@ -222,7 +222,12 @@ appends only when `end == last_open`. `next_window` resolves
 panl/panr (half-span shifts in open candles, clamped to history
 bounds), zin/zout (span/2, span*2 clamped to [30, 6720]), home and
 s<span> presets (re-anchor to last open). Action names starting `s`
-carry the target span (`s960` = 1D at 960-tick sessions).
+carry the target span (`s960` = 1D at 960-tick sessions). Chrome is
+two rows: five nav buttons (row 0) plus one Select (row 1) whose
+options ARE the actions — `s<span>` values for the six presets and
+`ax` for the axis toggle — under the `sel` cid; `_handle` resolves
+`sel` by substituting `data["values"][0]` for the action, so legacy
+`s<span>`/`ax` buttons on old messages share one path.
 Render aesthetics live in `_render_png` helpers, all pure:
 `_span_label(span)` maps spans to `1h`/`4h`/`1d`/`1w` (`~Nd`/`Nt`
 fallbacks) for the title, and `_session_boundaries(ticks, times, bucket)`
@@ -237,15 +242,29 @@ the axis (07:17 → 15:44) and the `Mon DD` day labels only fire across
 UTC dates, so without a visible boundary + duration the compressed gap
 reads as a bad tick. The open→closed-tail transition is tick-adjacent
 so the shading marks it, not a separator. The legend (`O/H/L/C Δ%` in the window's direction
-color), right-edge last-price pill (`rect=(0,0,0.94,1)` reserves its
+color), right-edge last-price pill (`rect=(0,0,0.95,1)` reserves its
 gutter), and faint ticker watermark are all derived from `rows` — no
 protocol/signature change. Renders are cached in-process
-(`_RENDER_CACHE`, LRU 64) keyed by a fingerprint of every row's
-tick_index+close+volume — a repeat request (button spam, second user on
-the same ticker) reuses the PNG bytes; the fingerprint busts on any
-intra-tick fill amendment so a mid-tick trade still re-renders. PNGs
-save at dpi=120 (1200px wide): upload size is the dominant
-/chart latency on slow links. `/chart mine:True` renders a PRIVATE
+(`_RENDER_CACHE`, LRU 64) keyed by `_RENDER_VERSION` plus a fingerprint
+of every row's tick_index+close+volume — a repeat request (button spam,
+second user on the same ticker) reuses the PNG bytes; the fingerprint
+busts on any intra-tick fill amendment so a mid-tick trade still
+re-renders, and `_RENDER_VERSION` busts it on any _render_png change so
+a long-lived process can't serve pre-change layouts. PNGs
+save at figsize (8,4.5) dpi=150 (1200×675): same pixels as the old
+10×6@120, so point-sized elements render ~25% bigger at Discord's
+~550px inline width — upload size is the dominant /chart latency on
+slow links. Layout notes: `ypad` is `_y_pad(span, lo)` = 8% of span
+(~86% of the panel is data; the old 0.2%-of-price floor halved it on
+quiet windows — it only rescues all-flat data now); volume draws as a
+translucent underlay in the bottom ~15% of the single price axes (a
+dedicated pane reserved a quarter of the canvas and sat empty on
+zero-volume windows); price ticks live inside the right edge
+(`tick_right` + `pad=-42`); numerics are monospace; the title is
+`{last} {Δ%}` in direction color with muted `ticker · span · session`
+on the right; the embed title carries `· {last} {Δ%}` and the stripe
+is `stripe_for_change(window_delta)` — `render_candle_chart` returns
+`(buf, end, end_ts, last_close, window_delta)` for it. `/chart mine:True` renders a PRIVATE
 chart (ephemeral defer) with the caller's marks drawn by `_render_png`:
 position entry line + P&L band (`viewer_id` → `positions` avg_cost/qty,
 signed for margin shorts) and the newest OPEN bounded short's dashed
@@ -261,8 +280,8 @@ working, they just scroll up. In Docker, `MPLCONFIGDIR=/app/.mplconfig`
 is baked with the font cache at image build — `stockbot` has no home
 dir, so without it every container restart rebuilds the fontlist and
 the first render takes seconds. Candle/wick/volume widths drop to 0.6 above
-120 bars, else 0.8. `MARKET CLOSED` only suffixes the title when the
-tail is closed candles.
+120 bars, else 0.8. `MARKET CLOSED` only suffixes the muted header
+when the tail is closed candles.
 Shop UI: `/shop` (replaces `/shop list|buy`) is a stateless browser in
 `bot/shop_view.py` mirroring the chart component pattern —
 `shop:{action}:{arg}` cids (`home`, `cat`, `pick`, `buy`, `equip`,
