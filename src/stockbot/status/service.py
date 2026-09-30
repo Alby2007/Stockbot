@@ -207,6 +207,84 @@ async def evaluate_badges(
             """
         )
         granted += [(int(r[0]), str(r[1])) for r in await cur.fetchall()]
+        # Duel wins: settled duels where the row names you winner.
+        await cur.execute(
+            """
+            INSERT INTO entitlements (user_id, item_key)
+            SELECT x.user_id, x.key FROM (
+                SELECT d.winner_id AS user_id, s.key, COUNT(*) AS metric_value,
+                       (s.metadata->>'threshold')::int AS threshold
+                FROM duels d
+                JOIN users u ON u.id = d.winner_id AND NOT u.is_bot
+                JOIN shop_items s
+                  ON s.kind = 'BADGE' AND s.metadata->>'metric' = 'duel_wins'
+                WHERE d.status = 'SETTLED'
+                GROUP BY d.winner_id, s.key
+            ) x WHERE x.metric_value >= x.threshold
+            ON CONFLICT DO NOTHING
+            RETURNING user_id, item_key
+            """
+        )
+        granted += [(int(r[0]), str(r[1])) for r in await cur.fetchall()]
+        # Bounty claims: heads actually collected.
+        await cur.execute(
+            """
+            INSERT INTO entitlements (user_id, item_key)
+            SELECT x.user_id, x.key FROM (
+                SELECT b.claimed_by AS user_id, s.key, COUNT(*) AS metric_value,
+                       (s.metadata->>'threshold')::int AS threshold
+                FROM bounties b
+                JOIN users u ON u.id = b.claimed_by AND NOT u.is_bot
+                JOIN shop_items s
+                  ON s.kind = 'BADGE' AND s.metadata->>'metric' = 'bounty_claims'
+                WHERE b.status = 'CLAIMED' AND b.claimed_by IS NOT NULL
+                GROUP BY b.claimed_by, s.key
+            ) x WHERE x.metric_value >= x.threshold
+            ON CONFLICT DO NOTHING
+            RETURNING user_id, item_key
+            """
+        )
+        granted += [(int(r[0]), str(r[1])) for r in await cur.fetchall()]
+        # Liquidations survived: distinct liquidation days on the main
+        # book. The badge of shame you can only earn by living through it.
+        await cur.execute(
+            """
+            INSERT INTO entitlements (user_id, item_key)
+            SELECT x.user_id, x.key FROM (
+                SELECT l.user_id, s.key,
+                       COUNT(DISTINCT l.tick_index) AS metric_value,
+                       (s.metadata->>'threshold')::int AS threshold
+                FROM liquidations l
+                JOIN users u ON u.id = l.user_id AND NOT u.is_bot
+                JOIN shop_items s
+                  ON s.kind = 'BADGE' AND s.metadata->>'metric' = 'liquidations'
+                WHERE l.season_id IS NULL
+                GROUP BY l.user_id, s.key
+            ) x WHERE x.metric_value >= x.threshold
+            ON CONFLICT DO NOTHING
+            RETURNING user_id, item_key
+            """
+        )
+        granted += [(int(r[0]), str(r[1])) for r in await cur.fetchall()]
+        # Prop wins: settled bets that actually paid out.
+        await cur.execute(
+            """
+            INSERT INTO entitlements (user_id, item_key)
+            SELECT x.user_id, x.key FROM (
+                SELECT b.user_id, s.key, COUNT(*) AS metric_value,
+                       (s.metadata->>'threshold')::int AS threshold
+                FROM prop_bets b
+                JOIN users u ON u.id = b.user_id AND NOT u.is_bot
+                JOIN shop_items s
+                  ON s.kind = 'BADGE' AND s.metadata->>'metric' = 'prop_wins'
+                WHERE b.paid_minor IS NOT NULL AND b.paid_minor > 0
+                GROUP BY b.user_id, s.key
+            ) x WHERE x.metric_value >= x.threshold
+            ON CONFLICT DO NOTHING
+            RETURNING user_id, item_key
+            """
+        )
+        granted += [(int(r[0]), str(r[1])) for r in await cur.fetchall()]
         # Collectible completion (0060): held-card counts against frozen
         # set denominators, filtered by the badge row's card_set /
         # card_kind / min_frame metadata so tiers need no code changes.

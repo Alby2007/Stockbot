@@ -72,6 +72,8 @@ class Season:
     stake_minor: int
     prize_pool_minor: int
     sandbox_user_id: int | None = None
+    duel_id: int | None = None
+    division_tier: int | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,10 @@ def _season_from_row(row: dict[str, Any]) -> Season:
         prize_pool_minor=int(row["prize_pool_minor"]),
         sandbox_user_id=(
             int(row["sandbox_user_id"]) if row["sandbox_user_id"] is not None else None
+        ),
+        duel_id=int(row["duel_id"]) if row.get("duel_id") is not None else None,
+        division_tier=(
+            int(row["division_tier"]) if row.get("division_tier") is not None else None
         ),
     )
 
@@ -148,6 +154,7 @@ async def get_open_season(conn: AsyncConnection) -> Season | None:
             SELECT * FROM seasons
             WHERE status IN ('ACTIVE', 'SCHEDULED')
               AND sandbox_user_id IS NULL
+              AND duel_id IS NULL AND division_tier IS NULL
             ORDER BY CASE status WHEN 'ACTIVE' THEN 0 ELSE 1 END, start_tick
             LIMIT 1
             """
@@ -163,6 +170,7 @@ async def get_latest_season(conn: AsyncConnection) -> Season | None:
             """
             SELECT * FROM seasons
             WHERE sandbox_user_id IS NULL
+              AND duel_id IS NULL AND division_tier IS NULL
             ORDER BY CASE status WHEN 'ACTIVE' THEN 0 WHEN 'SCHEDULED' THEN 1 ELSE 2 END,
                      start_tick DESC
             LIMIT 1
@@ -318,6 +326,71 @@ async def get_active_entry(
             )
         row = await cur.fetchone()
     return (int(row[0]), int(row[1])) if row else None
+
+
+# Trade scope: `league:`-flag commands resolve through here. A pinned
+# season wins while it's an ACTIVE entry of the user's; a dead/absent pin
+# falls back to get_active_entry's most-recent rule. Duel accepts auto-pin
+# both players (a division week respawning mid-duel would otherwise steal
+# the routing); pin rows are deleted when their season closes and lazily
+# ignored whenever they're stale, so a missed delete can't strand a user.
+async def resolve_trade_entry(
+    conn: AsyncConnection, user_id: int
+) -> tuple[int, int] | None:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT season_id FROM trade_scope WHERE user_id = %s", (user_id,)
+        )
+        row = await cur.fetchone()
+    if row is not None:
+        entry = await get_active_entry(conn, user_id, int(row[0]))
+        if entry is not None:
+            return entry
+    return await get_active_entry(conn, user_id)
+
+
+async def list_active_entries(conn: AsyncConnection, user_id: int) -> list[Season]:
+    """Every ACTIVE competitive season the user is entered in (public,
+    duel, division -- sandbox stays excluded), most recent first."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT s.*
+            FROM season_entries e
+            JOIN seasons s ON s.id = e.season_id
+            WHERE e.user_id = %s AND s.status = 'ACTIVE'
+              AND s.sandbox_user_id IS NULL
+            ORDER BY s.start_tick DESC
+            """,
+            (user_id,),
+        )
+        return [_season_from_row(r) for r in await cur.fetchall()]
+
+
+async def pinned_scope(conn: AsyncConnection, user_id: int) -> int | None:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT season_id FROM trade_scope WHERE user_id = %s", (user_id,)
+        )
+        row = await cur.fetchone()
+    return int(row[0]) if row else None
+
+
+async def pin_scope(conn: AsyncConnection, user_id: int, season_id: int) -> None:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            INSERT INTO trade_scope (user_id, season_id) VALUES (%s, %s)
+            ON CONFLICT (user_id) DO UPDATE
+                SET season_id = EXCLUDED.season_id, updated_at = now()
+            """,
+            (user_id, season_id),
+        )
+
+
+async def clear_scope(conn: AsyncConnection, user_id: int) -> None:
+    async with conn.cursor() as cur:
+        await cur.execute("DELETE FROM trade_scope WHERE user_id = %s", (user_id,))
 
 
 # Sandbox: a personal, resettable practice season. sandbox_user_id marks the
@@ -614,6 +687,42 @@ async def close_season(conn: AsyncConnection, season_id: int) -> None:
         await _close_season_claimed(conn, season_id)
 
 
+async def _teardown_league(
+    conn: AsyncConnection,
+    season_id: int,
+    entries: list[dict[str, Any]],
+    tick: int,
+    memo: str,
+) -> None:
+    """Shared close tail: intrinsic-settle season options, sweep the league
+    balances left in each entry to SINK, cancel resting league orders.
+    Equity/prize decisions belong to the caller BEFORE this runs: the
+    options settlement must land in league accounts ahead of the sweep,
+    not post-close into accounts it already emptied."""
+    from stockbot.options.service import settle_season_options
+
+    await settle_season_options(conn, season_id, max(tick, 0))
+    sink_id = await get_system_account_id(conn, "SINK")
+    for entry in entries:
+        league_account = int(entry["account_id"])
+        balance = await get_balance(conn, league_account)
+        if balance > 0:
+            await post_transfer(
+                conn,
+                from_account_id=league_account,
+                to_account_id=sink_id,
+                amount=balance,
+                reason="LEAGUE_RETURN",
+                memo=memo,
+            )
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "UPDATE orders SET status = 'CANCELLED' "
+            "WHERE season_id = %s AND status = 'OPEN'",
+            (season_id,),
+        )
+
+
 async def _close_season_claimed(conn: AsyncConnection, season_id: int) -> None:
     """The scoring/payout/sweep work of close_season. Runs inside the
     caller's transaction with the seasons row already flipped to CLOSED."""
@@ -630,34 +739,34 @@ async def _close_season_claimed(conn: AsyncConnection, season_id: int) -> None:
         )
         entries = await dcur.fetchall()
 
+    async with conn.cursor() as cur:
+        # Scope pins die with their season -- the row is already CLOSED, so
+        # resolve_trade_entry would fall back anyway; deleting here keeps
+        # the table small and covers every branch below.
+        await cur.execute(
+            "DELETE FROM trade_scope WHERE season_id = %s", (season_id,)
+        )
+
+    # Duel/division seasons close through their own scoring and payout
+    # paths (equal-stake equity compare / tier movement), then share the
+    # league teardown. seasons_one_context makes the markers exclusive.
+    if season.duel_id is not None:
+        from stockbot.duels import service as duels_svc
+
+        await duels_svc.close_duel_season(conn, season, entries, tick)
+        await _teardown_league(conn, season_id, entries, tick, season.name)
+        return
+    if season.division_tier is not None:
+        from stockbot.divisions import service as div_svc
+
+        await div_svc.close_division_season(conn, season, entries, tick)
+        await _teardown_league(conn, season_id, entries, tick, season.name)
+        return
+
     if season.sandbox_user_id is not None:
         # Sandbox reset: no scoring, trophies, standings, or result DMs --
-        # just sweep the stake back to SINK and cancel resting orders.
-        # Settle season options FIRST: their intrinsic payout must land in
-        # the league account before the sweep, not post-close into a dead
-        # account (the entry row persists, so a later expiry settle would
-        # still resolve -- and strand the cash there forever).
-        from stockbot.options.service import settle_season_options
-
-        await settle_season_options(conn, season_id, max(tick, 0))
-        sink_id = await get_system_account_id(conn, "SINK")
-        for entry in entries:
-            balance = await get_balance(conn, int(entry["account_id"]))
-            if balance > 0:
-                await post_transfer(
-                    conn,
-                    from_account_id=int(entry["account_id"]),
-                    to_account_id=sink_id,
-                    amount=balance,
-                    reason="LEAGUE_RETURN",
-                    memo=season.name,
-                )
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "UPDATE orders SET status = 'CANCELLED' "
-                "WHERE season_id = %s AND status = 'OPEN'",
-                (season_id,),
-            )
+        # just the teardown sweep back to SINK.
+        await _teardown_league(conn, season_id, entries, tick, season.name)
         return
 
     # Final equity snapshot at close so the last partial day counts.
@@ -708,7 +817,6 @@ async def _close_season_claimed(conn: AsyncConnection, season_id: int) -> None:
     prize_pool = season.entry_fee_minor * len(entries)
 
     faucet_id = await get_system_account_id(conn, "FAUCET")
-    sink_id = await get_system_account_id(conn, "SINK")
 
     for uid, rank in rank_by_user.items():
         prize = (
@@ -829,33 +937,12 @@ async def _close_season_claimed(conn: AsyncConnection, season_id: int) -> None:
     # already counted their model marks (which include residual time value),
     # and the intrinsic payout joins the league cash for the sweep. Waiting
     # for expiry would pay into an account the sweep already emptied.
-    from stockbot.options.service import settle_season_options
-
-    await settle_season_options(conn, season_id, max(tick, 0))
-
-    # League wealth never leaves the league: sweep whatever is left to SINK.
-    for entry in entries:
-        league_account = int(entry["account_id"])
-        balance = await get_balance(conn, league_account)
-        if balance > 0:
-            await post_transfer(
-                conn,
-                from_account_id=league_account,
-                to_account_id=sink_id,
-                amount=balance,
-                reason="LEAGUE_RETURN",
-                memo=season.name,
-            )
+    # League wealth never leaves the league: teardown sweeps it all to SINK.
+    await _teardown_league(conn, season_id, entries, tick, season.name)
 
     async with conn.cursor() as cur:
         # status was already flipped by the atomic claim in close_season.
         await cur.execute(
             "UPDATE seasons SET prize_pool_minor = %s WHERE id = %s",
             (prize_pool, season_id),
-        )
-        # League orders reference a dead season now -- cancel them.
-        await cur.execute(
-            "UPDATE orders SET status = 'CANCELLED' "
-            "WHERE season_id = %s AND status = 'OPEN'",
-            (season_id,),
         )

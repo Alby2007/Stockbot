@@ -12,12 +12,17 @@ from psycopg import AsyncConnection, sql
 from psycopg.rows import dict_row
 
 from stockbot.alerts import service as alerts
+from stockbot.bounties import service as bounties
+from stockbot.chaos import service as chaos
 from stockbot.collectibles import moments
 from stockbot.collectibles import service as collect_svc
+from stockbot.divisions import service as divisions
+from stockbot.duels import service as duels
 from stockbot.ipo import service as ipo
 from stockbot.maintenance import run_maintenance_if_due
 from stockbot.margin import service as margin
 from stockbot.market import data, engine, events
+from stockbot.npc import service as npc_svc
 from stockbot.observability import (
     audit_every_n_ticks,
     run_periodic_audit,
@@ -25,6 +30,7 @@ from stockbot.observability import (
 )
 from stockbot.options import service as options
 from stockbot.orders import service as orders
+from stockbot.props import service as props
 from stockbot.quests import service as quests
 from stockbot.seasons import service as seasons
 from stockbot.shop import service as shop_svc
@@ -216,6 +222,19 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             # depends on prices moving does.
             await margin.accrue_borrow_fees(conn)
             await seasons.on_tick(conn, tick_index)
+            # Competition sweeps are calendar-driven, not price-driven:
+            # duel offers and bounties still expire on closed ticks, and
+            # a division week ending on a closed tick still settles.
+            await duels.on_tick(conn, tick_index)
+            await bounties.on_tick(conn, tick_index)
+            await divisions.on_tick(conn, tick_index)
+            # Phase 2 sweeps are calendar-driven too: a scheduled crash
+            # lands even while the venue sleeps (the reopen gap IS the
+            # crash), prop resolutions read the frozen mark, and persona
+            # chatter is day-boundary gossip.
+            await chaos.on_tick(conn, tick_index)
+            await props.on_tick(conn, tick_index)
+            await npc_svc.on_day(conn, tick_index)
             await snapshot_net_worth_if_due(conn, tick_index)
             await evaluate_badges(
                 conn, tick_index, interval_ticks=await badges_interval_ticks(conn)
@@ -324,6 +343,11 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         vol_cfg = await data.vol_config(conn)
         flow_cfg = await data.flow_config(conn)
         mom_cfg = await data.mom_config(conn)
+        # Scheduled chaos: an ACTIVE VOL_STORM scales every instrument's
+        # effective sigma for its window. Read fresh each tick off the
+        # events table; expiry reverts it automatically since sigma_eff
+        # is recomputed every tick anyway.
+        chaos_vol_mult = await chaos.active_multiplier(conn, "VOL_STORM", tick_index)
 
         # Phase H flow decomposition, computed up front because H2's
         # cross-impact needs every instrument's bounded flow before any
@@ -634,7 +658,7 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
             vol_new[result.id] = v_i
             sigma_eff_new[result.id] = sigma_i * engine.vol_multiplier(
                 v_mkt, v_i, mkt_w, clip_lo, clip_hi
-            )
+            ) * chaos_vol_mult
             flow_ret[result.id] = bounded_flow
             # Plan A: decaying EWMA of bounded OWN flow -- the adverse-
             # selection signal fill paths use to skew the half-spread.
@@ -880,6 +904,15 @@ async def apply_tick(conn: AsyncConnection, master_seed: str) -> int:
         # Season lifecycle: activate due seasons, write day-boundary equity
         # snapshots, close finished seasons (all inside this tick's tx).
         await seasons.on_tick(conn, tick_index)
+        await duels.on_tick(conn, tick_index)
+        await bounties.on_tick(conn, tick_index)
+        await divisions.on_tick(conn, tick_index)
+        # Chaos activation/expiry and prop settlement are part of the
+        # same lifecycle block (the VOL_STORM multiplier itself is read
+        # per-tick at sigma_eff above, not here).
+        await chaos.on_tick(conn, tick_index)
+        await props.on_tick(conn, tick_index)
+        await npc_svc.on_day(conn, tick_index)
         # N2: same day-boundary cadence, but for every main-portfolio USER
         # account -- feeds /compare and /profile's 24h change.
         await snapshot_net_worth_if_due(conn, tick_index)

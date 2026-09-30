@@ -231,6 +231,115 @@ def _fmt_gift_received(items: list[dict[str, Any]]) -> str:
     return "🎁 " + "; ".join(parts) + " — `/equip` it from the shop."
 
 
+def _fmt_duel_offer(items: list[dict[str, Any]]) -> str:
+    parts = [
+        f"<@{p['from']}> challenged you — **{format_money(p['stake'])}** each, "
+        f"answer in the channel (`/duels list` if you lost the message)"
+        for p in items
+    ]
+    noun = "challenge" if len(items) == 1 else "challenges"
+    return f"⚔️ Duel {noun}: " + "; ".join(parts)
+
+
+def _fmt_duel_result(items: list[dict[str, Any]]) -> str:
+    parts = []
+    for p in items:
+        result = p.get("result")
+        other = p.get("opponent")
+        if result == "won":
+            parts.append(
+                f"you beat <@{other}> — **{format_money(p['payout'])}** paid out"
+            )
+        elif result == "lost":
+            parts.append(
+                f"<@{other}> took the pot — your equity "
+                f"{format_money(p['my_equity'])} vs their "
+                f"{format_money(p['their_equity'])}"
+            )
+        elif result == "forfeited":
+            parts.append(f"you forfeited to <@{other}> — they take the pot")
+        elif result == "tied":
+            parts.append(
+                f"dead heat with <@{other}> — stakes refunded minus rake"
+            )
+        elif result == "declined":
+            parts.append(f"<@{other}> declined — stake refunded")
+        elif result == "expired":
+            parts.append(f"your offer to <@{other}> expired — stake refunded")
+    noun = "Duel" if len(items) == 1 else "Duels"
+    return f"⚔️ {noun}: " + "; ".join(parts)
+
+
+def _fmt_bounty_placed(items: list[dict[str, Any]]) -> str:
+    total = sum(int(p["amount"]) for p in items)
+    posters = ", ".join(f"<@{p['poster']}>" for p in items)
+    noun = "bounty" if len(items) == 1 else "bounties"
+    return (
+        f"🎯 {len(items)} open {noun} on your head — **{format_money(total)}** "
+        f"total, posted by {posters}. Stay above maintenance."
+    )
+
+
+def _fmt_bounty_paid(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    if p.get("role") == "claimant":
+        return (
+            f"🎯 Collected: **{format_money(p['paid'])}** paid — you held the "
+            f"largest position against <@{p['target']}>'s liquidation."
+        )
+    if p.get("claimant"):
+        return (
+            f"🎯 <@{p['claimant']}> collected the "
+            f"{'bounty' if p['count'] == 1 else 'bounties'} on your head — "
+            "biggest opposing exposure in your liquidated tickers."
+        )
+    return (
+        "🎯 The bounties on your head went unclaimed — nobody was positioned "
+        "against your liquidated tickers, so the pot burned to the sink."
+    )
+
+
+def _fmt_bounty_expired(items: list[dict[str, Any]]) -> str:
+    parts = [
+        f"`#{p['bounty_id']}` on <@{p['target']}> "
+        f"({format_money(p['amount'])} refunded)"
+        for p in items
+    ]
+    noun = "Bounty" if len(items) == 1 else "Bounties"
+    return f"{noun} expired: " + "; ".join(parts) + "."
+
+
+def _fmt_division_result(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    moved = str(p.get("moved") or "")
+    tail = {
+        "promoted": f"promoted to **{p['new_tier_name']}**",
+        "relegated": f"relegated to **{p['new_tier_name']}**",
+    }.get(moved, f"holding in **{p['new_tier_name']}**")
+    return (
+        f"🏆 **{p['tier_name']} Division** week settled — rank #{p['rank']}/"
+        f"{p['entrants']}, equity {format_money(p['equity'])}: {tail}. "
+        "Next week's season is live."
+    )
+
+
+def _fmt_prop_resolved(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    return (
+        f"🎲 Prop `#{p['prop_id']}` resolved **{p['outcome']}** — "
+        f"\"{p['title']}\". Your cut: **{format_money(p['paid'])}**."
+    )
+
+
+def _fmt_boss_beaten(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    return (
+        f"🗡️ **Giant Slayer.** You beat {p['boss']}'s week "
+        f"({p['your_ret']:+.1%} vs {p['boss_ret']:+.1%}) — "
+        "hidden badge earned."
+    )
+
+
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "LIQUIDATION": _fmt_liquidation,
     "MARGIN_CALL": _fmt_margin_call,
@@ -249,6 +358,14 @@ _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "TRADE_RESULT": _fmt_trade_result,
     "ENTITLEMENT_EXPIRING": _fmt_entitlement_expiring,
     "GIFT_RECEIVED": _fmt_gift_received,
+    "DUEL_OFFER": _fmt_duel_offer,
+    "DUEL_RESULT": _fmt_duel_result,
+    "BOUNTY_PLACED": _fmt_bounty_placed,
+    "BOUNTY_PAID": _fmt_bounty_paid,
+    "BOUNTY_EXPIRED": _fmt_bounty_expired,
+    "DIVISION_RESULT": _fmt_division_result,
+    "PROP_RESOLVED": _fmt_prop_resolved,
+    "BOSS_BEATEN": _fmt_boss_beaten,
 }
 
 

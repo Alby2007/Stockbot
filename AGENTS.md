@@ -1596,3 +1596,36 @@ rate limits -- the `plan-1ccd460d1232ae3e.md` hardening pass):
   `tick or 0` — never NULL on a pre-first-tick buy. Idempotent:
   settlement is a
   status flip on locked rows, buys key on `interaction_id`.
+
+## Game layer (competition + drama)
+
+Phase 1 competition (0068): duels (escrowed stakes in GAME_ESCROW, equal
+FAUCET league stakes in a private `seasons.duel_id` season, higher equity
+wins pot minus rake), liquidation bounties (main-book only; claimant =
+largest aggregate opposing exposure in the liquidated tickers, else SINK),
+weekly divisions (`division_memberships` -> per-tier private seasons,
+top-K promote/bottom-K relegate, `division.min_trades` gates the table),
+and `trade_scope` pins (`resolve_trade_entry` consults the pin before
+recency; duel accept auto-pins; pins die at season close). Gold caps:
+top-of-table Gold holds, bottom-K still relegates.
+
+Phase 2 drama (0069): parimutuel props (`props` + `prop_bets`; bets
+escrow to GAME_ESCROW, winners split the whole pool pro-rata minus rake;
+ties/empty winning side refund all; `settle_due` runs both tick phases
+like options; `autogen` stamps the weekly SBX40-vs-ASX40 prop at the
+7-day boundary). Chaos events (`chaos_events`; FLASH_CRASH applies one
+impact shift at activation, VOL_STORM multiplies sigma_eff via
+`chaos.active_multiplier` read each tick in apply_tick, FEE_SURGE folds
+into `margin.borrow_fee_bps_per_tick` inside `margin_config` -- both
+consume the events table at read time so expiry reverts automatically;
+Margin Call Monday = weekly auto FEE_SURGE on `chaos.mcm_day_mod`).
+NPC personas (`npc_agents.is_persona`/`display_name`): openly-named
+bosses that skip permadeath, are the ONLY bot bounty targets, taunt on
+the feed at day boundaries, and feed the weekly beat-the-boss sweep
+(grants `badge_boss_slayer` directly -- it bypasses evaluate_badges).
+Hidden badges are grant-only catalog rows with `metadata.hidden`; new
+evaluate_badges metric blocks cover duel_wins, bounty_claims,
+liquidations (distinct main-book liquidation days), and prop_wins.
+Gotcha preserved: `settle_due`'s flip UPDATE needs its own
+conn.transaction() -- a bare cursor leaves an ambient tx that silently
+demotes the per-prop payout transactions to never-committed savepoints.

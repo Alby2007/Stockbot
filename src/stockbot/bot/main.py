@@ -20,10 +20,14 @@ from stockbot.bot.collection_view import (
     handle_collection_component,
 )
 from stockbot.bot.commands import guild_welcome_message, register_commands
+from stockbot.bot.duel_view import CID_PREFIX as DUEL_CID_PREFIX
+from stockbot.bot.duel_view import handle_duel_component
 from stockbot.bot.feed import ChannelGone
 from stockbot.bot.feed import poll_once as feed_poll_once
 from stockbot.bot.leaderboard import sync_leaderboard_boards
 from stockbot.bot.notify import DeliveryForbidden, poll_once
+from stockbot.bot.scope_view import CID_PREFIX as SCOPE_CID_PREFIX
+from stockbot.bot.scope_view import handle_scope_component
 from stockbot.bot.shop_view import SHOP_CID_PREFIX, handle_shop_component
 from stockbot.bot.trade_view import (
     CID_PREFIX as TRADE_CID_PREFIX,
@@ -286,6 +290,42 @@ class StockBotClient(discord.Client):
                     else:
                         await interaction.response.send_message(
                             "Couldn't answer that trade — run /trade list.",
+                            ephemeral=True,
+                        )
+                except discord.HTTPException:
+                    pass
+        elif str(data.get("custom_id", "")).startswith(DUEL_CID_PREFIX):
+            try:
+                await handle_duel_component(interaction)
+            except Exception:
+                log.exception("duel component interaction failed")
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(
+                            "Couldn't answer that duel — run /duel list.",
+                            ephemeral=True,
+                        )
+                    else:
+                        await interaction.response.send_message(
+                            "Couldn't answer that duel — run /duel list.",
+                            ephemeral=True,
+                        )
+                except discord.HTTPException:
+                    pass
+        elif str(data.get("custom_id", "")).startswith(SCOPE_CID_PREFIX):
+            try:
+                await handle_scope_component(interaction)
+            except Exception:
+                log.exception("scope component interaction failed")
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(
+                            "Couldn't change scope — run /scope again.",
+                            ephemeral=True,
+                        )
+                    else:
+                        await interaction.response.send_message(
+                            "Couldn't change scope — run /scope again.",
                             ephemeral=True,
                         )
                 except discord.HTTPException:

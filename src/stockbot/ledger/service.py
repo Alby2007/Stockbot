@@ -20,7 +20,10 @@ from psycopg import AsyncConnection
 
 from stockbot.ledger.errors import InsufficientFundsError, UnknownAccountError
 
-SYSTEM_ACCOUNTS = ("FAUCET", "SINK", "MARKET_MAKER", "INSURANCE_FUND", "IPO_ESCROW")
+SYSTEM_ACCOUNTS = (
+    "FAUCET", "SINK", "MARKET_MAKER", "INSURANCE_FUND", "IPO_ESCROW",
+    "GAME_ESCROW",
+)
 
 
 async def get_system_account_id(conn: AsyncConnection, name: str) -> int:

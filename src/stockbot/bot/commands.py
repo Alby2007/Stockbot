@@ -83,6 +83,7 @@ from stockbot.bot.collection_view import (
 from stockbot.bot.collection_view import (
     frame_glyph as _frame_glyph,
 )
+from stockbot.bot.duel_view import duel_view, render_duel
 from stockbot.bot.format import (
     EMBED_DOWN,
     EMBED_FLAT,
@@ -105,6 +106,7 @@ from stockbot.bot.leaderboard import (
     leaderboard_embed,
     post_leaderboard_board,
 )
+from stockbot.bot.scope_view import describe_entry, scope_embed, scope_view
 from stockbot.bot.shop_view import (
     build_shop_card,
     build_shop_home,
@@ -113,6 +115,7 @@ from stockbot.bot.shop_view import (
     load_shop_state,
 )
 from stockbot.bot.trade_view import render_trade, trade_view
+from stockbot.bounties import service as bounty_svc
 from stockbot.claims.errors import (
     AccountTooYoungError,
     AlreadyClaimedTodayError,
@@ -147,6 +150,10 @@ from stockbot.collectibles.trades import (
 )
 from stockbot.compliance.wash_trade import scan_for_wash_trades
 from stockbot.config import get_settings
+from stockbot.divisions import service as divisions_svc
+from stockbot.divisions.service import tier_name
+from stockbot.duels import service as duel_svc
+from stockbot.duels.service import WINDOW_CHOICES
 from stockbot.feed import emit_feed
 from stockbot.ipo import service as ipo_svc
 from stockbot.ledger.errors import InsufficientFundsError
@@ -190,6 +197,7 @@ from stockbot.orders.service import (
     place_oco,
     place_order,
 )
+from stockbot.props import service as props_svc
 from stockbot.quests.service import RerollError, list_quests, reroll_quest
 from stockbot.seasons.errors import SandboxAlreadyOpenError, SeasonError
 from stockbot.seasons.service import (
@@ -203,8 +211,11 @@ from stockbot.seasons.service import (
     get_season,
     join_season,
     league_equity_minor,
+    list_active_entries,
     open_sandbox,
+    pinned_scope,
     reset_sandbox,
+    resolve_trade_entry,
     standings,
 )
 from stockbot.shop.errors import NotOwnedError, ShopError
@@ -988,7 +999,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         # Same stripe/title the component-edit embed uses -- price and
         # window delta are useful before the PNG finishes uploading.
         embed = discord.Embed(
-            title=f"{snapshot.ticker} \u2014 {snapshot.name} \u00b7 "
+            title=f"{snapshot.ticker} \u2014 {snapshot.name} · "
                   f"{last_close:,.2f} {window_delta:+.2%}",
             color=stripe_for_change(window_delta),
         )
@@ -998,7 +1009,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         else:
             ending = str(end)
         embed.set_footer(
-            text=f"{span} open ticks ending {ending} \u00b7 "
+            text=f"{span} open ticks ending {ending} · "
                  f"{bucket_for_span(span)}t/candle"
         )
         await interaction.followup.send(
@@ -1186,7 +1197,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 entry = await (
                     get_sandbox_entry(conn, interaction.user.id)
                     if sandbox
-                    else get_active_entry(conn, interaction.user.id)
+                    else resolve_trade_entry(conn, interaction.user.id)
                 )
                 if entry is None:
                     await interaction.response.send_message(
@@ -1703,7 +1714,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 entry = await (
                     get_sandbox_entry(conn, interaction.user.id)
                     if sandbox
-                    else get_active_entry(conn, interaction.user.id)
+                    else resolve_trade_entry(conn, interaction.user.id)
                 )
                 if entry is None:
                     await interaction.response.send_message(
@@ -1831,7 +1842,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             account_id = bootstrap.account_id
             season_id: int | None = None
             if league:
-                entry = await get_active_entry(conn, interaction.user.id)
+                entry = await resolve_trade_entry(conn, interaction.user.id)
                 if entry is None:
                     await interaction.response.send_message(
                         "You're not entered in an active season. `/league join` first.",
@@ -1898,7 +1909,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             season_id: int | None = None
             bootstrap: BootstrapResult | None = None
             if league:
-                entry = await get_active_entry(conn, interaction.user.id)
+                entry = await resolve_trade_entry(conn, interaction.user.id)
                 if entry is None:
                     await interaction.response.send_message(
                         "You're not entered in an active season.", ephemeral=True
@@ -1959,7 +1970,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
             season_id: int | None = None
             if league:
-                entry = await get_active_entry(conn, interaction.user.id)
+                entry = await resolve_trade_entry(conn, interaction.user.id)
                 if entry is None:
                     await interaction.response.send_message(
                         "You're not entered in an active season. `/league join` first.",
@@ -2021,7 +2032,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
             season_id: int | None = None
             if league:
-                entry = await get_active_entry(conn, interaction.user.id)
+                entry = await resolve_trade_entry(conn, interaction.user.id)
                 if entry is None:
                     await interaction.response.send_message(
                         "You're not entered in an active season. `/league join` first.",
@@ -2120,7 +2131,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
             season_id: int | None = None
             if league:
-                entry = await get_active_entry(conn, interaction.user.id)
+                entry = await resolve_trade_entry(conn, interaction.user.id)
                 if entry is None:
                     await interaction.response.send_message(
                         "You're not entered in an active season. `/league join` first.",
@@ -2361,7 +2372,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
             season_id: int | None = None
             if league:
-                entry = await get_active_entry(conn, interaction.user.id)
+                entry = await resolve_trade_entry(conn, interaction.user.id)
                 if entry is None:
                     await interaction.response.send_message(
                         "You're not entered in an active season. `/league join` first.",
@@ -2401,7 +2412,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
             season_id: int | None = None
             if league:
-                entry = await get_active_entry(conn, interaction.user.id)
+                entry = await resolve_trade_entry(conn, interaction.user.id)
                 if entry is None:
                     await interaction.response.send_message(
                         "You're not entered in an active season.", ephemeral=True
@@ -3332,6 +3343,446 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
     tree.add_command(league_group)
 
+    # --- Direct competition: duels, bounties, divisions, scope ---------
+
+    @tree.command(
+        name="duel",
+        description="Challenge someone to an equal-stake trading duel",
+    )
+    @app_commands.describe(
+        opponent="Who you're challenging",
+        stake="Dollars each side escrows — winner takes the pot",
+        window="How long the duel runs",
+    )
+    @app_commands.choices(
+        window=[app_commands.Choice(name=k, value=v) for k, v in WINDOW_CHOICES.items()]
+    )
+    async def duel(
+        interaction: discord.Interaction,
+        opponent: discord.User,
+        stake: float,
+        window: int,
+    ) -> None:
+        stake_minor = int(Decimal(str(stake)) * 100)
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            tick = await current_tick_index(conn) or 0
+            try:
+                duel_id = await duel_svc.create_offer(
+                    conn,
+                    challenger_id=interaction.user.id,
+                    opponent_id=opponent.id,
+                    stake_minor=stake_minor,
+                    window_ticks=window,
+                    tick_index=tick,
+                )
+            except InsufficientFundsError:
+                await interaction.response.send_message(
+                    f"Insufficient funds for the {format_money(stake_minor)} stake.",
+                    ephemeral=True,
+                )
+                return
+            except (TradingError, MarginError) as exc:
+                await _reject(interaction, str(exc))
+                return
+            row = await duel_svc.get_duel(conn, duel_id)
+        assert row is not None
+        await interaction.response.send_message(
+            content=f"<@{opponent.id}> — you have been challenged."
+            + _welcome_suffix(bootstrap),
+            embed=render_duel(row),
+            view=duel_view(duel_id),
+        )
+
+    duels_group = app_commands.Group(
+        name="duels", description="Your duel history and active matches"
+    )
+
+    @duels_group.command(name="list", description="Your recent duels")
+    async def duels_list(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            rows = await duel_svc.list_duels(conn, interaction.user.id)
+        if not rows:
+            await interaction.response.send_message(
+                "No duels yet — `/duel @someone stake:<$>` starts one.",
+                ephemeral=True,
+            )
+            return
+        lines = []
+        for d in rows:
+            other = d.other(interaction.user.id)
+            status = d.status.lower()
+            if d.status == "SETTLED":
+                if d.winner_id is None:
+                    status = "tied"
+                else:
+                    status = "won" if d.winner_id == interaction.user.id else "lost"
+            lines.append(
+                f"#{d.id:<4} vs <@{other}> · {format_money(d.stake_minor)} · {status}"
+            )
+        embed = discord.Embed(title="Your duels", color=EMBED_INFO)
+        embed.description = "\n".join(lines)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @duels_group.command(
+        name="forfeit", description="Concede your active duel — the opponent wins"
+    )
+    async def duels_forfeit(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            tick = await current_tick_index(conn) or 0
+            try:
+                result = await duel_svc.forfeit(conn, interaction.user.id, tick)
+            except TradingError as exc:
+                await _reject(interaction, str(exc))
+                return
+        await interaction.response.send_message(
+            f"Forfeited duel `#{result.id}` — <@{result.other(interaction.user.id)}> "
+            f"takes the pot."
+        )
+
+    tree.add_command(duels_group)
+
+    @tree.command(
+        name="bounty",
+        description="Put an escrowed bounty on someone's head — pays out on their liquidation",
+    )
+    @app_commands.describe(
+        target="Who the hit is on",
+        payout="Dollars escrowed — paid to whoever's positioned against them when they liquidate",
+    )
+    async def bounty(
+        interaction: discord.Interaction, target: discord.User, payout: float
+    ) -> None:
+        amount_minor = int(Decimal(str(payout)) * 100)
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            tick = await current_tick_index(conn) or 0
+            try:
+                bounty_id = await bounty_svc.post(
+                    conn,
+                    poster_id=interaction.user.id,
+                    target_id=target.id,
+                    amount_minor=amount_minor,
+                    tick_index=tick,
+                )
+            except InsufficientFundsError:
+                await interaction.response.send_message(
+                    "Insufficient funds for the bounty + posting fee.",
+                    ephemeral=True,
+                )
+                return
+            except (TradingError, MarginError) as exc:
+                await _reject(interaction, str(exc))
+                return
+        await interaction.response.send_message(
+            f"🎯 Bounty `#{bounty_id}`: **{format_money(amount_minor)}** on "
+            f"<@{target.id}>'s head — pays out on their next liquidation."
+            + _welcome_suffix(bootstrap)
+        )
+
+    bounties_group = app_commands.Group(
+        name="bounties", description="Open bounties on the market"
+    )
+
+    @bounties_group.command(name="list", description="Every open bounty")
+    async def bounties_list(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            tick = await current_tick_index(conn) or 0
+            rows = await bounty_svc.list_open(conn)
+        if not rows:
+            await interaction.response.send_message(
+                "No open bounties.", ephemeral=True
+            )
+            return
+        lines = []
+        for b in rows:
+            mine = " · yours" if b.poster_id == interaction.user.id else ""
+            lines.append(
+                f"`#{b.id}` **{format_money(b.amount_minor)}** on <@{b.target_id}>"
+                f" · by <@{b.poster_id}> · expires in ~{max(b.expires_tick - tick, 0)}t{mine}"
+            )
+        embed = discord.Embed(title="Open bounties", color=EMBED_GOLD)
+        embed.description = "\n".join(lines)
+        embed.set_footer(text="Cancel yours with /bounties cancel <id>")
+        await interaction.response.send_message(embed=embed)
+
+    @bounties_group.command(
+        name="cancel", description="Withdraw an open bounty you posted"
+    )
+    @app_commands.describe(bounty_id="Bounty id from /bounties list")
+    async def bounties_cancel(interaction: discord.Interaction, bounty_id: int) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            try:
+                await bounty_svc.cancel(conn, bounty_id, interaction.user.id)
+            except TradingError as exc:
+                await _reject(interaction, str(exc))
+                return
+        await interaction.response.send_message(
+            f"Bounty `#{bounty_id}` withdrawn — the escrow is back in your balance.",
+            ephemeral=True,
+        )
+
+    tree.add_command(bounties_group)
+
+    division_group = app_commands.Group(
+        name="division",
+        description="The weekly competitive ladder — promote up or get relegated",
+    )
+
+    @division_group.command(
+        name="join", description="Enter the ladder at the bottom tier"
+    )
+    async def division_join(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            tick = await current_tick_index(conn) or 0
+            try:
+                tier = await divisions_svc.join(conn, interaction.user.id, tick)
+            except TradingError as exc:
+                await _reject(interaction, str(exc))
+                return
+        await interaction.response.send_message(
+            f"Welcome to the **{tier_name(tier)} Division** — you're enrolled "
+            "in this week's season. Trade it with `league:True` (check `/scope` "
+            "if you're in other seasons too)." + _welcome_suffix(bootstrap)
+        )
+
+    @division_group.command(
+        name="leave", description="Drop off the ladder after this week settles"
+    )
+    async def division_leave(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            try:
+                await divisions_svc.leave(conn, interaction.user.id)
+            except TradingError as exc:
+                await _reject(interaction, str(exc))
+                return
+        await interaction.response.send_message(
+            "Off the ladder — your current week still settles, then you're done.",
+            ephemeral=True,
+        )
+
+    @division_group.command(
+        name="standings", description="The live ladder by tier"
+    )
+    async def division_standings(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            rows = await divisions_svc.ladder(conn)
+        if not rows:
+            await interaction.response.send_message(
+                "Nobody's on the ladder yet — `/division join` starts it.",
+                ephemeral=True,
+            )
+            return
+        tiers: dict[int, list[dict[str, Any]]] = {}
+        for r in rows:
+            tiers.setdefault(int(r["tier"]), []).append(r)
+        embed = discord.Embed(title="Division ladder", color=EMBED_GOLD)
+        for tier in sorted(tiers):
+            members = tiers[tier]
+            live = [m for m in members if m["equity_minor"] is not None]
+            live.sort(key=lambda m: int(m["equity_minor"]), reverse=True)
+            queued = [m for m in members if m["equity_minor"] is None]
+            lines = []
+            for i, m in enumerate(live, start=1):
+                mark = " ▲" if i <= 2 else " ▼" if i > len(live) - 2 else ""
+                lines.append(
+                    f"{i}. <@{m['user_id']}> — {format_money(int(m['equity_minor']))}{mark}"
+                )
+            lines.extend(f"· <@{m['user_id']}> *(next week)*" for m in queued)
+            embed.add_field(
+                name=f"{tier_name(tier)} Division",
+                value="\n".join(lines) or "—",
+                inline=False,
+            )
+        embed.set_footer(text="▲ promotion zone · ▼ relegation zone")
+        await interaction.response.send_message(embed=embed)
+
+    tree.add_command(division_group)
+
+    props_group = app_commands.Group(
+        name="props",
+        description="Parimutuel event contracts — bet on the market's own drama",
+    )
+
+    @props_group.command(name="list", description="Open prop contracts and their pools")
+    async def props_list(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            tick = await current_tick_index(conn) or 0
+            rows = await props_svc.list_open(conn)
+        if not rows:
+            await interaction.response.send_message(
+                "No open props — new ones post weekly.", ephemeral=True
+            )
+            return
+        lines = []
+        for p in rows:
+            total = p.pool_yes_minor + p.pool_no_minor
+            yes_pct = (p.pool_yes_minor / total * 100) if total else 50.0
+            lines.append(
+                f"`#{p.id}` {p.title}\n"
+                f"    YES {format_money(p.pool_yes_minor)} ({yes_pct:.0f}%) · "
+                f"NO {format_money(p.pool_no_minor)} · resolves in ~"
+                f"{max(p.resolve_tick - tick, 0)}t"
+            )
+        embed = discord.Embed(title="Open props", color=EMBED_GOLD)
+        embed.description = "\n".join(lines)
+        embed.set_footer(text="Bet with /props bet <id> <yes|no> <amount>")
+        await interaction.response.send_message(embed=embed)
+
+    @props_group.command(name="bet", description="Stake on one side of a prop")
+    @app_commands.describe(
+        prop_id="Prop id from /props list",
+        side="yes or no",
+        amount="Dollars to stake",
+    )
+    @app_commands.choices(
+        side=[
+            app_commands.Choice(name="yes", value="yes"),
+            app_commands.Choice(name="no", value="no"),
+        ]
+    )
+    async def props_bet(
+        interaction: discord.Interaction, prop_id: int, side: str, amount: float
+    ) -> None:
+        amount_minor = int(Decimal(str(amount)) * 100)
+        async with db.connection() as conn:
+            bootstrap = await bootstrap_user(conn, interaction.user.id)
+            tick = await current_tick_index(conn) or 0
+            try:
+                stake = await props_svc.bet(
+                    conn, interaction.user.id, prop_id, side, amount_minor, tick
+                )
+                prop = await props_svc.get_prop(conn, prop_id)
+            except InsufficientFundsError:
+                await interaction.response.send_message(
+                    "Insufficient funds for that bet.", ephemeral=True
+                )
+                return
+            except (TradingError, MarginError) as exc:
+                await _reject(interaction, str(exc))
+                return
+        title = prop.title if prop else f"prop #{prop_id}"
+        await interaction.response.send_message(
+            f"🎲 **{format_money(amount_minor)}** on **{side.upper()}** — "
+            f"{title} (your side now totals {format_money(stake)})."
+            + _welcome_suffix(bootstrap)
+        )
+
+    @props_group.command(name="mine", description="Your prop bets and results")
+    async def props_mine(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            rows = await props_svc.my_bets(conn, interaction.user.id)
+        if not rows:
+            await interaction.response.send_message(
+                "No prop bets yet — `/props list`.", ephemeral=True
+            )
+            return
+        lines = []
+        for r in rows:
+            paid = (
+                f" → paid **{format_money(int(r['paid_minor']))}**"
+                if r["paid_minor"] is not None
+                else ""
+            )
+            status = str(r["status"]).lower()
+            lines.append(
+                f"`#{r['prop_id']}` {r['title']} — **{format_money(int(r['amount_minor']))}** "
+                f"on {r['side']} · {status}{paid}"
+            )
+        embed = discord.Embed(title="Your props", color=EMBED_GOLD)
+        embed.description = "\n".join(lines)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    tree.add_command(props_group)
+
+    @tree.command(
+        name="boss",
+        description="The named rivals — openly bots, openly gunning for your wallet",
+    )
+    async def boss(interaction: discord.Interaction) -> None:
+        from stockbot.npc import service as npc_cast
+
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            cast = await npc_cast.personas(conn)
+            rows = [
+                (p, await status_svc.net_worth_minor(conn, p.user_id))
+                for p in cast
+            ]
+        if not rows:
+            await interaction.response.send_message(
+                "No bosses on the tape right now.", ephemeral=True
+            )
+            return
+        embed = discord.Embed(title="The rivals", color=EMBED_GOLD)
+        embed.description = "\n".join(
+            f"**{p.display_name}** — {format_money(equity)} net worth · "
+            f"`{p.archetype}` bot"
+            for p, equity in rows
+        )
+        embed.set_footer(
+            text="Put a bounty on them with /bounty — beat their week for a hidden badge"
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @tree.command(
+        name="scope",
+        description="Choose which competitive season your league-flag commands trade in",
+    )
+    async def scope(interaction: discord.Interaction) -> None:
+        async with db.connection() as conn:
+            await bootstrap_user(conn, interaction.user.id)
+            entries = await list_active_entries(conn, interaction.user.id)
+            pinned = await pinned_scope(conn, interaction.user.id)
+            duel_by_season: dict[int, Any] = {}
+            for s in entries:
+                if s.duel_id is not None:
+                    d = await duel_svc.get_duel(conn, s.duel_id)
+                    if d is not None:
+                        duel_by_season[s.id] = d
+        if not entries:
+            await interaction.response.send_message(
+                "You have no active competitive seasons — `/league join`, "
+                "`/duel`, or `/division join` first.",
+                ephemeral=True,
+            )
+            return
+        options = [
+            discord.SelectOption(
+                label="Auto — most recent active season",
+                value="0",
+                description="Unpin: league commands follow recency",
+                default=pinned is None,
+            )
+        ]
+        for s in entries:
+            label = describe_entry(s, duel_by_season.get(s.id))
+            options.append(
+                discord.SelectOption(
+                    label=("📌 " if s.id == pinned else "") + label[:97],
+                    value=str(s.id),
+                    default=s.id == pinned,
+                )
+            )
+        embed = scope_embed()
+        lines = []
+        for s in entries:
+            pin = "📌 " if s.id == pinned else ""
+            lines.append(f"{pin}**{describe_entry(s, duel_by_season.get(s.id))}**")
+        embed.add_field(name="Your active entries", value="\n".join(lines), inline=False)
+        await interaction.response.send_message(
+            embed=embed, view=scope_view(options), ephemeral=True
+        )
+
     sandbox_group = app_commands.Group(
         name="sandbox",
         description="Private practice portfolio — resets free, never touches net worth",
@@ -3454,7 +3905,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 return "You don't have a sandbox running. `/sandbox open` first."
             return entry[0]
         if league:
-            entry = await get_active_entry(conn, interaction.user.id)
+            entry = await resolve_trade_entry(conn, interaction.user.id)
             if entry is None:
                 return "You're not entered in an active season. `/league join` first."
             return entry[0]
@@ -4266,6 +4717,105 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             f"Spawned {len(spawned)} `{archetype}` agent(s)"
             + (f" pinned to `{ticker.upper()}`" if ticker else "")
             + ".",
+            ephemeral=True,
+        )
+
+    @admin_group.command(
+        name="npc-spawn-persona",
+        description="Spawn a named rival (openly a bot; skips permadeath; bounty-targetable)",
+    )
+    @app_commands.describe(
+        name="Display name, e.g. 'Hedge Fund Harry'",
+        archetype="Trading style the persona runs",
+        stake_dollars="Starting stake in dollars (default npc.stake_minor)",
+    )
+    @app_commands.choices(
+        archetype=[app_commands.Choice(name=k, value=k) for k in sorted(NPC_ARCHETYPES)]
+    )
+    async def admin_npc_spawn_persona(
+        interaction: discord.Interaction,
+        name: str,
+        archetype: str,
+        stake_dollars: app_commands.Range[float, 100.0, 10_000_000.0] | None = None,
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        stake_minor = int(Decimal(str(stake_dollars)) * 100) if stake_dollars is not None else None
+        try:
+            async with db.connection() as conn:
+                async with conn.transaction():
+                    uid = await spawn_agent(
+                        conn,
+                        archetype,
+                        label=name,
+                        stake_minor=stake_minor,
+                        persona=True,
+                        display_name=name,
+                    )
+        except ValueError as exc:
+            await interaction.response.send_message(
+                f"Spawn refused: {exc}", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            f"**{name}** (`{archetype}`, user `{uid}`) is on the tape — "
+            "taunts daily, bounties open.",
+            ephemeral=True,
+        )
+
+    @admin_group.command(
+        name="chaos-schedule",
+        description="Queue a chaos event (flash crash / vol storm / fee surge)",
+    )
+    @app_commands.describe(
+        kind="Event kind",
+        in_ticks="Ticks from now until it fires",
+        duration_ticks="How long the window lasts (multiplier events)",
+        mult="Multiplier for VOL_STORM / FEE_SURGE",
+        pct="Crash magnitude (0-1) for FLASH_CRASH",
+    )
+    @app_commands.choices(
+        kind=[
+            app_commands.Choice(name="flash_crash", value="FLASH_CRASH"),
+            app_commands.Choice(name="vol_storm", value="VOL_STORM"),
+            app_commands.Choice(name="fee_surge", value="FEE_SURGE"),
+        ]
+    )
+    async def admin_chaos_schedule(
+        interaction: discord.Interaction,
+        kind: str,
+        in_ticks: app_commands.Range[int, 1, 100_000],
+        duration_ticks: app_commands.Range[int, 1, 100_000] = 1440,
+        mult: app_commands.Range[float, 0.1, 50.0] | None = None,
+        pct: app_commands.Range[float, 0.001, 0.5] | None = None,
+    ) -> None:
+        if not _is_admin(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        from stockbot.chaos import service as chaos_svc
+
+        payload: dict[str, Any] = {}
+        if kind == "FLASH_CRASH":
+            payload["pct"] = pct if pct is not None else 0.03
+        else:
+            payload["mult"] = (
+                mult if mult is not None
+                else (2.0 if kind == "VOL_STORM" else 2.0)
+            )
+        async with db.connection() as conn:
+            tick = await current_tick_index(conn) or 0
+            async with conn.transaction():
+                event_id = await chaos_svc.schedule(
+                    conn,
+                    kind=kind,
+                    start_tick=tick + int(in_ticks),
+                    duration_ticks=int(duration_ticks),
+                    payload=payload,
+                )
+        await interaction.response.send_message(
+            f"Chaos `#{event_id}` **{kind}** queued for tick {tick + int(in_ticks)} "
+            f"(+{int(in_ticks)}t, {int(duration_ticks)}t window).",
             ephemeral=True,
         )
 

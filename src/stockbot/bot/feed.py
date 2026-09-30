@@ -229,6 +229,148 @@ def _fmt_deal(items: list[dict[str, Any]]) -> str:
     return f"🎉 Today's deal: {p['name']} −{pct}% — `/shop item:{p['item_key']}`"
 
 
+def _fmt_duel_started(items: list[dict[str, Any]]) -> str:
+    parts = [
+        f"{_mention(p['challenger'])} vs {_mention(p['opponent'])} — "
+        f"{format_money(p['stake'])} each on the line"
+        for p in items
+    ]
+    return "⚔️ duel" + ("s" if len(items) > 1 else "") + " on: " + "; ".join(parts)
+
+
+def _fmt_duel_settled(items: list[dict[str, Any]]) -> str:
+    parts = []
+    for p in items:
+        if p.get("winner") is None:
+            parts.append(
+                f"{_mention(p['loser'])}'s duel ended in a dead heat — stakes refunded"
+            )
+        elif p.get("forfeit"):
+            parts.append(
+                f"{_mention(p['winner'])} took the pot after "
+                f"{_mention(p['loser'])} forfeited — {format_money(p['payout'])}"
+            )
+        else:
+            parts.append(
+                f"{_mention(p['winner'])} took {_mention(p['loser'])}'s "
+                f"{format_money(p['stake'])} — {format_money(p['payout'])} paid"
+            )
+    return "⚔️ " + "; ".join(parts)
+
+
+def _fmt_bounty_posted(items: list[dict[str, Any]]) -> str:
+    parts = [
+        f"{format_money(p['amount'])} on "
+        f"{p['target_name'] + ' (bot)' if p.get('target_name') else _mention(p['target'])}'s head"
+        for p in items
+    ]
+    return "🎯 new bount" + ("ies" if len(items) > 1 else "y") + ": " + "; ".join(parts)
+
+
+def _fmt_bounty_paid(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    count = p.get("count", 1)
+    noun = "bounty" if count == 1 else f"{count} bounties"
+    target = (
+        p["target_name"] + " (bot)"
+        if p.get("target_name")
+        else _mention(p["target"])
+    )
+    if p.get("claimant") is not None:
+        return (
+            f"🎯 {_mention(p['claimant'])} collected the {noun} on "
+            f"{target}'s head — {format_money(p['paid'])} paid"
+        )
+    return (
+        f"🎯 {noun.capitalize()} on {target}'s head went "
+        "unclaimed — nobody was positioned against them; the pot burned"
+    )
+
+
+def _fmt_division_week(items: list[dict[str, Any]]) -> str:
+    parts = []
+    for p in items:
+        head = f"**{p['tier_name']}** week settled"
+        if p.get("winner_id") is not None:
+            head += f" — {_mention(p['winner_id'])} on top ({p['entrants']} entrants)"
+        moves = []
+        if p.get("promoted"):
+            moves.append("promoted " + ", ".join(_mention(u) for u in p["promoted"]))
+        if p.get("relegated"):
+            moves.append("relegated " + ", ".join(_mention(u) for u in p["relegated"]))
+        parts.append(head + ("; " + "; ".join(moves) if moves else ""))
+    return "🏆 " + " · ".join(parts)
+
+
+def _fmt_prop_opened(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    return (
+        f"🎲 new prop `#{p['prop_id']}`: \"{p['title']}\" — "
+        "take a side with /props bet"
+    )
+
+
+def _fmt_prop_resolved(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    if p.get("outcome"):
+        return (
+            f"🎲 prop `#{p['prop_id']}` resolved **{p['outcome']}** — "
+            f"\"{p['title']}\" ({format_money(p['pool'])} in the pool)"
+        )
+    return (
+        f"🎲 prop `#{p['prop_id']}` voided — \"{p['title']}\", stakes refunded"
+    )
+
+
+def _fmt_chaos_crash(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    return (
+        f"💥 **FLASH CRASH** — every stock just gapped "
+        f"{float(p['pct']):.1%} lower. Check your margin."
+    )
+
+
+def _fmt_chaos_vol(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    return (
+        f"🌪️ **VOLATILITY STORM** — sigma ×{float(p['mult']):.1f} "
+        f"until tick {p['end_tick']}."
+    )
+
+
+def _fmt_chaos_fee(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    label = p.get("label") or "fee surge"
+    return (
+        f"📞 **{label.upper()}** — borrow costs ×{float(p['mult']):.1f} "
+        f"until tick {p['end_tick']}. Shorts bleed double."
+    )
+
+
+def _fmt_chaos_ended(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    names = {
+        "FLASH_CRASH": "the dust settles after the flash crash",
+        "VOL_STORM": "the volatility storm passes",
+        "FEE_SURGE": "borrow rates normalize",
+    }
+    return f"🌤️ {names.get(str(p['kind']), 'the chaos passes')}."
+
+
+def _fmt_persona_taunt(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    return f"🤖 {p['line']}"
+
+
+def _fmt_boss_beaten(items: list[dict[str, Any]]) -> str:
+    p = items[0]
+    who = ", ".join(_mention(u) for u in p.get("beaten_by", []))
+    return (
+        f"🗡️ {who} out-traded **{p['boss']}** all week "
+        f"({p['boss_ret']:+.1%} for the boss). Giant Slayer badges out."
+    )
+
+
 _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "LIQUIDATION": _fmt_liquidation,
     "SQUEEZE": _fmt_squeeze,
@@ -247,6 +389,19 @@ _FORMATTERS: dict[str, Callable[[list[dict[str, Any]]], str]] = {
     "GIFT": _fmt_gift,
     "LISTING": _fmt_listing,
     "DEAL": _fmt_deal,
+    "DUEL_STARTED": _fmt_duel_started,
+    "DUEL_SETTLED": _fmt_duel_settled,
+    "BOUNTY_POSTED": _fmt_bounty_posted,
+    "BOUNTY_PAID": _fmt_bounty_paid,
+    "DIVISION_WEEK": _fmt_division_week,
+    "PROP_OPENED": _fmt_prop_opened,
+    "PROP_RESOLVED": _fmt_prop_resolved,
+    "CHAOS_FLASH_CRASH": _fmt_chaos_crash,
+    "CHAOS_VOL_STORM": _fmt_chaos_vol,
+    "CHAOS_FEE_SURGE": _fmt_chaos_fee,
+    "CHAOS_ENDED": _fmt_chaos_ended,
+    "PERSONA_TAUNT": _fmt_persona_taunt,
+    "BOSS_BEATEN": _fmt_boss_beaten,
 }
 
 

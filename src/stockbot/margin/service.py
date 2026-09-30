@@ -84,7 +84,17 @@ class MarginHealth:
 async def margin_config(conn: AsyncConnection) -> dict[str, Decimal]:
     async with conn.cursor() as cur:
         await cur.execute("SELECT key, value FROM config WHERE key LIKE 'margin.%'")
-        return {key: Decimal(value) for key, value in await cur.fetchall()}
+        cfg = {key: Decimal(value) for key, value in await cur.fetchall()}
+    # FEE_SURGE (Margin Call Monday, scheduled chaos) multiplies the
+    # borrow rate for its active window. Evaluated at read time off the
+    # events table -- expiry drops the row's ACTIVE status, nothing is
+    # materialized into `config` to go stale.
+    from stockbot.chaos import service as chaos  # lazy: margin <- chaos cycle
+
+    fee_mult = await chaos.active_multiplier(conn, "FEE_SURGE")
+    if fee_mult != 1.0 and "margin.borrow_fee_bps_per_tick" in cfg:
+        cfg["margin.borrow_fee_bps_per_tick"] *= Decimal(str(fee_mult))
+    return cfg
 
 
 async def margin_tier(conn: AsyncConnection, user_id: int, season_id: int | None) -> int:
@@ -780,6 +790,7 @@ async def _liquidate_account(
         int(pos["market_id"]) not in open_market_ids
         for pos in remaining_shorts
     ):
+        await _settle_bounties(conn, user_id, season_id, tick_index, legs)
         return legs
     if health.equity_minor < 0 or health.undermargined:
         for pos in remaining_shorts:
@@ -828,7 +839,26 @@ async def _liquidate_account(
                     conn, 0, "ADL", None, tick_index, mm_absorbed_minor=residual
                 )
 
+    await _settle_bounties(conn, user_id, season_id, tick_index, legs)
     return legs
+
+
+async def _settle_bounties(
+    conn: AsyncConnection,
+    user_id: int,
+    season_id: int | None,
+    tick_index: int | None,
+    legs: int,
+) -> None:
+    """Pay out open bounties on a just-liquidated MAIN portfolio. League
+    stakes are faucet-seeded, so a league liquidation never triggers
+    (same gate as the public tape). Lazy import keeps bounties.service
+    -> margin.service free of a module cycle."""
+    if legs <= 0 or season_id is not None:
+        return
+    from stockbot.bounties import service as bounties_svc
+
+    await bounties_svc.settle_for_user(conn, user_id, tick_index)
 
 
 async def check_and_liquidate(

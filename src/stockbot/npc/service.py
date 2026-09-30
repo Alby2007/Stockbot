@@ -68,6 +68,8 @@ async def spawn_agent(
     label: str | None = None,
     quote_ticker: str | None = None,
     stake_minor: int | None = None,
+    persona: bool = False,
+    display_name: str | None = None,
 ) -> int:
     """Create one synthetic agent. Returns its user_id.
 
@@ -76,6 +78,13 @@ async def spawn_agent(
     runner lock in production; concurrent manual spawns could race on
     the MAX and the second loses to the users PK (acceptable: spawns
     are rare and the loser just retries).
+
+    `persona=True` makes an openly-named antagonist (Hedge Fund Harry):
+    `display_name` is how feed/DM surfaces render them (the synthetic
+    snowflake would produce a dead <@id> mention), they're the ONLY
+    bot-kind bounty target, and permadeath can't claim them -- a boss
+    doesn't bleed out, he just has a bad quarter. The anonymous
+    population stays anonymous and mortal.
 
     Raises ValueError for an unknown archetype or a quote_ticker that
     isn't an active instrument -- without the checks the spawn produces
@@ -130,10 +139,18 @@ async def spawn_agent(
     async with conn.cursor() as cur:
         await cur.execute(
             """
-            INSERT INTO npc_agents (user_id, archetype, label, quote_ticker)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO npc_agents (user_id, archetype, label, quote_ticker,
+                                    is_persona, display_name)
+            VALUES (%s, %s, %s, %s, %s, %s)
             """,
-            (user_id, archetype, label or f"npc-{archetype}-{user_id}", quote_ticker),
+            (
+                user_id,
+                archetype,
+                label or f"npc-{archetype}-{user_id}",
+                quote_ticker,
+                persona,
+                display_name,
+            ),
         )
     if archetype == "shorter":
         # Margin tier is an ops grant, not a purchase -- debiting the
@@ -335,6 +352,7 @@ async def mark_dead_agents(conn: AsyncConnection, tick_index: int) -> int:
             """
             SELECT n.user_id FROM npc_agents n
             WHERE n.enabled AND n.died_at_tick IS NULL
+              AND NOT n.is_persona  -- bosses don't bleed out
             ORDER BY n.user_id
             """
         )
@@ -446,3 +464,223 @@ async def set_agent_enabled(conn: AsyncConnection, *, label: str, enabled: bool)
         label=str(row["label"]),
         quote_ticker=row["quote_ticker"],
     )
+
+
+# --- Personas (phase 2 game layer) --------------------------------------
+# Named, openly-disclosed rivals. They trade like any agent (archetype
+# decisions, same tick budget), but their name is the product: feed
+# taunts on hot streaks, a weekly "beat the boss" challenge, and they're
+# the only addressable bot bounty target. Everything here renders by
+# display_name -- synthetic snowflakes produce dead mentions.
+
+
+@dataclass(frozen=True)
+class Persona:
+    user_id: int
+    display_name: str
+    archetype: str
+
+
+async def personas(conn: AsyncConnection) -> list[Persona]:
+    """All living personas, whether or not the archetype is enabled."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT user_id, display_name, archetype FROM npc_agents
+            WHERE is_persona AND enabled AND died_at_tick IS NULL
+            ORDER BY user_id
+            """
+        )
+        return [
+            Persona(
+                user_id=int(r["user_id"]),
+                display_name=str(r["display_name"] or r["archetype"]),
+                archetype=str(r["archetype"]),
+            )
+            for r in await cur.fetchall()
+        ]
+
+
+async def persona_name(conn: AsyncConnection, user_id: int) -> str | None:
+    """display_name if `user_id` is a living persona, else None -- the
+    cheap check callers (bounty payloads) make before choosing a render."""
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT display_name FROM npc_agents WHERE user_id = %s AND is_persona",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+    return str(row[0]) if row and row[0] is not None else None
+
+
+_TAUNTS_UP = (
+    "{name} pockets {pct} today and wants you to know about it.",
+    "{name}: 'amateur hour over there?' (+{pct})",
+    "{name} is up {pct} on the day. He's insufferable about it.",
+    "{name} just posted another winner. +{pct} today.",
+)
+_TAUNTS_DOWN = (
+    "{name} bled {pct} today. He calls it 'buying the dip'.",
+    "{name}: 'a temporary drawdown' (-{pct})",
+    "{name} is down {pct} and suddenly very quiet.",
+    "{name} lost {pct} today. The tape remembers.",
+)
+
+
+async def on_day(conn: AsyncConnection, tick_index: int) -> int:
+    """Day-boundary persona beat: a taunt when a persona had a notable
+    day, then the weekly 'beat the boss' check at the week boundary.
+    Called from apply_tick's lifecycle block in BOTH phases -- it's
+    calendar-driven like the division sweep."""
+    if await _config_float(conn, "personas.enabled", 1.0) == 0.0:
+        return 0
+    if tick_index == 0 or tick_index % TICKS_PER_DAY != 0:
+        return 0
+    day_index = tick_index // TICKS_PER_DAY
+    fired = 0
+    cast = await personas(conn)
+    if not cast:
+        return 0
+
+    from stockbot.feed import emit_feed  # lazy: keep npc leaf-clean
+
+    rng = random.Random(f"persona-{day_index}")
+    for p in cast:
+        equity = await net_worth_minor(conn, p.user_id)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT equity_minor FROM net_worth_snapshots
+                WHERE user_id = %s AND day_index < %s
+                ORDER BY day_index DESC LIMIT 1
+                """,
+                (p.user_id, day_index),
+            )
+            prev = await cur.fetchone()
+        if prev is None or int(prev[0]) <= 0:
+            continue
+        delta_pct = (equity / int(prev[0]) - 1.0) * 100
+        if abs(delta_pct) < 1.0:
+            continue  # a boring day is a quiet boss
+        bank = _TAUNTS_UP if delta_pct > 0 else _TAUNTS_DOWN
+        line = rng.choice(bank).format(
+            name=p.display_name, pct=f"{abs(delta_pct):.1f}%"
+        )
+        await emit_feed(
+            conn,
+            "PERSONA_TAUNT",
+            {"persona": p.display_name, "line": line, "delta_pct": delta_pct},
+            tick_index=tick_index,
+        )
+        fired += 1
+
+    if day_index % 7 == 0:
+        fired += await _beat_boss_weekly(conn, tick_index, day_index, cast)
+    return fired
+
+
+async def _beat_boss_weekly(
+    conn: AsyncConnection,
+    tick_index: int,
+    day_index: int,
+    cast: list[Persona],
+) -> int:
+    """Week boundary: every human whose weekly net-worth delta beat the
+    best persona's earns the `boss_slayer` badge + a feed callout. Reads
+    the day-boundary snapshots -- the same basis /compare uses."""
+    if not cast:
+        return 0
+    boss = cast[0]  # deterministic: lowest user_id is THE boss
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT equity_minor FROM net_worth_snapshots
+            WHERE user_id = %s AND day_index <= %s
+            ORDER BY day_index DESC LIMIT 1
+            """,
+            (boss.user_id, day_index - 7),
+        )
+        boss_then = await cur.fetchone()
+        await cur.execute(
+            """
+            SELECT equity_minor FROM net_worth_snapshots
+            WHERE user_id = %s AND day_index < %s
+            ORDER BY day_index DESC LIMIT 1
+            """,
+            (boss.user_id, day_index),
+        )
+        boss_now = await cur.fetchone()
+    if boss_then is None or boss_now is None or int(boss_then[0]) <= 0:
+        return 0
+    boss_ret = int(boss_now[0]) / int(boss_then[0]) - 1.0
+
+    # Every human with a comparable 7-day window, ranked by return.
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT a.user_id, n0.equity_minor AS then_eq, n1.equity_minor AS now_eq
+            FROM accounts a
+            JOIN users u ON u.id = a.user_id AND NOT u.is_bot
+            JOIN LATERAL (
+                SELECT equity_minor FROM net_worth_snapshots s
+                WHERE s.user_id = a.user_id AND s.day_index <= %s
+                ORDER BY s.day_index DESC LIMIT 1
+            ) n0 ON TRUE
+            JOIN LATERAL (
+                SELECT equity_minor FROM net_worth_snapshots s
+                WHERE s.user_id = a.user_id AND s.day_index < %s
+                ORDER BY s.day_index DESC LIMIT 1
+            ) n1 ON TRUE
+            WHERE a.kind = 'USER'
+            """,
+            (day_index - 7, day_index - 7, day_index),
+        )
+        rows = await cur.fetchall()
+    beaten: list[tuple[int, float]] = []
+    for r in rows:
+        then_eq, now_eq = int(r["then_eq"]), int(r["now_eq"])
+        if then_eq <= 0:
+            continue
+        ret = now_eq / then_eq - 1.0
+        if ret > boss_ret:
+            beaten.append((int(r["user_id"]), ret))
+    if not beaten:
+        return 0
+
+    from stockbot.feed import emit_feed  # lazy
+
+    fired = 0
+    for uid, ret in beaten:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO entitlements (user_id, item_key)
+                VALUES (%s, 'badge_boss_slayer')
+                ON CONFLICT (user_id, item_key) DO NOTHING
+                """,
+                (uid,),
+            )
+            if cur.rowcount:
+                await cur.execute(
+                    """
+                    INSERT INTO notifications (user_id, kind, payload)
+                    SELECT %s, 'BOSS_BEATEN',
+                           jsonb_build_object('tick_index', %s, 'boss', %s,
+                                              'your_ret', %s, 'boss_ret', %s)
+                    """,
+                    (uid, tick_index, boss.display_name, ret, boss_ret),
+                )
+                fired += 1
+    if fired:
+        await emit_feed(
+            conn,
+            "BOSS_BEATEN",
+            {
+                "boss": boss.display_name,
+                "boss_ret": boss_ret,
+                "beaten_by": [uid for uid, _ in beaten],
+                "week": day_index // 7,
+            },
+            tick_index=tick_index,
+        )
+    return fired
