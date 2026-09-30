@@ -22,7 +22,7 @@ async def test_duel_wins_badge(conn: AsyncConnection) -> None:
     await bootstrap_user(conn, 4301)
     await bootstrap_user(conn, 4302)
     async with conn.cursor() as cur:
-        for i in range(3):
+        for _i in range(3):
             await cur.execute(
                 """
                 INSERT INTO duels (challenger_id, opponent_id, stake_minor,
