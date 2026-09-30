@@ -79,6 +79,7 @@ class CardRow:
     sector_id: int | None
     rarity: str | None
     instrument_id: int | None
+    sector_name: str | None = None
 
 
 async def _config_map(conn: AsyncConnection, prefix: str) -> dict[str, float]:
@@ -160,8 +161,10 @@ async def get_card(conn: AsyncConnection, key: str) -> CardRow | None:
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT key, set_key, kind, name, flavor, sector_id, rarity, instrument_id
-            FROM cards WHERE key = %s
+            SELECT c.key, c.set_key, c.kind, c.name, c.flavor, c.sector_id,
+                   c.rarity, c.instrument_id, s.name AS sector_name
+            FROM cards c LEFT JOIN sectors s ON s.id = c.sector_id
+            WHERE c.key = %s
             """,
             (key,),
         )
@@ -177,7 +180,38 @@ async def get_card(conn: AsyncConnection, key: str) -> CardRow | None:
         sector_id=row["sector_id"],
         rarity=row["rarity"],
         instrument_id=row["instrument_id"],
+        sector_name=row["sector_name"],
     )
+
+
+async def get_cards(conn: AsyncConnection, keys: list[str]) -> dict[str, CardRow]:
+    """Batch fetch for the reveal path -- one query for a pack's pulls."""
+    if not keys:
+        return {}
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT c.key, c.set_key, c.kind, c.name, c.flavor, c.sector_id,
+                   c.rarity, c.instrument_id, s.name AS sector_name
+            FROM cards c LEFT JOIN sectors s ON s.id = c.sector_id
+            WHERE c.key = ANY(%s)
+            """,
+            (keys,),
+        )
+        out: dict[str, CardRow] = {}
+        for row in await cur.fetchall():
+            out[str(row["key"])] = CardRow(
+                key=str(row["key"]),
+                set_key=str(row["set_key"]),
+                kind=str(row["kind"]),
+                name=str(row["name"]),
+                flavor=str(row["flavor"]),
+                sector_id=row["sector_id"],
+                rarity=row["rarity"],
+                instrument_id=row["instrument_id"],
+                sector_name=row["sector_name"],
+            )
+        return out
 
 
 async def find_card(
@@ -192,13 +226,14 @@ async def find_card(
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT key, set_key, kind, name, flavor, sector_id, rarity, instrument_id
-            FROM cards
-            WHERE lower(name) = %s
-               OR lower(key) = %s
-               OR (kind = 'INSTRUMENT' AND instrument_id = (
+            SELECT c.key, c.set_key, c.kind, c.name, c.flavor, c.sector_id,
+                   c.rarity, c.instrument_id, s.name AS sector_name
+            FROM cards c LEFT JOIN sectors s ON s.id = c.sector_id
+            WHERE lower(c.name) = %s
+               OR lower(c.key) = %s
+               OR (c.kind = 'INSTRUMENT' AND c.instrument_id = (
                      SELECT id FROM instruments WHERE lower(ticker) = %s))
-            ORDER BY key LIMIT 1
+            ORDER BY c.key LIMIT 1
             """,
             (q, q, q),
         )
@@ -214,6 +249,7 @@ async def find_card(
         sector_id=r["sector_id"],
         rarity=r["rarity"],
         instrument_id=r["instrument_id"],
+        sector_name=r["sector_name"],
     )
 
 

@@ -62,6 +62,7 @@ from stockbot.bot.autocomplete import (
     ticker_autocomplete,
     tunable_param_autocomplete,
 )
+from stockbot.bot.cardart import FaceSpec, render_card_face, render_card_spread
 from stockbot.bot.chart_view import (
     MAX_SPAN,
     MAX_SPAN_PRO,
@@ -120,12 +121,14 @@ from stockbot.claims.errors import (
 from stockbot.claims.service import claim_daily
 from stockbot.collectibles.pull import FRAME_RANK
 from stockbot.collectibles.service import (
+    CardRow,
     PullOutcome,
     assemble_card,
     collection_stats,
     collector_leaderboard,
     craft_card,
     find_card,
+    get_cards,
     list_collection,
     recipe_for,
     set_featured_card,
@@ -303,6 +306,18 @@ def _frame_glyph_for(card: Any) -> str:
 # Podium medals on ranked surfaces -- same language as leaderboard.py.
 _COLLECTOR_MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
+# Sector emoji for /market sub-headers (renders fine inside ```ansi).
+_SECTOR_EMOJI = {
+    "TECH": "🖥",
+    "FIN": "🏦",
+    "HEALTH": "🏥",
+    "ENERGY": "⚡",
+    "CONSUMER": "🛒",
+    "INDUSTRIAL": "🏭",
+    "UTILITIES": "💡",
+    "MATERIALS": "🧱",
+}
+
 
 def _market_embed(
     snapshots: list[InstrumentSnapshot],
@@ -355,7 +370,8 @@ def _market_embed(
         for s in rows:
             if s.sector_key != prev_sector:
                 prev_sector = s.sector_key
-                lines.append(ansi_dim(f"   {prev_sector.upper()}"))
+                emoji = _SECTOR_EMOJI.get(prev_sector.upper(), "📦")
+                lines.append(ansi_dim(f"  {emoji} {prev_sector.upper()}"))
             marker = " ⏸" if s.is_halted else ""
             lines.append(
                 f"{s.ticker:<6} {format_price(s.quoted_price):>9} "
@@ -376,10 +392,13 @@ def _market_embed(
     )
 
 
-def _pull_embed(outcome: PullOutcome, index: int, total: int) -> discord.Embed:
+def _pull_embed(
+    outcome: PullOutcome, index: int, total: int, image_name: str
+) -> discord.Embed:
     """One staged-reveal card: frame glyph + name + mint serial + print
     stamps + outcome, duplicates carrying their shard award (C6 -- a
-    visible 'rare' dupe must never read as a bare loss)."""
+    visible 'rare' dupe must never read as a bare loss). The face PNG
+    attaches alongside (`attachment://`) so the reveal reads as a card."""
     dup = f" — duplicate, +{outcome.shards} shards" if outcome.outcome == "DUPLICATE" else ""
     upgrade = " — upgraded frame!" if outcome.outcome == "UPGRADE" else ""
     stamp_names = ", ".join(
@@ -392,8 +411,38 @@ def _pull_embed(outcome: PullOutcome, index: int, total: int) -> discord.Embed:
         + (f"\n*{stamp_names}*" if stamp_names else ""),
         color=frame_color(outcome.tier),
     )
+    embed.set_image(url=f"attachment://{image_name}")
     embed.set_footer(text=f"Card {index}/{total}")
     return embed
+
+
+async def _reject(interaction: discord.Interaction, msg: str) -> None:
+    """Ephemeral red reject -- bad news reads as bad news instead of
+    blending into the channel as plain text."""
+    await interaction.response.send_message(
+        embed=discord.Embed(description=msg, color=EMBED_DOWN),
+        ephemeral=True,
+    )
+
+
+def _face_fname(outcome: PullOutcome) -> str:
+    return f"card_{outcome.card_key}_{outcome.serial}.png"
+
+
+def _face_spec(outcome: PullOutcome, cards: dict[str, CardRow]) -> FaceSpec:
+    """A PullOutcome plus its card row -> what the face renderer needs."""
+    c = cards.get(outcome.card_key)
+    return FaceSpec(
+        card_key=outcome.card_key,
+        name=outcome.name,
+        kind=c.kind if c else ("PART" if outcome.tier == "PART" else "INSTRUMENT"),
+        frame=outcome.tier,
+        serial=outcome.serial,
+        stamps=tuple(outcome.stamps),
+        set_label=c.set_key if c else "",
+        flavor=c.flavor if c else "",
+        sector_name=c.sector_name if c else None,
+    )
 
 
 async def _held_shares(
@@ -971,7 +1020,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 for s in items
             )
 
-        embed = discord.Embed(title="Movers (24h)")
+        embed = discord.Embed(title="Movers (24h)", color=EMBED_INFO, timestamp=datetime.now(UTC))
         embed.add_field(
             name="📈 Top gainers",
             value=f"```ansi\n{_lines(ranked[-5:][::-1])}\n```",
@@ -1005,7 +1054,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"{ansi_pct(avg_change)}"
             )
 
-        embed = discord.Embed(title="Sectors (avg 24h change)")
+        embed = discord.Embed(
+            title="Sectors (avg 24h change)",
+            color=EMBED_INFO,
+            timestamp=datetime.now(UTC),
+        )
         embed.description = "```ansi\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(embed=embed)
 
@@ -1041,7 +1094,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             + (f"   street {format_pct(float(estimate))}" if estimate is not None else "")
             for ticker, resolve_tick, estimate, code in rows
         ]
-        embed = discord.Embed(title="Earnings calendar")
+        embed = discord.Embed(title="Earnings calendar", color=EMBED_INFO)
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(embed=embed)
 
@@ -1091,7 +1144,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             bucket = "minor" if m < 0.01 else ("sizable" if m < 0.03 else "major")
             return f" · desk: {bucket}"
 
-        embed = discord.Embed(title="News")
+        embed = discord.Embed(title="News", color=EMBED_INFO)
         if pending:
             lines = [
                 f"[{ticker}] {headline} (effect lands in "
@@ -1184,7 +1237,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         # Net worth nets out accrued borrow fees / dividend obligations,
         # same as the margin health and league scoring paths.
         net_worth_minor = int(cash + holdings_value * 100 - accrued_minor)
-        lines.append(f"\nNet worth: {format_money(net_worth_minor)}")
+        lines.append(f"\nNet worth: **{format_money(net_worth_minor)}**")
 
         embed = discord.Embed(
             title=f"{interaction.user.display_name}'s {scope + ' ' if scope else ''}portfolio",
@@ -1323,7 +1376,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             + (f" ({t['maker_taker'].lower()})" if t["maker_taker"] else "")
             for t in trades
         ]
-        embed = discord.Embed(title="Recent trades")
+        embed = discord.Embed(title="Recent trades", color=EMBED_INFO)
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(
             content=_welcome_suffix(bootstrap) or None, embed=embed
@@ -1354,7 +1407,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"+{format_money(q['reward_minor'])}"
             )
 
-        embed = discord.Embed(title="Quests")
+        embed = discord.Embed(title="Quests", color=EMBED_INFO)
         daily = [q for q in rows if q["period"] == "DAILY"]
         weekly = [q for q in rows if q["period"] == "WEEKLY"]
         if daily:
@@ -1396,7 +1449,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 )
                 return
             except RerollError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(
             f"Rerolled into **{new['name']}** — target {new['target']}, "
@@ -1430,7 +1483,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"League: {record}"
             )
 
-        embed = discord.Embed(title=f"{interaction.user.display_name} vs {user.display_name}")
+        embed = discord.Embed(
+            title=f"{interaction.user.display_name} vs {user.display_name}",
+            color=EMBED_GOLD,
+        )
         embed.add_field(name=interaction.user.display_name, value=_fmt(me))
         embed.add_field(name=user.display_name, value=_fmt(them))
         await interaction.response.send_message(
@@ -1443,7 +1499,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             bootstrap = await bootstrap_user(conn, interaction.user.id)
             stats = await status_svc.profile_stats(conn, interaction.user.id)
         assert stats is not None
-        embed = discord.Embed(title=f"{interaction.user.display_name}'s profile")
+        embed = discord.Embed(title=f"{interaction.user.display_name}'s profile", color=EMBED_INFO)
         if stats.title:
             embed.description = stats.title
         embed.add_field(name="Account age", value=f"{stats.account_age_days:.1f} day(s)")
@@ -1485,7 +1541,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"**{user.display_name}** hasn't joined StockBot — `/start` creates an account."
             )
             return
-        embed = discord.Embed(title=user.display_name)
+        embed = discord.Embed(title=user.display_name, color=EMBED_INFO)
         if stats.title:
             # Equipped title sits under the name -- the flex reads first.
             embed.description = stats.title
@@ -1529,7 +1585,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             try:
                 slot = await equip_item(conn, interaction.user.id, item.lower())
             except ShopError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         label = "title" if slot == "title" else "chart theme"
         await interaction.response.send_message(
@@ -1551,7 +1607,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             try:
                 cleared = await unequip_item(conn, interaction.user.id, slot)
             except ShopError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(
             f"Cleared your {slot}." if cleared else f"No {slot} equipped.",
@@ -1666,7 +1722,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     allow_short=short,
                 )
             except TradingError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
             if side == "SELL" and not short:
                 # N4.2: a sell that would push the position below zero is a
@@ -1720,10 +1776,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     )
                 except (TradingError, ValueError):
                     msg = "Insufficient funds for that trade."
-                await interaction.response.send_message(msg, ephemeral=True)
+                await _reject(interaction, msg)
                 return
             except (TradingError, MarginError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
             legs = await check_and_liquidate(conn, interaction.user.id, season_id)
             cash_after = await get_balance(conn, account_id)
@@ -1820,7 +1876,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             # MarginError: assert_spend_ok can block the fee spend.
             # ValueError: "collateral rounds to zero" on tiny shorts.
             except (TradingError, MarginError, ValueError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(
             f"Opened bounded short **#{result.short_id}**: {result.quantity} {result.ticker} "
@@ -1862,7 +1918,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"KO {format_price(s['knockout_price']):>10}  "
                 f"{format_pct(pnl_pct):>8}"
             )
-        embed = discord.Embed(title="Open bounded shorts")
+        embed = discord.Embed(title="Open bounded shorts", color=EMBED_WARN)
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         embed.set_footer(text="/cover <id> to close early")
         await interaction.response.send_message(
@@ -1880,7 +1936,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     conn, user_id=interaction.user.id, short_id=short_id
                 )
             except TradingError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         outcome = "profit" if result.payoff_minor >= 0 else "loss"
         await interaction.response.send_message(
@@ -2141,7 +2197,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     trail_amount=None if trail is None else Decimal(str(trail)),
                 )
             except (TradingError, ValueError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         expiry = "GTC" if result.expires_tick is None else f"expires tick {result.expires_tick}"
         if result.order_type == "STOP":
@@ -2322,7 +2378,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     allow_short=short,
                 )
             except (TradingError, ValueError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(
             f"Bracket resting on **{ticker.upper()}**: "
@@ -2383,7 +2439,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         lines = ["id    side    qty ticker                     price"] + [
             _order_line(r) for r in rows
         ]
-        embed = discord.Embed(title="Open orders")
+        embed = discord.Embed(title="Open orders", color=EMBED_INFO)
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(
             content=_welcome_suffix(bootstrap) or None, embed=embed
@@ -2447,7 +2503,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     )
                     mark_row = await cur.fetchone()
             except TradingError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         assert mark_row is not None
         await interaction.response.send_message(
@@ -2551,8 +2607,13 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT uc.best_frame, uc.copies, uc.best_serial,"
-                    " COALESCE(bp.stamps, '{}') AS best_stamps"
+                    " COALESCE(bp.stamps, '{}') AS best_stamps,"
+                    " (cs.rotated_tick IS NOT NULL"
+                    "  AND bp.tick_index IS NOT NULL"
+                    "  AND bp.tick_index < cs.rotated_tick) AS first_edition"
                     " FROM user_cards uc"
+                    " JOIN cards cd ON cd.key = uc.card_key"
+                    " JOIN card_sets cs ON cs.key = cd.set_key"
                     " LEFT JOIN card_pulls bp"
                     "  ON bp.user_id = uc.user_id"
                     " AND bp.card_key = uc.card_key"
@@ -2604,7 +2665,28 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     ),
                     inline=False,
                 )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        # Render the actual held copy (frame/serial/stamps baked into the
+        # face); unheld lookups show the base card, no serial.
+        spec = FaceSpec(
+            card_key=c.key,
+            name=c.name,
+            kind=c.kind,
+            frame=str(held[0]) if held else "STANDARD",
+            serial=int(held[2]) if held and held[2] is not None else None,
+            stamps=tuple(held[3] or ()) if held else (),
+            set_label=c.set_key,
+            flavor=c.flavor,
+            sector_name=c.sector_name,
+            first_edition=bool(held[4]) if held else False,
+        )
+        face = await render_card_face(spec)
+        fname = f"card_{c.key}.png"
+        embed.set_image(url=f"attachment://{fname}")
+        await interaction.response.send_message(
+            embed=embed,
+            file=discord.File(face, filename=fname),
+            ephemeral=True,
+        )
 
     @tree.command(name="collection", description="Browse a card binder")
     @app_commands.describe(user="Whose binder to view (default: yours)")
@@ -2673,6 +2755,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     interaction_id=str(interaction.id),
                     master_seed=get_settings().master_seed,
                 )
+                card_rows = await get_cards(conn, [o.card_key for o in outcomes])
         except ShopError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
@@ -2688,14 +2771,28 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             outcomes,
             key=lambda o: (o.tier != "PART", FRAME_RANK.get(o.tier, 0)),
         )
+        specs = [_face_spec(o, card_rows) for o in reveals]
         if reveals:
             # First card on the deferred response; the rest edit in.
-            embed = _pull_embed(reveals[0], 1, len(reveals))
-            await interaction.edit_original_response(embed=embed)
-            for idx, outcome in enumerate(reveals[1:], start=2):
+            # Webhook edits accept attachments -- the type-7 callback
+            # restriction only applies to component interactions.
+            fname = _face_fname(reveals[0])
+            buf = await render_card_face(specs[0])
+            embed = _pull_embed(reveals[0], 1, len(reveals), fname)
+            await interaction.edit_original_response(
+                embed=embed, attachments=[discord.File(buf, filename=fname)]
+            )
+            for idx, (outcome, spec) in enumerate(
+                zip(reveals[1:], specs[1:], strict=True), start=2
+            ):
                 await asyncio.sleep(1.2)
-                embed = _pull_embed(outcome, idx, len(reveals))
-                await interaction.edit_original_response(embed=embed)
+                fname = _face_fname(outcome)
+                buf = await render_card_face(spec)
+                embed = _pull_embed(outcome, idx, len(reveals), fname)
+                await interaction.edit_original_response(
+                    embed=embed,
+                    attachments=[discord.File(buf, filename=fname)],
+                )
         summary = "\n".join(
             f"{_frame_glyph(o.tier)} **{o.name}** #{o.serial} — {o.outcome.lower()}"
             + (f" (+{o.shards} shards)" if o.shards else "")
@@ -2703,12 +2800,19 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             for o in reveals
         )
         await asyncio.sleep(0.6)
+        spread_name = "pack_spread.png"
+        summary_embed = discord.Embed(
+            title=f"Pack opened — {len(reveals)} cards",
+            description=summary,
+            color=frame_color(reveals[-1].tier) if reveals else None,
+        )
+        summary_files: list[discord.File] = []
+        if specs:
+            spread = await render_card_spread(specs)
+            summary_embed.set_image(url=f"attachment://{spread_name}")
+            summary_files.append(discord.File(spread, filename=spread_name))
         await interaction.edit_original_response(
-            embed=discord.Embed(
-                title=f"Pack opened — {len(reveals)} cards",
-                description=summary,
-                color=frame_color(reveals[-1].tier) if reveals else None,
-            )
+            embed=summary_embed, attachments=summary_files
         )
 
     @tree.command(
@@ -2748,7 +2852,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     _k, cost = await craft_card(conn, interaction.user.id, c.key)
                     message = f"Crafted **{c.name}** (⚪ STANDARD) for {cost} shards."
             except ShopError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(message)
 
@@ -2772,7 +2876,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     conn, interaction.user.id, c.key if c else None
                 )
             except ShopError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         if key and c:
             await interaction.response.send_message(
@@ -2798,7 +2902,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     gift_to=user.id,
                 )
             except (ShopError, InsufficientFundsError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
             except DuplicateInteractionError:
                 await interaction.response.send_message(
@@ -2862,7 +2966,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                         user_id=interaction.user.id,
                     )
             except ShopError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
             except DuplicateInteractionError:
                 await interaction.response.send_message(
@@ -2974,7 +3078,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     tick,
                 )
             except ShopError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
             trade = await get_trade(conn, trade_id)
             assert trade is not None
@@ -3021,7 +3125,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             try:
                 await trades_cancel(conn, trade_id, interaction.user.id)
             except ShopError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(
             f"Offer `#{trade_id}` cancelled.", ephemeral=True
@@ -3073,7 +3177,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     )
                     + alloc
                 )
-        embed = discord.Embed(title="IPO offerings")
+        embed = discord.Embed(title="IPO offerings", color=EMBED_GOLD)
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         embed.set_footer(text="/ipo subscribe <ticker> <dollars> — pro-rata at the offer price")
         await interaction.response.send_message(
@@ -3102,7 +3206,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 )
                 return
             except (TradingError, ValueError, MarginError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(
             f"Committed **{format_money(result.committed_minor)}** to the "
@@ -3133,7 +3237,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 await league_equity_minor(conn, season.id, interaction.user.id) if entry else None
             )
 
-        embed = discord.Embed(title=f"League — {season.name}")
+        embed = discord.Embed(title=f"League — {season.name}", color=EMBED_INFO)
         embed.add_field(name="Status", value=season.status)
         embed.add_field(
             name="Window",
@@ -3170,7 +3274,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 return
             # MarginError: the entry fee is a gated discretionary spend.
             except (SeasonError, MarginError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         if season is None:
             # Rare race: the season was created between our read and
@@ -3213,7 +3317,10 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"{rank:>3}. <@{s.user_id}>  eq {format_money(s.equity_minor):>12}  "
                 f"score {score}{prize}"
             )
-        embed = discord.Embed(title=f"League standings — {season.name} ({season.status})")
+        embed = discord.Embed(
+            title=f"League standings — {season.name} ({season.status})",
+            color=EMBED_GOLD,
+        )
         embed.description = "\n".join(lines)
         await interaction.response.send_message(embed=embed)
 
@@ -3284,7 +3391,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 pos_count, short_count = int(row[0]), int(row[1])
             assert season is not None
             tick_age = max((await current_tick(conn)) - season.start_tick, 0)
-        embed = discord.Embed(title="Sandbox")
+        embed = discord.Embed(title="Sandbox", color=EMBED_INFO)
         embed.add_field(name="Equity", value=format_money(equity))
         embed.add_field(name="Cash", value=format_money(cash))
         embed.add_field(
@@ -3355,7 +3462,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             try:
                 chain = await option_chain(conn, ticker)
             except TradingError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         spot = chain["spot"]
         strikes = chain["strikes"]
@@ -3453,7 +3560,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     season_id=scope,
                 )
             except (TradingError, MarginError, ValueError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         breakeven = (
             float(result.strike) + result.premium_minor / 100
@@ -3504,7 +3611,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 f"×{int(r['quantity']):>5}  "
                 f"{format_money(r['mark_minor'])}/sh ({format_pct(pnl)})"
             )
-        embed = discord.Embed(title=f"{interaction.user.display_name}'s options")
+        embed = discord.Embed(
+            title=f"{interaction.user.display_name}'s options", color=EMBED_WARN
+        )
         embed.description = "```\n" + "\n".join(lines) + "\n```"
         await interaction.response.send_message(embed=embed)
 
@@ -3517,7 +3626,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             try:
                 result = await sell_option(conn, user_id=interaction.user.id, option_id=option)
             except (TradingError, MarginError, ValueError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         pnl = result.payout_minor - result.premium_paid_minor
         await interaction.response.send_message(
@@ -3559,7 +3668,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             try:
                 await tune_instrument(conn, ticker, param, value)
             except (ValueError, TradingError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(
             f"Set {ticker.upper()}.{param} = {value}", ephemeral=True
@@ -3693,7 +3802,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             try:
                 await set_config(conn, key, value)
             except ValueError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(f"Set config `{key}` = {value}", ephemeral=True)
 
@@ -3725,7 +3834,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     admin_id=interaction.user.id,
                 )
             except (ValueError, InsufficientFundsError, TradingError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(
             f"Adjusted {user.display_name} by {format_money(amount)} (ledger `ADMIN_ADJUST`).",
@@ -3748,7 +3857,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             if cancelled
             else (f"Order {order_id} is not OPEN (already filled/cancelled, or no such order).")
         )
-        await interaction.response.send_message(msg, ephemeral=True)
+        await _reject(interaction, msg)
 
     @admin_group.command(
         name="disable",
@@ -3765,7 +3874,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             try:
                 changed = await disable_user(conn, user.id, reason, interaction.user.id)
             except ValueError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(
             (
@@ -3896,7 +4005,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             try:
                 await close_season(conn, season_id)
             except SeasonError as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(f"Season {season_id} closed.", ephemeral=True)
 
@@ -3943,7 +4052,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     liquidity=liquidity,
                 )
             except (ValueError, TradingError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(
             f"Listed **{ticker.upper()}** ({name}) at {format_price(Decimal(str(base_price)))} "
@@ -3965,7 +4074,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             try:
                 report = await delist_instrument(conn, ticker)
             except (ValueError, TradingError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         lines = [
             f"**{report.ticker}** delisted at mark {format_price(report.mark_price)}"
@@ -4021,7 +4130,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                     duration_ticks=int(days * TICKS_PER_DAY),
                 )
             except (ValueError, TradingError) as exc:
-                await interaction.response.send_message(str(exc), ephemeral=True)
+                await _reject(interaction, str(exc))
                 return
         await interaction.response.send_message(
             f"IPO **{ticker.upper()}** created — {shares:,} shares at "

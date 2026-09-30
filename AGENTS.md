@@ -316,6 +316,24 @@ surfaces (`/collateral`, shorts, options positions) warn-amber,
 liquidations red, informational lists blue, card reveals use
 `collection_view.frame_color` (per-frame stripe + `FRAME_GLYPH`). The
 feed tape stays plain text — no embeds there by design.
+Card art (`bot/cardart.py`): `render_card_face(FaceSpec)` /
+`render_card_spread(specs)` draw collectible PNGs with matplotlib —
+same conventions as charts.py (Agg, `Figure` not pyplot, render inside
+`asyncio.to_thread`, `_FACE_CACHE` LRU keyed by the full fingerprint
+`(card_key, frame, serial, stamps, first_edition)` — the serial IS in
+the key since each mint is a different card). The art window is
+procedural: seeded `sha256(card_key)`, per-kind motif vocabulary
+(candles/sigil/burst/blueprint/seal), sector-hash hue for instruments —
+every card gets a distinct reproducible face with no authored art.
+Emoji don't rasterize in matplotlib, so stamps draw as text chips and
+tier as border geometry; `FRAME_COLOR` ints convert to hex for borders
+and `/open` reveal embeds reuse the same ints for the stripe. The
+`/open` reveal attaches a face per staged `edit_original_response` —
+webhook PATCH accepts attachments (the type-7 no-files rule only
+applies to component callbacks like the chart buttons); the summary
+edit swaps in the all-cards spread PNG. `/card` attaches the held
+copy's face. `CardRow.sector_name` + `get_cards()` batch lookup feed
+the renderer (LEFT JOIN sectors — one query per pack).
 Shop themes (0046): `theme_*` COSMETIC metadata IS the render palette —
 `shop.service.palette_from_metadata` normalizes it over
 `charts._DEFAULT_PALETTE` keys {up, down, bg, grid, text, accent, spine,

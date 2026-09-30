@@ -247,8 +247,10 @@ async def test_sell_oversell_with_short_flag_hits_margin_gate() -> None:
         interaction = _mock_interaction(user_id)
         await cmd.callback(interaction, ticker=ticker, quantity=2, short=True)
 
-        msg = interaction.response.send_message.call_args.args[0]
-        assert "margin tier" in msg
+        # Rejects render as red embeds now -- the message lives in
+        # `embed.description`, not the positional content arg.
+        embed = interaction.response.send_message.call_args.kwargs["embed"]
+        assert "margin tier" in (embed.description or "")
         async with db.connection() as conn:
             assert await _position_qty(conn, user_id, ticker) == 0
     finally:
