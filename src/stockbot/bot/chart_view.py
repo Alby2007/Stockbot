@@ -11,9 +11,10 @@ handler's is_done() guard makes the second call a no-op).
 Actions: panl/panr (shift the window half a span), zin/zout (halve/double
 the span), home (re-anchor to the last open tick), s<span> (timeframe
 presets: set span, re-anchor), ax (toggle the x-axis between real time
-and raw ticks). The timeframe presets and the axis toggle ride one
-Select whose cid action is `sel` -- its option values ARE the actions
-("s960", "ax"); legacy `s<span>` buttons on old messages still resolve.
+and raw ticks). The timeframe presets ride one Select whose cid action
+is `sel` -- its option values ARE the actions ("s960"); the axis toggle
+is its own button on row 2. Legacy `s<span>`/`ax` buttons on old
+messages still resolve.
 `axis` is "time" (UTC wall-clock labels) or "ticks"; `theme` is the
 equipped theme item key ("-" = default palette) and rides the cid rather
 than the clicker's pref -- a shared chart message can't repaint
@@ -253,8 +254,8 @@ def build_chart_view(
     clicker's own marks and reply with a fresh ephemeral message.
 
     Row 0 is navigation; row 1 is a single Select for the six span
-    presets and the axis toggle -- its option values are the actions
-    ("s960", "ax") resolved by the `sel` cid, which halves the chrome
+    presets (option values are the actions, "s960", resolved by the
+    `sel` cid); row 2 is the axis toggle. The Select halves the chrome
     under every chart and lets gated Pro spans read as menu entries."""
     view = discord.ui.View(timeout=None)
     for label, action in _BUTTONS:
@@ -266,21 +267,28 @@ def build_chart_view(
                 row=0,
             )
         )
-    # The toggle labels the mode a pick switches TO, not the current one.
-    other = "ticks" if axis == "time" else "time"
     options = [
         discord.SelectOption(
             label=label.upper(), value=f"s{t}", default=t == span
         )
         for label, t in TIMEFRAME_SPANS.items()
     ]
-    options.append(discord.SelectOption(label=f"Axis: {other}", value="ax"))
     view.add_item(
         _ChartSelect(
             custom_id=encode_cid("sel", iid, end, span, axis, theme, mine),
             placeholder="Span…",
             options=options,
             row=1,
+        )
+    )
+    # The toggle labels the mode a press switches TO, not the current one.
+    other = "ticks" if axis == "time" else "time"
+    view.add_item(
+        _ChartButton(
+            style=discord.ButtonStyle.secondary,
+            label=f"Axis: {other}",
+            custom_id=encode_cid("ax", iid, end, span, axis, theme, mine),
+            row=2,
         )
     )
     return view
@@ -345,9 +353,9 @@ async def _handle(interaction: discord.Interaction) -> None:
             return
         ticker, name = str(info[0]), str(info[1])
         if action == "sel":
-            # The span Select's option values ARE the actions ("s960",
-            # "ax") -- normalize so legacy s<span> buttons and menu picks
-            # share one path.
+            # The span Select's option values ARE the actions ("s960")
+            # -- normalize so menu picks and legacy s<span> buttons share
+            # one path. Old selects also carried "ax", which still works.
             values = data.get("values") or []
             action = str(values[0]) if values else ""
         if action == "ax":

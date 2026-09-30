@@ -139,8 +139,8 @@ def test_build_chart_view_encodes_window() -> None:
     buttons = [c for c in view.children if isinstance(c, discord.ui.Button)]
     selects = [c for c in view.children if isinstance(c, discord.ui.Select)]
     # V4: six span buttons collapsed into one Select -- 5 nav buttons
-    # + 1 picker halves the chrome under every chart.
-    assert len(buttons) == 5
+    # + 1 axis toggle + 1 picker halves the chrome under every chart.
+    assert len(buttons) == 6
     assert len(selects) == 1
     parsed = [parse_cid(str(b.custom_id)) for b in buttons]
     assert all(
@@ -153,39 +153,43 @@ def test_build_chart_view_encodes_window() -> None:
         "zin",
         "zout",
         "home",
+        "ax",
     }
     sel = selects[0]
     assert parse_cid(str(sel.custom_id)) == (
         "sel", 21, 1528, 240, "time", None, False
     )
+    # The Select is span presets only -- the axis toggle is a button.
     assert [o.value for o in sel.options] == [
-        "s60", "s240", "s960", "s4800", "s9600", "s19200", "ax",
+        "s60", "s240", "s960", "s4800", "s9600", "s19200",
     ]
     # The current span is the pre-selected option.
     assert [o.value for o in sel.options if o.default] == ["s240"]
 
 
 def test_build_chart_view_axis_state() -> None:
-    """The axis rides every component's cid, and the Select's toggle
-    option labels the mode a pick switches TO."""
+    """The axis rides every component's cid, and the toggle button
+    labels the mode a press switches TO."""
     view = build_chart_view(21, 1528, 240, axis="ticks")
     buttons = [c for c in view.children if isinstance(c, discord.ui.Button)]
     assert parse_cid(str(buttons[0].custom_id)) == (
         "panl", 21, 1528, 240, "ticks", None, False
     )
-    sel = next(c for c in view.children if isinstance(c, discord.ui.Select))
-    ax = next(o for o in sel.options if o.value == "ax")
+    ax = next(
+        b for b in buttons if parse_cid(str(b.custom_id))[0] == "ax"  # type: ignore[index]
+    )
     # cid still encodes the CURRENT axis; the label advertises the target.
-    assert parse_cid(str(sel.custom_id)) == (
-        "sel", 21, 1528, 240, "ticks", None, False
+    assert parse_cid(str(ax.custom_id)) == (
+        "ax", 21, 1528, 240, "ticks", None, False
     )
     assert ax.label == "Axis: time"
 
     view_time = build_chart_view(21, 1528, 240, axis="time")
-    sel_t = next(
-        c for c in view_time.children if isinstance(c, discord.ui.Select)
+    ax_t = next(
+        b for b in view_time.children
+        if isinstance(b, discord.ui.Button)
+        and parse_cid(str(b.custom_id))[0] == "ax"  # type: ignore[index]
     )
-    ax_t = next(o for o in sel_t.options if o.value == "ax")
     assert ax_t.label == "Axis: ticks"
 
 

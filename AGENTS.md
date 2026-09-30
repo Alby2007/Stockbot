@@ -223,11 +223,12 @@ panl/panr (half-span shifts in open candles, clamped to history
 bounds), zin/zout (span/2, span*2 clamped to [30, 6720]), home and
 s<span> presets (re-anchor to last open). Action names starting `s`
 carry the target span (`s960` = 1D at 960-tick sessions). Chrome is
-two rows: five nav buttons (row 0) plus one Select (row 1) whose
-options ARE the actions — `s<span>` values for the six presets and
-`ax` for the axis toggle — under the `sel` cid; `_handle` resolves
+three rows: five nav buttons (row 0), one Select (row 1) whose options
+ARE the actions — `s<span>` values for the six presets under the `sel`
+cid — and the axis toggle button (row 2, `ax` cid); `_handle` resolves
 `sel` by substituting `data["values"][0]` for the action, so legacy
-`s<span>`/`ax` buttons on old messages share one path.
+`s<span>`/`ax` buttons and old `ax`-carrying selects on old messages
+share one path.
 Render aesthetics live in `_render_png` helpers, all pure:
 `_span_label(span)` maps spans to `1h`/`4h`/`1d`/`1w` (`~Nd`/`Nt`
 fallbacks) for the title, and `_session_boundaries(ticks, times, bucket)`
